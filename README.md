@@ -1,6 +1,6 @@
 ## contrastive-rl (wip)
 
-For following a new line of research that started in 2023
+For following a [new line of research](https://arxiv.org/abs/2206.07568) that started in 2023 from Eysenbach et al.
 
 ## citations
 
