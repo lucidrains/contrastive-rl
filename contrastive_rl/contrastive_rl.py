@@ -12,9 +12,6 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
-def identity(t):
-    return t
-
 def l2norm(t):
     return F.normalize(t, dim = -1)
 
@@ -32,9 +29,8 @@ def contrastive_loss(
 ):
     assert embeds1.shape == embeds2.shape
 
-    maybe_norm = identity if not norm else l2norm
-
-    embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+    if norm:
+        embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
     sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
 
