@@ -25,7 +25,8 @@ def contrastive_loss(
     embeds1,          # (b d)
     embeds2,          # (b d)
     norm = False,     # not needed as original paper had a very nice negative results section at the end, but we'll allow for it
-    temperature = 1.
+    temperature = 1.,
+    eps = 1e-4
 ):
     assert embeds1.shape == embeds2.shape
 
@@ -35,7 +36,7 @@ def contrastive_loss(
     sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
 
     if temperature != 1.:
-        sim = sim * temperature
+        sim = sim / max(temperature, eps)
 
     labels = arange_from_tensor_dim(embeds1, dim = 0)
 
