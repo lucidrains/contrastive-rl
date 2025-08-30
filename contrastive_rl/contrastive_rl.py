@@ -4,6 +4,8 @@ import torch.nn.functional as F
 
 from einops import einsum, rearrange
 
+from x_mlps_pytorch import MLP
+
 # helper functions
 
 def exists(v):
