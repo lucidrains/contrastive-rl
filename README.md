@@ -1,5 +1,6 @@
 ## contrastive-rl (wip)
 
+For following a new line of research that started in 2023
 
 ## citations
 
