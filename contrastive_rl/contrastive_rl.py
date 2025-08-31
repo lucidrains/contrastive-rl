@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 from torch.nn import Module
 import torch.nn.functional as F
@@ -58,3 +60,30 @@ def contrastive_loss(
     ) * 0.5
 
     return contrastive_loss
+
+# contrastive wrapper module
+
+class ContrastiveWrapper(Module):
+    def __init__(
+        self,
+        encoder: Module,
+        future_encoder: Module | None = None, # in negative section, they claim no benefit of separate encoder, but will allow for it
+        contrastive_kwargs: dict = dict()
+    ):
+        super().__init__()
+
+        self.encode = encoder
+        self.encode_future = default(future_encoder, encoder)
+
+        self.contrastive_loss_kwargs = contrastive_kwargs
+
+    def forward(
+        self,
+        past,     # (b d)
+        future,   # (b d)
+    ):
+        encoded_past = self.encode(past)
+        encoded_future = self.encode_future(future)
+
+        loss = contrastive_loss(encoded_past, encoded_future, **self.contrastive_loss_kwargs)
+        return loss
