@@ -153,7 +153,7 @@ class ContrastiveRLTrainer(Module):
             batch_size = trajs.shape[0]
             batch_arange = arange_from_tensor_dim(trajs, dim = 0)
 
-            past_times = torch.randint(0, traj_len - 1, (batch_size,)) # feels like max past time should be dynamically adjusted base on the trajectory length, deal with that later
+            past_times = torch.randint(0, traj_len - 1, (batch_size, 1)) # feels like max past time should be dynamically adjusted base on the trajectory length, deal with that later
 
             future_times = past_times + torch.empty_like(past_times).geometric_(1. - self.discount)
             future_times.clamp_(max = traj_len - 1)
@@ -162,6 +162,8 @@ class ContrastiveRLTrainer(Module):
 
             past_obs = trajs[batch_arange, past_times]
             future_obs = trajs[batch_arange, future_times]
+
+            past_obs, future_obs = tuple(rearrange(t, 'b 1 d -> b d') for t in (past_obs, future_obs))
 
             loss = self.contrast_wrapper(past_obs, future_obs)
             loss.backward()
