@@ -4,9 +4,21 @@ import torch
 from torch.nn import Module
 import torch.nn.functional as F
 
-from einops import einsum, rearrange
+from accelerate import Accelerator
+
+from torch.optim import Adam
+from torch.utils.data import TensorDataset, DataLoader
+
+from einops import einsum, rearrange, repeat
 
 from x_mlps_pytorch import MLP
+
+# ein
+
+# b - batch
+# d - feature dimension (observation of embed)
+# t - time
+# n - num trajectories
 
 # helper functions
 
@@ -15,6 +27,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def l2norm(t):
     return F.normalize(t, dim = -1)
@@ -87,3 +102,69 @@ class ContrastiveWrapper(Module):
 
         loss = contrastive_loss(encoded_past, encoded_future, **self.contrastive_loss_kwargs)
         return loss
+
+# contrastive RL trainer
+
+class ContrastiveRLTrainer(Module):
+    def __init__(
+        self,
+        encoder: Module,
+        future_encoder: Module | None = None,
+        batch_size = 32,
+        repetition_factor = 2,
+        learning_rate = 3e-4,
+        discount = 0.99,
+        adam_kwargs: dict = dict(),
+        constrast_kwargs: dict = dict()
+    ):
+        super().__init__()
+
+        self.contrast_wrapper = ContrastiveWrapper(encoder = encoder, future_encoder = future_encoder, **constrast_kwargs)
+
+        assert divisible_by(batch_size, repetition_factor)
+        self.batch_size = batch_size // repetition_factor   # effective batch size is smaller and then repeated
+        self.repetition_factor = repetition_factor          # the in-trajectory repetition factor - basically having the network learn to distinguish negative features from within the same trajectory
+
+        self.discount = discount
+
+        self.optimizer = Adam(self.contrast_wrapper.parameters(), lr = learning_rate, **adam_kwargs)
+
+    def forward(
+        self,
+        trajectories, # (n t d) - assume not variable length for starters
+        num_train_steps
+    ):
+        traj_len = trajectories.shape[1]
+
+        # dataset and dataloader
+
+        dataset = TensorDataset(trajectories)
+        dataloader = DataLoader(dataset, batch_size = self.batch_size)
+
+        iter_dataloader = iter(dataloader)
+
+        # training steps
+
+        for _ in range(num_train_steps):
+
+            trajs = next(iter_dataloader)
+            trajs = repeat(trajs, 'b ... -> (b r) ...', r = self.repetition_factor)
+
+            batch_size = trajs.shape[0]
+            batch_arange = arange_from_tensor_dim(trajs, dim = 0)
+
+            past_times = torch.randint(0, traj_len - 1, (batch_size,)) # feels like max past time should be dynamically adjusted base on the trajectory length, deal with that later
+
+            future_times = past_times + torch.empty_like(past_times).geometric_(1. - self.discount)
+            future_times.clamp_(max = traj_len - 1)
+
+            batch_arange = rearrange(batch_arange, '... -> ... 1')
+
+            past_obs = trajs[batch_arange, past_times]
+            future_obs = trajs[batch_arange, future_times]
+
+            loss = self.contrast_wrapper(past_obs, future_obs)
+            loss.backward()
+
+            self.optimizer.step()
+            self.optimizer.zero_grad()
