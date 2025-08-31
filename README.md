@@ -1,3 +1,5 @@
+<img src="./crtr.png" width="450px"></img>
+
 ## contrastive-rl (wip)
 
 For following a [new line of research](https://arxiv.org/abs/2206.07568) that started in 2022 from [Eysenbach](https://ben-eysenbach.github.io/) et al.
