@@ -120,11 +120,14 @@ class ContrastiveRLTrainer(Module):
         learning_rate = 3e-4,
         discount = 0.99,
         adam_kwargs: dict = dict(),
-        constrast_kwargs: dict = dict()
+        constrast_kwargs: dict = dict(),
+        accelerate_kwargs: dict = dict()
     ):
         super().__init__()
 
-        self.contrast_wrapper = ContrastiveWrapper(encoder = encoder, future_encoder = future_encoder, **constrast_kwargs)
+        self.accelerator = Accelerator(**accelerate_kwargs)
+
+        contrast_wrapper = ContrastiveWrapper(encoder = encoder, future_encoder = future_encoder, **constrast_kwargs)
 
         assert divisible_by(batch_size, repetition_factor)
         self.batch_size = batch_size // repetition_factor   # effective batch size is smaller and then repeated
@@ -132,7 +135,22 @@ class ContrastiveRLTrainer(Module):
 
         self.discount = discount
 
-        self.optimizer = Adam(self.contrast_wrapper.parameters(), lr = learning_rate, **adam_kwargs)
+        optimizer = Adam(contrast_wrapper.parameters(), lr = learning_rate, **adam_kwargs)
+
+        (
+            self.contrast_wrapper,
+            self.optimizer,
+        ) = self.accelerator.prepare(
+            contrast_wrapper,
+            optimizer,
+        )
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def print(self, *args, **kwargs):
+        self.accelerator.print(*args, **kwargs)
 
     def forward(
         self,
@@ -145,6 +163,10 @@ class ContrastiveRLTrainer(Module):
 
         dataset = TensorDataset(trajectories)
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True, drop_last = True)
+
+        # prepare
+
+        dataloader = self.accelerator.prepare(dataloader)
 
         iter_dataloader = cycle(dataloader)
 
@@ -171,9 +193,10 @@ class ContrastiveRLTrainer(Module):
             past_obs, future_obs = tuple(rearrange(t, 'b 1 d -> b d') for t in (past_obs, future_obs))
 
             loss = self.contrast_wrapper(past_obs, future_obs)
-            loss.backward()
+
+            self.accelerator.backward(loss)
 
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-        print('training complete')
+        self.print('training complete')
