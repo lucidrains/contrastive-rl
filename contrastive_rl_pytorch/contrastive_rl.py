@@ -13,6 +13,8 @@ from einops import einsum, rearrange, repeat
 
 from x_mlps_pytorch import MLP
 
+from contrastive_rl_pytorch.distributed import is_distributed, AllGather
+
 # ein
 
 # b - batch
@@ -99,6 +101,7 @@ class ContrastiveWrapper(Module):
         self.encode_future = default(future_encoder, encoder)
 
         self.contrastive_loss_kwargs = contrastive_kwargs
+        self.all_gather = AllGather()
 
     def forward(
         self,
@@ -107,6 +110,10 @@ class ContrastiveWrapper(Module):
     ):
         encoded_past = self.encode(past)
         encoded_future = self.encode_future(future)
+
+        if is_distributed():
+            encoded_past = self.all_gather(encoded_past)
+            encoded_future = self.all_gather(encoded_future)
 
         loss = contrastive_loss(encoded_past, encoded_future, **self.contrastive_loss_kwargs)
         return loss
