@@ -194,6 +194,8 @@ class ContrastiveRLTrainer(Module):
 
             loss = self.contrast_wrapper(past_obs, future_obs)
 
+            self.print(f'loss: {loss.item():.3f}')
+
             self.accelerator.backward(loss)
 
             self.optimizer.step()
