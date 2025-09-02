@@ -1,4 +1,5 @@
 import pytest
+param = pytest.mark.parametrize
 
 import torch
 
@@ -25,16 +26,20 @@ def test_contrast_wrapper():
     loss = wrapper(past_obs, future_obs)
     assert loss.numel() == 1
 
-def test_contrast_trainer():
+@param('var_traj_len', (False, True))
+def test_contrast_trainer(
+    var_traj_len
+):
     from contrastive_rl_pytorch.contrastive_rl import ContrastiveRLTrainer
     from x_mlps_pytorch import MLP
 
     encoder = MLP(16, 256, 128)
 
     trainer = ContrastiveRLTrainer(
-        encoder
+        encoder,
+        cpu = True
     )
 
     trajectories = torch.randn(256, 512, 16)
 
-    trainer(trajectories, 2)
+    trainer(trajectories, 2, lens = torch.randint(256, 512, (256,)) if var_traj_len else None)

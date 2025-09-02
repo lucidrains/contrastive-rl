@@ -25,6 +25,9 @@ from x_mlps_pytorch import MLP
 def exists(v):
     return v is not None
 
+def compact(*args):
+    return [*filter(exists, args)]
+
 def default(v, d):
     return v if exists(v) else d
 
@@ -121,11 +124,12 @@ class ContrastiveRLTrainer(Module):
         discount = 0.99,
         adam_kwargs: dict = dict(),
         constrast_kwargs: dict = dict(),
-        accelerate_kwargs: dict = dict()
+        accelerate_kwargs: dict = dict(),
+        cpu = False
     ):
         super().__init__()
 
-        self.accelerator = Accelerator(**accelerate_kwargs)
+        self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
 
         contrast_wrapper = ContrastiveWrapper(encoder = encoder, future_encoder = future_encoder, **constrast_kwargs)
 
@@ -155,13 +159,17 @@ class ContrastiveRLTrainer(Module):
     def forward(
         self,
         trajectories, # (n t d) - assume not variable length for starters
-        num_train_steps
+        num_train_steps,
+        *,
+        lens = None # (n)
     ):
-        traj_len = trajectories.shape[1]
+        traj_var_lens = exists(lens)
+
+        max_traj_len = trajectories.shape[1]
 
         # dataset and dataloader
 
-        dataset = TensorDataset(trajectories)
+        dataset = TensorDataset(*compact(trajectories, lens))
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True, drop_last = True)
 
         # prepare
@@ -174,16 +182,30 @@ class ContrastiveRLTrainer(Module):
 
         for _ in range(num_train_steps):
 
-            trajs, *_ = next(iter_dataloader)
+            trajs, *rest = next(iter_dataloader)
+
             trajs = repeat(trajs, 'b ... -> (b r) ...', r = self.repetition_factor)
+
+            # handle trajectory lens
+
+            if traj_var_lens:
+                traj_lens = rest[0]
+                traj_lens = repeat(traj_lens, 'b ... -> (b r) ...', r = self.repetition_factor)
+
+            # batch arange for indexing out past future observations
 
             batch_size = trajs.shape[0]
             batch_arange = arange_from_tensor_dim(trajs, dim = 0)
 
-            past_times = torch.randint(0, traj_len - 1, (batch_size, 1)) # feels like max past time should be dynamically adjusted base on the trajectory length, deal with that later
+            # feels like max past time should be dynamically adjusted base on the trajectory length, deal with that later 
+
+            if traj_var_lens:
+                past_times = torch.rand((batch_size, 1), device = self.device).mul(traj_lens[:, None]).floor().long()
+            else:
+                past_times = torch.randint(0, max_traj_len - 1, (batch_size, 1))
 
             future_times = past_times + torch.empty_like(past_times).geometric_(1. - self.discount)
-            future_times.clamp_(max = traj_len - 1)
+            future_times.clamp_(max = max_traj_len - 1)
 
             batch_arange = rearrange(batch_arange, '... -> ... 1')
 
