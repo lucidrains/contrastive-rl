@@ -1,4 +1,4 @@
-from contrastive_rl.contrastive_rl import (
+from contrastive_rl_pytorch.contrastive_rl import (
     contrastive_loss,
     ContrastiveWrapper,
     ContrastiveRLTrainer
