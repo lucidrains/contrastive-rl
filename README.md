@@ -7,7 +7,7 @@ For following a [new line of research](https://arxiv.org/abs/2206.07568) that st
 ## install
 
 ```shell
-$ pip install contrastive-rl
+$ pip install contrastive-rl-pytorch
 ```
 
 ## usage
