@@ -13,7 +13,8 @@ $ pip install contrastive-rl-pytorch
 ## usage
 
 ```python
-from contrastive_rl.contrastive_rl import ContrastiveRLTrainer
+import torch
+from contrastive_rl_pytorch import ContrastiveRLTrainer
 from x_mlps_pytorch import MLP
 
 encoder = MLP(16, 256, 128)

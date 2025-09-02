@@ -3,7 +3,7 @@ import pytest
 import torch
 
 def test_contrast_loss():
-    from contrastive_rl.contrastive_rl import contrastive_loss
+    from contrastive_rl_pytorch.contrastive_rl import contrastive_loss
 
     embeds1 = torch.randn(10, 512)
     embeds2 = torch.randn(10, 512)
@@ -12,7 +12,7 @@ def test_contrast_loss():
     assert loss.numel() == 1
 
 def test_contrast_wrapper():
-    from contrastive_rl.contrastive_rl import ContrastiveWrapper
+    from contrastive_rl_pytorch.contrastive_rl import ContrastiveWrapper
 
     from x_mlps_pytorch import MLP
     encoder = MLP(16, 256, 128)
@@ -26,7 +26,7 @@ def test_contrast_wrapper():
     assert loss.numel() == 1
 
 def test_contrast_trainer():
-    from contrastive_rl.contrastive_rl import ContrastiveRLTrainer
+    from contrastive_rl_pytorch.contrastive_rl import ContrastiveRLTrainer
     from x_mlps_pytorch import MLP
 
     encoder = MLP(16, 256, 128)
