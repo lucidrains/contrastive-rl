@@ -1,6 +1,6 @@
 [project]
 name = "contrastive-rl-pytorch"
-version = "0.0.8"
+version = "0.0.10"
 description = "Contrastive RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

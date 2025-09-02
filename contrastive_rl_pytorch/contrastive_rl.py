@@ -174,6 +174,9 @@ class ContrastiveRLTrainer(Module):
 
         max_traj_len = trajectories.shape[1]
 
+        assert max_traj_len >= 2
+        assert not exists(lens) or (lens >= 2).all()
+
         # dataset and dataloader
 
         dataset = TensorDataset(*compact(trajectories, lens))
@@ -213,7 +216,7 @@ class ContrastiveRLTrainer(Module):
 
             # future times, using delta time drawn from geometric distribution
 
-            future_times = past_times + torch.empty_like(past_times).geometric_(1. - self.discount)
+            future_times = past_times + torch.empty_like(past_times).geometric_(1. - self.discount).clamp(min = 1)
             future_times.clamp_(max = max_traj_len - 1)
 
             # pick out the past and future observations as positive pairs
