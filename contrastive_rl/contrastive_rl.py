@@ -147,7 +147,7 @@ class ContrastiveRLTrainer(Module):
 
         for _ in range(num_train_steps):
 
-            trajs = next(iter_dataloader)
+            trajs, *_ = next(iter_dataloader)
             trajs = repeat(trajs, 'b ... -> (b r) ...', r = self.repetition_factor)
 
             batch_size = trajs.shape[0]
@@ -170,3 +170,5 @@ class ContrastiveRLTrainer(Module):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
+
+        print('training complete')
