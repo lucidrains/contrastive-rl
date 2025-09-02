@@ -4,6 +4,31 @@
 
 For following a [new line of research](https://arxiv.org/abs/2206.07568) that started in 2022 from [Eysenbach](https://ben-eysenbach.github.io/) et al.
 
+## install
+
+```shell
+$ pip install contrastive-rl
+```
+
+## usage
+
+```python
+from contrastive_rl.contrastive_rl import ContrastiveRLTrainer
+from x_mlps_pytorch import MLP
+
+encoder = MLP(16, 256, 128)
+
+trainer = ContrastiveRLTrainer(encoder)
+
+trajectories = torch.randn(256, 512, 16)
+
+trainer(trajectories, 100)
+
+# train for 100 steps and save
+
+torch.save(encoder.state_dict(), './trained.pt')
+```
+
 ## citations
 
 ```bibtex

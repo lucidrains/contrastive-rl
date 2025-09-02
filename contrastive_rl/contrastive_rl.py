@@ -38,6 +38,11 @@ def arange_from_tensor_dim(t, dim):
     device = t.device
     return torch.arange(t.shape[dim], device = device)
 
+def cycle(dl):
+    while True:
+        for batch in dl:
+            yield batch
+
 # tensor functions
 
 def contrastive_loss(
@@ -139,9 +144,9 @@ class ContrastiveRLTrainer(Module):
         # dataset and dataloader
 
         dataset = TensorDataset(trajectories)
-        dataloader = DataLoader(dataset, batch_size = self.batch_size)
+        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True, drop_last = True)
 
-        iter_dataloader = iter(dataloader)
+        iter_dataloader = cycle(dataloader)
 
         # training steps
 
