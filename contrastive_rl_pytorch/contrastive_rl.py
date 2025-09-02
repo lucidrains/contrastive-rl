@@ -200,7 +200,7 @@ class ContrastiveRLTrainer(Module):
             # feels like max past time should be dynamically adjusted base on the trajectory length, deal with that later 
 
             if traj_var_lens:
-                past_times = torch.rand((batch_size, 1), device = self.device).mul(traj_lens[:, None]).floor().long()
+                past_times = torch.rand((batch_size, 1), device = self.device).mul(traj_lens[:, None] - 1).floor().long()
             else:
                 past_times = torch.randint(0, max_traj_len - 1, (batch_size, 1))
 
