@@ -27,8 +27,10 @@ def test_contrast_wrapper():
     assert loss.numel() == 1
 
 @param('var_traj_len', (False, True))
+@param('repetition_factor', (1, 2))
 def test_contrast_trainer(
-    var_traj_len
+    var_traj_len,
+    repetition_factor
 ):
     from contrastive_rl_pytorch.contrastive_rl import ContrastiveRLTrainer
     from x_mlps_pytorch import MLP
@@ -37,7 +39,8 @@ def test_contrast_trainer(
 
     trainer = ContrastiveRLTrainer(
         encoder,
-        cpu = True
+        cpu = True,
+        repetition_factor = repetition_factor
     )
 
     trajectories = torch.randn(256, 512, 16)
