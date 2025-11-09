@@ -55,3 +55,14 @@ torch.save(encoder.state_dict(), './trained.pt')
     url     = {https://arxiv.org/abs/2508.13113}, 
 }
 ```
+
+```bibtex
+@inproceedings{anonymous2025hierarchical,
+    title   = {Hierarchical Contrastive Reinforcement Learning: learn representation more suitable for {RL} environments},
+    author  = {Anonymous},
+    booktitle = {Submitted to The Fourteenth International Conference on Learning Representations},
+    year    = {2025},
+    url     = {https://openreview.net/forum?id=rTCSFOzVcK},
+    note    = {under review}
+}
+```
