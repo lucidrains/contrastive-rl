@@ -66,3 +66,26 @@ torch.save(encoder.state_dict(), './trained.pt')
     note    = {under review}
 }
 ```
+
+```bibtex
+@misc{liu2024singlegoalneedskills,
+    title   = {A Single Goal is All You Need: Skills and Exploration Emerge from Contrastive RL without Rewards, Demonstrations, or Subgoals}, 
+    author  = {Grace Liu and Michael Tang and Benjamin Eysenbach},
+    year    = {2024},
+    eprint  = {2408.05804},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2408.05804}, 
+}
+```
+
+```bibtex
+@inproceedings{anonymous2025demystifying,
+    title   = {Demystifying Emergent Exploration in Goal-Conditioned {RL}},
+    author  = {Anonymous},
+    booktitle = {Submitted to The Fourteenth International Conference on Learning Representations},
+    year    = {2025},
+    url     = {https://openreview.net/forum?id=mwgYORsqtv},
+    note    = {under review}
+}
+```
