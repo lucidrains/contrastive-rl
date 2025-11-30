@@ -15,9 +15,10 @@ $ pip install contrastive-rl-pytorch
 ```python
 import torch
 from contrastive_rl_pytorch import ContrastiveRLTrainer
-from x_mlps_pytorch import MLP
 
-encoder = MLP(16, 256, 128)
+from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
+
+encoder = ResidualNormedMLP(dim = 256, dim_in = 16, dim_out = 128)
 
 trainer = ContrastiveRLTrainer(encoder)
 
@@ -87,5 +88,15 @@ torch.save(encoder.state_dict(), './trained.pt')
     year    = {2025},
     url     = {https://openreview.net/forum?id=mwgYORsqtv},
     note    = {under review}
+}
+```
+
+```bibtex
+@inproceedings{wang2025,
+    title   = {1000 Layer Networks for Self-Supervised {RL}: Scaling Depth Can Enable New Goal-Reaching Capabilities},
+    author  = {Kevin Wang and Ishaan Javali and Micha{\l} Bortkiewicz and Tomasz Trzcinski and Benjamin Eysenbach},
+    booktitle = {The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+    year    = {2025},
+    url     = {https://openreview.net/forum?id=s0JVsx3bx1}
 }
 ```

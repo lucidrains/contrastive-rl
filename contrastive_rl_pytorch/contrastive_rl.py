@@ -11,7 +11,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 from einops import einsum, rearrange, repeat
 
-from x_mlps_pytorch import MLP
+from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
 
 from contrastive_rl_pytorch.distributed import is_distributed, AllGather
 
