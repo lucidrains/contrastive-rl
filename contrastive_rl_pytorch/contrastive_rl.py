@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from torch import cat
 from torch.nn import Module
 import torch.nn.functional as F
 
@@ -21,14 +22,28 @@ from contrastive_rl_pytorch.distributed import is_distributed, AllGather
 # d - feature dimension (observation of embed)
 # t - time
 # n - num trajectories
+# na - num actions
 
 # helper functions
 
 def exists(v):
     return v is not None
 
-def compact(*args):
-    return [*filter(exists, args)]
+def compact(arr):
+    return [*filter(exists, arr)]
+
+def compact_with_inverse(arr):
+    indices = [i for i, el in enumerate(arr) if exists(el)]
+
+    def inverse(out):
+        nones = [None] * len(arr)
+
+        for i, out_el in zip(indices, out):
+            nones[i] = out_el
+
+        return nones
+
+    return compact(arr), inverse
 
 def default(v, d):
     return v if exists(v) else d
@@ -107,7 +122,12 @@ class ContrastiveWrapper(Module):
         self,
         past,     # (b d)
         future,   # (b d)
+        past_action = None # (b na)
     ):
+
+        if exists(past_action):
+            past = cat((past, past_action), dim = -1)
+
         encoded_past = self.encode(past)
         encoded_future = self.encode_future(future)
 
@@ -165,10 +185,12 @@ class ContrastiveRLTrainer(Module):
 
     def forward(
         self,
-        trajectories, # (n t d) - assume not variable length for starters
+        trajectories,       # (n t d) - assume not variable length for starters
         num_train_steps,
         *,
-        lens = None # (n)
+        lens = None,        # (n)
+        actions = None,     # (n na)
+        goal_state = None   # (n t dg)
     ):
         traj_var_lens = exists(lens)
 
@@ -179,7 +201,14 @@ class ContrastiveRLTrainer(Module):
 
         # dataset and dataloader
 
-        dataset = TensorDataset(*compact(trajectories, lens))
+        all_data = dict(states = trajectories, lens = lens, actions = actions, goal_states = goal_state)
+
+        keys = list(all_data.keys())
+        values = list(all_data.values())
+
+        values_exist, inverse_compact = compact_with_inverse(values)
+
+        dataset = TensorDataset(*values_exist)
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True, drop_last = True)
 
         # prepare
@@ -192,14 +221,26 @@ class ContrastiveRLTrainer(Module):
 
         for _ in range(num_train_steps):
 
-            trajs, *rest = next(iter_dataloader)
+            data = next(iter_dataloader)
+
+            data_dict = dict(zip(keys, inverse_compact(data)))
+
+            trajs = data_dict['states']
 
             trajs = repeat(trajs, 'b ... -> (b r) ...', r = self.repetition_factor)
 
+            # handle goal
+
+            goal = trajs
+
+            if exists(data_dict['goal_states']):
+                goal = data_dict['goal_states']
+                goal = repeat(goal, 'b ... -> (b r) ...', r = self.repetition_factor)
+
             # handle trajectory lens
 
-            if traj_var_lens:
-                traj_lens = rest[0]
+            if exists(data_dict['lens']):
+                traj_lens = data_dict['lens']
                 traj_lens = repeat(traj_lens, 'b ... -> (b r) ...', r = self.repetition_factor)
 
             # batch arange for indexing out past future observations
@@ -224,13 +265,22 @@ class ContrastiveRLTrainer(Module):
             batch_arange = rearrange(batch_arange, '... -> ... 1')
 
             past_obs = trajs[batch_arange, past_times]
-            future_obs = trajs[batch_arange, future_times]
+            future_obs = goal[batch_arange, future_times]
 
-            past_obs, future_obs = tuple(rearrange(t, 'b 1 d -> b d') for t in (past_obs, future_obs))
+            past_obs, future_obs = tuple(rearrange(t, 'b 1 ... -> b ...') for t in (past_obs, future_obs))
+
+            # handle maybe action
+
+            past_action = None
+
+            if exists(data_dict['actions']):
+                actions = data_dict['actions']
+                past_action = actions[batch_arange, past_times]
+                past_action = rearrange(t, 'b 1 ... -> b ...')
 
             # contrastive learning
 
-            loss = self.contrast_wrapper(past_obs, future_obs)
+            loss = self.contrast_wrapper(past_obs, future_obs, past_action)
 
             self.print(f'loss: {loss.item():.3f}')
 
