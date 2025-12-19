@@ -275,8 +275,10 @@ class ContrastiveRLTrainer(Module):
 
             if exists(data_dict['actions']):
                 actions = data_dict['actions']
+                actions = repeat(actions, 'b ... -> (b r) ...', r = self.repetition_factor)
+
                 past_action = actions[batch_arange, past_times]
-                past_action = rearrange(t, 'b 1 ... -> b ...')
+                past_action = rearrange(past_action, 'b 1 ... -> b ...')
 
             # contrastive learning
 
