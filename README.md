@@ -100,3 +100,15 @@ torch.save(encoder.state_dict(), './trained.pt')
     url     = {https://openreview.net/forum?id=s0JVsx3bx1}
 }
 ```
+
+```bibtex
+@misc{nimonkar2025selfsupervisedgoalreachingresultsmultiagent,
+    title   = {Self-Supervised Goal-Reaching Results in Multi-Agent Cooperation and Exploration}, 
+    author  = {Chirayu Nimonkar and Shlok Shah and Catherine Ji and Benjamin Eysenbach},
+    year    = {2025},
+    eprint  = {2509.10656},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2509.10656}, 
+}
+```

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
 import torch
 from torch import cat, arange
 from torch.nn import Module
@@ -309,8 +311,8 @@ class ActorTrainer(Module):
         batch_size = 32,
         learning_rate = 3e-4,
         adam_kwargs: dict = dict(),
-        constrast_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
+        softmax_actor_output = False,
         cpu = False
     ):
         super().__init__()
@@ -321,16 +323,21 @@ class ActorTrainer(Module):
 
         self.actor = actor
 
+        # in a recent CRL paper, they made the discovery that passing softmax output directly to critic (without any hard one-hot straight-through) can work
+
+        self.softmax_actor_output = softmax_actor_output
+
         (
             self.actor,
             self.optimizer,
         ) = self.accelerator.prepare(
             actor,
-            optimizer,
+            optimizer
         )
 
-        self.encoder = encoder.to(self.device)
         self.goal_encoder = goal_encoder.to(self.device)
+        self.encoder = deepcopy(encoder).to(self.device)
+        self.encoder.requires_grad_(False)
 
         self.batch_size = batch_size
 
@@ -375,14 +382,20 @@ class ActorTrainer(Module):
 
         # training loop
 
+        self.actor.train()
+
         for _ in tqdm(range(num_epochs)):
 
             state, = next(iter_dataloader)
 
             action = self.actor(state)
 
+            if self.softmax_actor_output:
+                action = action.softmax(dim = -1)
+
             self.encoder.eval()
             encoded_state_action = self.encoder(cat((state, action), dim = -1))
+
             normed_encoded_state_action = l2norm(encoded_state_action)
 
             sim = einsum(normed_encoded_state_action, normed_encoded_goal, 'b d, d -> b')
