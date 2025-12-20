@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from torch import cat
+from torch import cat, arange
 from torch.nn import Module
 import torch.nn.functional as F
 
@@ -10,11 +10,14 @@ from accelerate import Accelerator
 from torch.optim import Adam
 from torch.utils.data import TensorDataset, DataLoader
 
+import einx
 from einops import einsum, rearrange, repeat
 
 from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
 
 from contrastive_rl_pytorch.distributed import is_distributed, AllGather
+
+from tqdm import tqdm
 
 # ein
 
@@ -219,7 +222,7 @@ class ContrastiveRLTrainer(Module):
 
         # training steps
 
-        for _ in range(num_train_steps):
+        for _ in tqdm(range(num_train_steps)):
 
             data = next(iter_dataloader)
 
@@ -294,3 +297,105 @@ class ContrastiveRLTrainer(Module):
             self.optimizer.zero_grad()
 
         self.print('training complete')
+
+# training the actor
+
+class ActorTrainer(Module):
+    def __init__(
+        self,
+        actor: Module,
+        encoder: Module,
+        goal_encoder: Module,
+        batch_size = 32,
+        learning_rate = 3e-4,
+        adam_kwargs: dict = dict(),
+        constrast_kwargs: dict = dict(),
+        accelerate_kwargs: dict = dict(),
+        cpu = False
+    ):
+        super().__init__()
+
+        self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
+
+        optimizer = Adam(actor.parameters(), lr = learning_rate, **adam_kwargs)
+
+        self.actor = actor
+
+        (
+            self.actor,
+            self.optimizer,
+        ) = self.accelerator.prepare(
+            actor,
+            optimizer,
+        )
+
+        self.encoder = encoder.to(self.device)
+        self.goal_encoder = goal_encoder.to(self.device)
+
+        self.batch_size = batch_size
+
+    @property
+    def device(self):
+        return self.accelerator.device
+
+    def print(self, *args, **kwargs):
+        self.accelerator.print(*args, **kwargs)
+
+    def forward(
+        self,
+        trajectories,
+        goal,
+        num_epochs = 3,
+        *,
+        lens = None
+    ):
+
+        # encode goal
+
+        with torch.no_grad():
+            self.goal_encoder.eval()
+            encoded_goal = self.goal_encoder(goal.to(self.device))
+            normed_encoded_goal = l2norm(encoded_goal)
+
+        # data
+
+        if exists(lens):
+            traj_len = trajectories.shape[-2]
+            mask = einx.less('t, b -> b t', arange(traj_len, device = self.device), lens)
+            states = trajectories[mask]
+        else:
+            states = rearrange(trajectories, '... d -> (...) d')
+
+        dataset = TensorDataset(states)
+        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+
+        dataloader = self.accelerator.prepare(dataloader)
+
+        iter_dataloader = cycle(dataloader)
+
+        # training loop
+
+        for _ in tqdm(range(num_epochs)):
+
+            state, = next(iter_dataloader)
+
+            action = self.actor(state)
+
+            self.encoder.eval()
+            encoded_state_action = self.encoder(cat((state, action), dim = -1))
+            normed_encoded_state_action = l2norm(encoded_state_action)
+
+            sim = einsum(normed_encoded_state_action, normed_encoded_goal, 'b d, d -> b')
+
+            # maximize the similarity between the encoded state action trained from contrastive RL and the encoded goal
+
+            loss = -sim.mean()
+
+            self.accelerator.backward(loss)
+
+            self.print(f'actor loss: {loss.item():.3f}')
+
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+        self.print('actor training complete')

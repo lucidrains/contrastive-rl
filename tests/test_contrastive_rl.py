@@ -63,3 +63,24 @@ def test_traditional_crl():
     trainer(trajectories, 100, lens = torch.randint(384, 512, (256,)), actions = actions)
 
     torch.save(encoder.state_dict(), './trained.pt')
+
+def test_train_policy():
+    import torch.nn.functional as F
+    from contrastive_rl_pytorch import ContrastiveRLTrainer, ActorTrainer
+
+    from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
+
+    actor = ResidualNormedMLP(dim = 10, dim_in = 16, dim_out = 4)
+    encoder = ResidualNormedMLP(dim = 10, dim_in = 16 + 4, dim_out = 128)
+    goal_encoder = ResidualNormedMLP(dim = 10, dim_in = 16, dim_out = 128)
+
+    actor_trainer = ActorTrainer(actor, encoder, goal_encoder, cpu = True)
+
+    trajectories = torch.randn(256, 512, 16)
+
+    lens = torch.randint(384, 512, (256,))
+    goal = torch.randn(16)
+
+    actor_trainer(trajectories, goal, lens = lens)
+
+    torch.save(actor.state_dict(), './trained-actor.pt')
