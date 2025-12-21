@@ -137,8 +137,8 @@ class ContrastiveWrapper(Module):
         encoded_future = self.encode_future(future)
 
         if is_distributed():
-            encoded_past = self.all_gather(encoded_past)
-            encoded_future = self.all_gather(encoded_future)
+            encoded_past, _ = self.all_gather(encoded_past)
+            encoded_future, _ = self.all_gather(encoded_future)
 
         loss = contrastive_loss(encoded_past, encoded_future, **self.contrastive_loss_kwargs)
         return loss
@@ -155,7 +155,7 @@ class ContrastiveRLTrainer(Module):
         learning_rate = 3e-4,
         discount = 0.99,
         adam_kwargs: dict = dict(),
-        constrast_kwargs: dict = dict(),
+        contrast_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         cpu = False
     ):
@@ -163,7 +163,7 @@ class ContrastiveRLTrainer(Module):
 
         self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
 
-        contrast_wrapper = ContrastiveWrapper(encoder = encoder, future_encoder = future_encoder, **constrast_kwargs)
+        contrast_wrapper = ContrastiveWrapper(encoder = encoder, future_encoder = future_encoder, contrastive_kwargs = contrast_kwargs)
 
         assert divisible_by(batch_size, repetition_factor)
         self.batch_size = batch_size // repetition_factor   # effective batch size is smaller and then repeated
@@ -258,7 +258,7 @@ class ContrastiveRLTrainer(Module):
             if traj_var_lens:
                 past_times = torch.rand((batch_size, 1), device = self.device).mul(traj_lens[:, None] - 1).floor().long()
             else:
-                past_times = torch.randint(0, max_traj_len - 1, (batch_size, 1))
+                past_times = torch.randint(0, max_traj_len - 1, (batch_size, 1), device = self.device)
 
             # future times, using delta time drawn from geometric distribution
 
