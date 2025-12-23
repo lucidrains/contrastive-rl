@@ -263,6 +263,13 @@ class ContrastiveRLTrainer(Module):
             # future times, using delta time drawn from geometric distribution
 
             future_times = past_times + torch.empty_like(past_times).geometric_(1. - self.discount).clamp(min = 1)
+
+            # clamping future times by max_traj_len if not variable lengths else prepare variable length
+
+            clamp_traj_len = max_traj_len if not traj_var_lens else rearrange(traj_lens - 1, 'b -> b 1')
+
+            # clamp
+
             future_times.clamp_(max = max_traj_len - 1)
 
             # pick out the past and future observations as positive pairs
@@ -313,7 +320,8 @@ class ActorTrainer(Module):
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         softmax_actor_output = False,
-        cpu = False
+        cpu = False,
+        l2norm_embed = False
     ):
         super().__init__()
 
@@ -335,11 +343,12 @@ class ActorTrainer(Module):
             optimizer
         )
 
-        self.goal_encoder = goal_encoder.to(self.device)
-        self.encoder = deepcopy(encoder).to(self.device)
-        self.encoder.requires_grad_(False)
-
         self.batch_size = batch_size
+
+        self.goal_encoder = goal_encoder
+        self.encoder = encoder
+
+        self.l2norm_embed = l2norm_embed
 
     @property
     def device(self):
@@ -357,12 +366,22 @@ class ActorTrainer(Module):
         lens = None
     ):
 
+        device = self.device
+
+        # setup models
+
+        goal_encoder = self.goal_encoder.to(device)
+        encoder = deepcopy(self.encoder).to(device)
+        encoder.requires_grad_(False)
+
         # encode goal
 
         with torch.no_grad():
-            self.goal_encoder.eval()
-            encoded_goal = self.goal_encoder(goal.to(self.device))
-            normed_encoded_goal = l2norm(encoded_goal)
+            goal_encoder.eval()
+            encoded_goal = goal_encoder(goal.to(self.device))
+
+            if self.l2norm_embed:
+                encoded_goal = l2norm(encoded_goal)
 
         # data
 
@@ -394,11 +413,12 @@ class ActorTrainer(Module):
                 action = action.softmax(dim = -1)
 
             self.encoder.eval()
-            encoded_state_action = self.encoder(cat((state, action), dim = -1))
+            encoded_state_action = encoder(cat((state, action), dim = -1))
 
-            normed_encoded_state_action = l2norm(encoded_state_action)
+            if self.l2norm_embed:
+                encoded_state_action = l2norm(encoded_state_action)
 
-            sim = einsum(normed_encoded_state_action, normed_encoded_goal, 'b d, d -> b')
+            sim = einsum(encoded_state_action, encoded_goal, 'b d, d -> b')
 
             # maximize the similarity between the encoded state action trained from contrastive RL and the encoded goal
 
