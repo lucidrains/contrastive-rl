@@ -25,6 +25,7 @@ dependencies = [
     "accelerate",
     "einx>=0.3.0",
     "einops>=0.8.1",
+    "memmap-replay-buffer>=0.0.1",
     "torch>=2.4",
     "x-mlps-pytorch>=0.1.21"
 ]
