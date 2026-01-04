@@ -50,7 +50,7 @@ def divisible_by(num, den):
 # main
 
 def main(
-    num_episodes = 10_000,
+    num_episodes = 100_000,
     max_timesteps = 500,
     num_episodes_before_learn = 250,
     buffer_size = 5_000,
@@ -63,6 +63,7 @@ def main(
     actor_num_train_steps = 50,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
+    train_critic_soft_one_hot = False,
     cpu = True
 ):
 
@@ -93,6 +94,7 @@ def main(
         fields = dict(
             state = ('float', 8),
             action = 'int',
+            action_soft_one_hot = ('float', 4)
         ),
         circular = True,
         overwrite = True
@@ -170,7 +172,8 @@ def main(
 
                 replay_buffer.store(
                     state = state,
-                    action = action
+                    action = action,
+                    action_soft_one_hot = action_logits.softmax(dim = -1)
                 )
 
                 if done:
@@ -185,17 +188,20 @@ def main(
         if divisible_by(eps + 1, num_episodes_before_learn):
 
             data = replay_buffer.get_all_data(
-                fields = ['state', 'action'],
+                fields = ['state', 'action', 'action_soft_one_hot'],
                 meta_fields = ['episode_lens']
             )
 
-            one_hot_actions = F.one_hot(data['action'].long(), num_classes = 4)
+            if train_critic_soft_one_hot:
+                actions = data['action_soft_one_hot']
+            else:
+                actions = F.one_hot(data['action'].long(), num_classes = 4)
 
             critic_trainer(
                 data['state'],
                 cl_train_steps,
                 lens = data['episode_lens'],
-                actions = one_hot_actions
+                actions = actions
             )
 
             actor_trainer(
