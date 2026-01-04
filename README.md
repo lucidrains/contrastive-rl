@@ -33,6 +33,16 @@ trainer(trajectories, 100)
 torch.save(encoder.state_dict(), './trained.pt')
 ```
 
+# quick test
+
+make sure `uv` is installed `pip install uv`
+
+then
+
+```shell
+$ uv run train_lunar.py
+```
+
 ## citations
 
 ```bibtex
