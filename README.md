@@ -18,7 +18,7 @@ $ pip install contrastive-rl-pytorch
 import torch
 from contrastive_rl_pytorch import ContrastiveRLTrainer
 
-from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
+from x_mlps_pytorch import ResidualNormedMLP
 
 encoder = ResidualNormedMLP(dim = 256, dim_in = 16, dim_out = 128)
 
