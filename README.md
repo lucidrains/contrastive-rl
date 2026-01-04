@@ -1,6 +1,6 @@
 <img src="./crtr.png" width="450px"></img>
 
-## contrastive-rl (wip)
+## contrastive-rl
 
 For following a [new line of research](https://arxiv.org/abs/2206.07568) that started in 2022 from [Eysenbach](https://ben-eysenbach.github.io/) et al.
 
@@ -33,7 +33,7 @@ trainer(trajectories, 100)
 torch.save(encoder.state_dict(), './trained.pt')
 ```
 
-# quick test
+## quick test
 
 make sure `uv` is installed `pip install uv`
 
