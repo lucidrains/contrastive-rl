@@ -1,10 +1,12 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
+#   "discrete-continuous-embed-readout",
 #   "fire",
 #   "gymnasium[box2d]",
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.10",
+#   "x-mlps-pytorch>=0.1.32",
 #   "tqdm"
 # ]
 # ///
@@ -15,6 +17,8 @@ from fire import Fire
 from shutil import rmtree
 
 import torch
+from torch import from_numpy
+import torch.nn.functional as F
 
 from tqdm import tqdm
 
@@ -27,6 +31,10 @@ from contrastive_rl_pytorch import (
     ContrastiveRLTrainer,
     ActorTrainer
 )
+
+from x_mlps_pytorch import ResidualNormedMLP
+
+from discrete_continuous_embed_readout import Readout
 
 # functions
 
@@ -47,7 +55,9 @@ def main(
     num_episodes_before_learn = 500,
     buffer_size = 1_000,
     video_folder = './recordings',
-    render_every_eps = None
+    render_every_eps = None,
+    dim_contrastive_embed = 32,
+    cl_train_steps = 500
 ):
 
     # create env
@@ -76,10 +86,43 @@ def main(
         max_timesteps = max_timesteps + 1,
         fields = dict(
             state = ('float', 8),
-            actions = 'int',
+            action = 'int',
         ),
         circular = True,
         overwrite = True
+    )
+
+    # model
+
+    actor_encoder = ResidualNormedMLP(
+        dim_in = 8,
+        dim = 32,
+        depth = 8,
+        dim_out = 4
+    )
+
+    actor_readout = Readout(num_discrete = 4, dim = 0)
+
+    critic_encoder = ResidualNormedMLP(
+        dim_in = 8 + 4,
+        dim = 64,
+        dim_out = dim_contrastive_embed,
+        depth = 16,
+        residual_every = 4,
+    )
+
+    goal_encoder = ResidualNormedMLP(
+        dim_in = 8,
+        dim = 64,
+        dim_out = dim_contrastive_embed,
+        depth = 16,
+        residual_every = 4
+    )
+
+    critic_trainer = ContrastiveRLTrainer(
+        critic_encoder,
+        goal_encoder,
+        cpu = True
     )
 
     # episodes
@@ -92,9 +135,11 @@ def main(
 
             for _ in range(max_timesteps):
 
-                action = torch.randint(0, 4, ()).numpy()
+                action_logits = actor_encoder(from_numpy(state))
 
-                next_state, reward, terminated, truncated, *_ = env.step(action)
+                action = actor_readout.sample(action_logits)
+
+                next_state, reward, terminated, truncated, *_ = env.step(action.cpu().numpy())
 
                 done = truncated or terminated
 
@@ -108,8 +153,23 @@ def main(
 
                 state = next_state
 
+        # train the critic with contrastive learning
+
         if divisible_by(eps + 1, num_episodes_before_learn):
-            break
+
+            data = replay_buffer.get_all_data(
+                fields = ['state', 'action'],
+                meta_fields = ['episode_lens']
+            )
+
+            one_hot_actions = F.one_hot(data['action'].long(), num_classes = 4)
+
+            critic_trainer(
+                data['state'],
+                cl_train_steps,
+                lens = data['episode_lens'],
+                actions = one_hot_actions
+            )
 
 # fire
 

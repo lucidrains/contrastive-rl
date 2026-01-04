@@ -190,7 +190,7 @@ class ContrastiveRLTrainer(Module):
 
     def forward(
         self,
-        trajectories,       # (n t d) - assume not variable length for starters
+        trajectories,       # (n t d)
         num_train_steps,
         *,
         lens = None,        # (n)
@@ -224,7 +224,9 @@ class ContrastiveRLTrainer(Module):
 
         # training steps
 
-        for _ in tqdm(range(num_train_steps)):
+        pbar = tqdm(range(num_train_steps), disable = not self.accelerator.is_main_process)
+
+        for _ in pbar:
 
             data = next(iter_dataloader)
 
@@ -296,7 +298,7 @@ class ContrastiveRLTrainer(Module):
 
             loss = self.contrast_wrapper(past_obs, future_obs, past_action)
 
-            self.print(f'loss: {loss.item():.3f}')
+            pbar.set_description(f'loss: {loss.item():.3f}')
 
             # backwards and optimizer step
 
@@ -403,7 +405,9 @@ class ActorTrainer(Module):
 
         self.actor.train()
 
-        for _ in tqdm(range(num_epochs)):
+        pbar = tqdm(range(num_epochs), disable = not self.accelerator.is_main_process)
+
+        for _ in pbar:
 
             state, = next(iter_dataloader)
 
@@ -426,7 +430,7 @@ class ActorTrainer(Module):
 
             self.accelerator.backward(loss)
 
-            self.print(f'actor loss: {loss.item():.3f}')
+            pbar.set_description(f'actor loss: {loss.item():.3f}')
 
             self.optimizer.step()
             self.optimizer.zero_grad()
