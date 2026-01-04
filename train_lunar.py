@@ -52,12 +52,18 @@ def divisible_by(num, den):
 def main(
     num_episodes = 10_000,
     max_timesteps = 500,
-    num_episodes_before_learn = 500,
-    buffer_size = 1_000,
+    num_episodes_before_learn = 250,
+    buffer_size = 2_500,
     video_folder = './recordings',
     render_every_eps = None,
     dim_contrastive_embed = 32,
-    cl_train_steps = 500
+    cl_train_steps = 500,
+    cl_batch_size = 256,
+    actor_batch_size = 16,
+    actor_num_train_steps = 200,
+    critic_learning_rate = 3e-4,
+    actor_learning_rate = 3e-4,
+    cpu = True
 ):
 
     # create env
@@ -122,14 +128,31 @@ def main(
     critic_trainer = ContrastiveRLTrainer(
         critic_encoder,
         goal_encoder,
-        cpu = True
+        batch_size = cl_batch_size,
+        learning_rate = critic_learning_rate,
+        cpu = cpu
     )
+
+    actor_trainer = ActorTrainer(
+        actor_encoder,
+        critic_encoder,
+        goal_encoder,
+        batch_size = actor_batch_size,
+        learning_rate = actor_learning_rate,
+        softmax_actor_output = True,
+        cpu = cpu,
+    )
+
+    actor_goal = torch.zeros(8,)
 
     # episodes
 
-    for eps in tqdm(range(num_episodes), desc = 'episodes'):
+    pbar = tqdm(range(num_episodes), desc = 'episodes')
+    for eps in pbar:
 
         state, *_ = env.reset()
+
+        cum_reward = 0.
 
         with replay_buffer.one_episode():
 
@@ -140,6 +163,8 @@ def main(
                 action = actor_readout.sample(action_logits)
 
                 next_state, reward, terminated, truncated, *_ = env.step(action.cpu().numpy())
+
+                cum_reward += reward
 
                 done = truncated or terminated
 
@@ -152,6 +177,8 @@ def main(
                     break
 
                 state = next_state
+
+            pbar.set_description(f'cumulative reward: {cum_reward.item():.1f}')
 
         # train the critic with contrastive learning
 
@@ -169,6 +196,13 @@ def main(
                 cl_train_steps,
                 lens = data['episode_lens'],
                 actions = one_hot_actions
+            )
+
+            actor_trainer(
+                data['state'],
+                actor_goal,
+                actor_num_train_steps,
+                lens = data['episode_lens']
             )
 
 # fire

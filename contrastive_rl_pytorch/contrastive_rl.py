@@ -150,7 +150,7 @@ class ContrastiveRLTrainer(Module):
         self,
         encoder: Module,
         future_encoder: Module | None = None,
-        batch_size = 32,
+        batch_size = 256,
         repetition_factor = 2,
         learning_rate = 3e-4,
         discount = 0.99,
@@ -268,11 +268,11 @@ class ContrastiveRLTrainer(Module):
 
             # clamping future times by max_traj_len if not variable lengths else prepare variable length
 
-            clamp_traj_len = max_traj_len if not traj_var_lens else rearrange(traj_lens - 1, 'b -> b 1')
+            clamp_traj_len = (max_traj_len - 1) if not traj_var_lens else rearrange(traj_lens - 1, 'b -> b 1')
 
             # clamp
 
-            future_times.clamp_(max = max_traj_len - 1)
+            future_times.clamp_(max = clamp_traj_len)
 
             # pick out the past and future observations as positive pairs
 
@@ -306,8 +306,6 @@ class ContrastiveRLTrainer(Module):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
-
-        self.print('training complete')
 
 # training the actor
 
@@ -363,7 +361,7 @@ class ActorTrainer(Module):
         self,
         trajectories,
         goal,
-        num_epochs = 3,
+        num_train_steps,
         *,
         lens = None
     ):
@@ -405,7 +403,7 @@ class ActorTrainer(Module):
 
         self.actor.train()
 
-        pbar = tqdm(range(num_epochs), disable = not self.accelerator.is_main_process)
+        pbar = tqdm(range(num_train_steps), disable = not self.accelerator.is_main_process)
 
         for _ in pbar:
 
@@ -416,7 +414,7 @@ class ActorTrainer(Module):
             if self.softmax_actor_output:
                 action = action.softmax(dim = -1)
 
-            self.encoder.eval()
+            encoder.eval()
             encoded_state_action = encoder(cat((state, action), dim = -1))
 
             if self.l2norm_embed:
@@ -434,5 +432,3 @@ class ActorTrainer(Module):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
-
-        self.print('actor training complete')
