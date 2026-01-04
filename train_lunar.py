@@ -17,7 +17,7 @@ from fire import Fire
 from shutil import rmtree
 
 import torch
-from torch import from_numpy
+from torch import from_numpy, tensor
 import torch.nn.functional as F
 
 from tqdm import tqdm
@@ -53,14 +53,14 @@ def main(
     num_episodes = 10_000,
     max_timesteps = 500,
     num_episodes_before_learn = 250,
-    buffer_size = 2_500,
+    buffer_size = 5_000,
     video_folder = './recordings',
     render_every_eps = None,
     dim_contrastive_embed = 32,
-    cl_train_steps = 500,
+    cl_train_steps = 1000,
     cl_batch_size = 256,
     actor_batch_size = 16,
-    actor_num_train_steps = 200,
+    actor_num_train_steps = 50,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
     cpu = True
@@ -143,7 +143,7 @@ def main(
         cpu = cpu,
     )
 
-    actor_goal = torch.zeros(8,)
+    actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.])
 
     # episodes
 
