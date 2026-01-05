@@ -363,7 +363,8 @@ class ActorTrainer(Module):
         goal,
         num_train_steps,
         *,
-        lens = None
+        lens = None,
+        sample_fn = None
     ):
 
         device = self.device
@@ -413,6 +414,8 @@ class ActorTrainer(Module):
 
             if self.softmax_actor_output:
                 action = action.softmax(dim = -1)
+            elif exists(sample_fn):
+                action = sample_fn(action)
 
             encoder.eval()
             encoded_state_action = encoder(cat((state, action), dim = -1))
