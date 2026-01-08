@@ -132,7 +132,11 @@ def main(
         goal_encoder,
         batch_size = cl_batch_size,
         learning_rate = critic_learning_rate,
-        cpu = cpu
+        cpu = cpu,
+        
+        contrast_kwargs = dict(
+            temperature = 0.1
+        )
     )
 
     actor_trainer = ActorTrainer(

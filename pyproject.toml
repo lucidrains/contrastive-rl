@@ -27,7 +27,10 @@ dependencies = [
     "einops>=0.8.1",
     "memmap-replay-buffer>=0.0.17",
     "torch>=2.4",
-    "x-mlps-pytorch>=0.1.32"
+    "x-mlps-pytorch>=0.1.32",
+    "fire>=0.7.1",
+    "gymnasium[box2d,other]>=1.1.1",
+    "discrete_continuous_embed_readout",
 ]
 
 [project.urls]
