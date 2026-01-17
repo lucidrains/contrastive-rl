@@ -63,10 +63,10 @@ def main(
     cl_train_steps = 1000,
     cl_batch_size = 256,
     actor_batch_size = 16,
-    actor_num_train_steps = 500,
+    actor_num_train_steps = 100,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
-    train_critic_soft_one_hot = False,
+    train_critic_soft_one_hot = True,
     cpu = True
 ):
 

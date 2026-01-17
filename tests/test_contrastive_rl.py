@@ -70,7 +70,7 @@ def test_train_policy():
 
     from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
 
-    actor = ResidualNormedMLP(dim = 10, dim_in = 16, dim_out = 4)
+    actor = ResidualNormedMLP(dim = 10, dim_in = 16 * 2, dim_out = 4)
     encoder = ResidualNormedMLP(dim = 10, dim_in = 16 + 4, dim_out = 128)
     goal_encoder = ResidualNormedMLP(dim = 10, dim_in = 16, dim_out = 128)
 
@@ -79,8 +79,7 @@ def test_train_policy():
     trajectories = torch.randn(256, 512, 16)
 
     lens = torch.randint(384, 512, (256,))
-    goal = torch.randn(16)
 
-    actor_trainer(trajectories, goal, 16, lens = lens)
+    actor_trainer(trajectories, 16, lens = lens)
 
     torch.save(actor.state_dict(), './trained-actor.pt')
