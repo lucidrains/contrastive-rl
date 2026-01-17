@@ -47,6 +47,9 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def module_device(m):
+    return next(m.parameters()).device
+
 # main
 
 def main(
@@ -60,7 +63,7 @@ def main(
     cl_train_steps = 1000,
     cl_batch_size = 256,
     actor_batch_size = 16,
-    actor_num_train_steps = 50,
+    actor_num_train_steps = 500,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
     train_critic_soft_one_hot = False,
@@ -85,6 +88,9 @@ def main(
         disable_logger = True
     )
 
+    dim_state = 8
+    dim_action = 4
+
     # replay buffer
 
     replay_buffer = ReplayBuffer(
@@ -92,9 +98,9 @@ def main(
         max_episodes = buffer_size,
         max_timesteps = max_timesteps + 1,
         fields = dict(
-            state = ('float', 8),
+            state = ('float', dim_state),
             action = 'int',
-            action_soft_one_hot = ('float', 4)
+            action_soft_one_hot = ('float', dim_action)
         ),
         circular = True,
         overwrite = True
@@ -103,16 +109,16 @@ def main(
     # model
 
     actor_encoder = ResidualNormedMLP(
-        dim_in = 8,
+        dim_in = dim_state + dim_state, # state and goal
         dim = 32,
         depth = 8,
-        dim_out = 4
+        dim_out = dim_action
     )
 
     actor_readout = Readout(num_discrete = 4, dim = 0)
 
     critic_encoder = ResidualNormedMLP(
-        dim_in = 8 + 4,
+        dim_in = dim_state + dim_action,
         dim = 64,
         dim_out = dim_contrastive_embed,
         depth = 16,
@@ -120,7 +126,7 @@ def main(
     )
 
     goal_encoder = ResidualNormedMLP(
-        dim_in = 8,
+        dim_in = dim_state,
         dim = 64,
         dim_out = dim_contrastive_embed,
         depth = 16,
@@ -145,7 +151,7 @@ def main(
         cpu = cpu,
     )
 
-    actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.])
+    actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = module_device(actor_encoder))
 
     # episodes
 
@@ -160,7 +166,7 @@ def main(
 
             for _ in range(max_timesteps):
 
-                action_logits = actor_encoder(from_numpy(state))
+                action_logits = actor_encoder((from_numpy(state), actor_goal))
 
                 action = actor_readout.sample(action_logits)
 
@@ -206,7 +212,6 @@ def main(
 
             actor_trainer(
                 data['state'],
-                actor_goal,
                 actor_num_train_steps,
                 lens = data['episode_lens']
             )

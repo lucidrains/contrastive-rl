@@ -360,7 +360,6 @@ class ActorTrainer(Module):
     def forward(
         self,
         trajectories,
-        goal,
         num_train_steps,
         *,
         lens = None,
@@ -375,15 +374,6 @@ class ActorTrainer(Module):
         encoder = deepcopy(self.encoder).to(device)
         encoder.requires_grad_(False)
 
-        # encode goal
-
-        with torch.no_grad():
-            goal_encoder.eval()
-            encoded_goal = goal_encoder(goal.to(self.device))
-
-            if self.l2norm_embed:
-                encoded_goal = l2norm(encoded_goal)
-
         # data
 
         if exists(lens):
@@ -395,10 +385,12 @@ class ActorTrainer(Module):
 
         dataset = TensorDataset(states)
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+        goal_dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
-        dataloader = self.accelerator.prepare(dataloader)
+        dataloader, goal_dataloader = self.accelerator.prepare(dataloader, goal_dataloader)
 
         iter_dataloader = cycle(dataloader)
+        iter_goal_dataloader = cycle(goal_dataloader)
 
         # training loop
 
@@ -409,13 +401,18 @@ class ActorTrainer(Module):
         for _ in pbar:
 
             state, = next(iter_dataloader)
+            goal, = next(iter_goal_dataloader)
 
-            action = self.actor(state)
+            # forward state and goal
+
+            action = self.actor((state, goal))
 
             if self.softmax_actor_output:
                 action = action.softmax(dim = -1)
             elif exists(sample_fn):
                 action = sample_fn(action)
+
+            # encode state
 
             encoder.eval()
             encoded_state_action = encoder(cat((state, action), dim = -1))
@@ -423,7 +420,16 @@ class ActorTrainer(Module):
             if self.l2norm_embed:
                 encoded_state_action = l2norm(encoded_state_action)
 
-            sim = einsum(encoded_state_action, encoded_goal, 'b d, d -> b')
+            # encode goal
+
+            with torch.no_grad():
+                goal_encoder.eval()
+                encoded_goal = goal_encoder(goal)
+
+                if self.l2norm_embed:
+                    encoded_goal = l2norm(encoded_goal)
+
+            sim = einsum(encoded_state_action, encoded_goal, 'b d, b d -> b')
 
             # maximize the similarity between the encoded state action trained from contrastive RL and the encoded goal
 

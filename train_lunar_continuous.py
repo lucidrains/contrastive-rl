@@ -50,6 +50,9 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def module_device(m):
+    return next(m.parameters()).device
+
 # main
 
 def main(
@@ -148,7 +151,7 @@ def main(
         cpu = cpu,
     )
 
-    actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.])
+    actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = module_device(actor_encoder))
 
     # episodes
 
@@ -163,7 +166,7 @@ def main(
 
             for _ in range(max_timesteps):
 
-                action_logits = actor_encoder(from_numpy(state))
+                action_logits = actor_encoder((from_numpy(state), actor_goal))
 
                 action = actor_readout.sample(action_logits)
 
@@ -203,7 +206,6 @@ def main(
 
             actor_trainer(
                 data['state'],
-                actor_goal,
                 actor_num_train_steps,
                 lens = data['episode_lens'],
                 sample_fn = actor_readout.sample
