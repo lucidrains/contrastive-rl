@@ -73,9 +73,9 @@ def cycle(dl):
 # tensor functions
 
 def contrastive_loss(
-    embeds1,          # (b d)
-    embeds2,          # (b d)
-    norm = False,     # not needed as original paper had a very nice negative results section at the end, but we'll allow for it
+    embeds1,                  # (b d)
+    embeds2,                  # (b d)
+    l2norm_embed = False,
     temperature = 1.,
     eps = 1e-4
 ):
@@ -83,7 +83,7 @@ def contrastive_loss(
 
     # maybe norm
 
-    if norm:
+    if l2norm_embed:
         embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
     # similarity

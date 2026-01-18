@@ -71,6 +71,7 @@ def main(
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
+    repetition_factor = 1,
     cpu = True
 ):
 
@@ -117,7 +118,7 @@ def main(
         ResidualNormedMLP(
             dim_in = obs_dim * 2,
             dim = 256,
-            depth = 12,
+            depth = 16,
             dim_out = action_dim * 2
         ),
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
@@ -129,7 +130,7 @@ def main(
         dim_in = obs_dim + action_dim,
         dim = 256,
         dim_out = dim_contrastive_embed,
-        depth = 12,
+        depth = 16,
         residual_every = 4,
     )
 
@@ -137,7 +138,7 @@ def main(
         dim_in = obs_dim,
         dim = 256,
         dim_out = dim_contrastive_embed,
-        depth = 12,
+        depth = 16,
         residual_every = 4
     )
 
@@ -146,6 +147,10 @@ def main(
         goal_encoder,
         batch_size = cl_batch_size,
         learning_rate = critic_learning_rate,
+        repetition_factor = repetition_factor,
+        contrast_kwargs = dict(
+            l2norm_embed = True,
+        ),
         cpu = cpu
     )
 
@@ -155,6 +160,7 @@ def main(
         goal_encoder,
         batch_size = actor_batch_size,
         learning_rate = actor_learning_rate,
+        l2norm_embed = True,
         cpu = cpu,
     )
 

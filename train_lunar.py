@@ -67,6 +67,7 @@ def main(
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
     train_critic_soft_one_hot = True,
+    repetition_factor = 1,
     cpu = True
 ):
 
@@ -111,7 +112,8 @@ def main(
     actor_encoder = ResidualNormedMLP(
         dim_in = dim_state + dim_state, # state and goal
         dim = 32,
-        depth = 8,
+        depth = 4,
+        residual_every = 2,
         dim_out = dim_action
     )
 
@@ -121,7 +123,7 @@ def main(
         dim_in = dim_state + dim_action,
         dim = 64,
         dim_out = dim_contrastive_embed,
-        depth = 16,
+        depth = 8,
         residual_every = 4,
     )
 
@@ -129,7 +131,7 @@ def main(
         dim_in = dim_state,
         dim = 64,
         dim_out = dim_contrastive_embed,
-        depth = 16,
+        depth = 8,
         residual_every = 4
     )
 
@@ -138,6 +140,10 @@ def main(
         goal_encoder,
         batch_size = cl_batch_size,
         learning_rate = critic_learning_rate,
+        repetition_factor = repetition_factor,
+        contrast_kwargs = dict(
+            l2norm_embed = True,
+        ),
         cpu = cpu
     )
 
@@ -148,6 +154,7 @@ def main(
         batch_size = actor_batch_size,
         learning_rate = actor_learning_rate,
         softmax_actor_output = True,
+        l2norm_embed = True,
         cpu = cpu,
     )
 

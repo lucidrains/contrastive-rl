@@ -69,13 +69,14 @@ def main(
     actor_num_train_steps = 500,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
+    repetition_factor = 1,
     cpu = True
 ):
 
     # create env
 
     env = gym.make('LunarLander-v3', continuous = True, render_mode = 'rgb_array')
-
+    
     # recording
 
     rmtree(video_folder, ignore_errors = True)
@@ -108,9 +109,9 @@ def main(
 
     actor_encoder = nn.Sequential(
         ResidualNormedMLP(
-            dim_in = 8,
+            dim_in = 8 * 2,
             dim = 32,
-            depth = 8,
+            depth = 4,
             dim_out = 4
         ),
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
@@ -122,7 +123,7 @@ def main(
         dim_in = 8 + 2,
         dim = 64,
         dim_out = dim_contrastive_embed,
-        depth = 16,
+        depth = 8,
         residual_every = 4,
     )
 
@@ -130,7 +131,7 @@ def main(
         dim_in = 8,
         dim = 64,
         dim_out = dim_contrastive_embed,
-        depth = 16,
+        depth = 8,
         residual_every = 4
     )
 
@@ -139,6 +140,10 @@ def main(
         goal_encoder,
         batch_size = cl_batch_size,
         learning_rate = critic_learning_rate,
+        repetition_factor = repetition_factor,
+        contrast_kwargs = dict(
+            l2norm_embed = True,
+        ),
         cpu = cpu
     )
 
@@ -148,6 +153,7 @@ def main(
         goal_encoder,
         batch_size = actor_batch_size,
         learning_rate = actor_learning_rate,
+        l2norm_embed = True,
         cpu = cpu,
     )
 
