@@ -124,7 +124,7 @@ def main(
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
     )
 
-    actor_readout = Readout(num_continuous = action_dim, continuous_squashed = True, dim = 0)
+    actor_readout = Readout(num_continuous = action_dim, continuous_squashed = False, dim = 0)
 
     critic_encoder = ResidualNormedMLP(
         dim_in = obs_dim + action_dim,

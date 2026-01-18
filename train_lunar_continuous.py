@@ -65,8 +65,8 @@ def main(
     dim_contrastive_embed = 32,
     cl_train_steps = 2_000,
     cl_batch_size = 256,
-    actor_batch_size = 16,
-    actor_num_train_steps = 500,
+    actor_batch_size = 32,
+    actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
     repetition_factor = 1,
@@ -117,7 +117,7 @@ def main(
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
     )
 
-    actor_readout = Readout(num_continuous = 2, continuous_squashed = True, dim = 0)
+    actor_readout = Readout(num_continuous = 2, continuous_squashed = False, dim = 0)
 
     critic_encoder = ResidualNormedMLP(
         dim_in = 8 + 2,

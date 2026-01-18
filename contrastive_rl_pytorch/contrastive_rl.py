@@ -3,8 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 
 import torch
-from torch import cat, arange
-from torch.nn import Module
+from torch import cat, arange, tensor
+from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
 from accelerate import Accelerator
@@ -76,7 +76,7 @@ def contrastive_loss(
     embeds1,                  # (b d)
     embeds2,                  # (b d)
     l2norm_embed = False,
-    temperature = 1.,
+    scale = 1.,
     eps = 1e-4
 ):
     assert embeds1.shape == embeds2.shape
@@ -90,8 +90,7 @@ def contrastive_loss(
 
     sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
 
-    if temperature != 1.:
-        sim = sim / max(temperature, eps)
+    sim = sim * scale
 
     # labels, which is 1 across diagonal
 
@@ -123,6 +122,12 @@ class ContrastiveWrapper(Module):
         self.encode_future = default(future_encoder, encoder)
 
         self.contrastive_loss_kwargs = contrastive_kwargs
+        self.is_cosine_sim = contrastive_kwargs.get('l2norm_embed', False)
+
+        self.learned_log_temp = None
+        if self.is_cosine_sim:
+            self.learned_log_temp = Parameter(tensor(1.))
+
         self.all_gather = AllGather()
 
     def forward(
@@ -142,7 +147,11 @@ class ContrastiveWrapper(Module):
             encoded_past, _ = self.all_gather(encoded_past)
             encoded_future, _ = self.all_gather(encoded_future)
 
-        loss = contrastive_loss(encoded_past, encoded_future, **self.contrastive_loss_kwargs)
+        scale = 1.
+        if exists(self.learned_log_temp):
+            scale = self.learned_log_temp.exp()
+
+        loss = contrastive_loss(encoded_past, encoded_future, scale = scale, **self.contrastive_loss_kwargs)
         return loss
 
 # contrastive RL trainer
