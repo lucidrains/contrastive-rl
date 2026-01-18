@@ -64,6 +64,8 @@ def arange_from_tensor_dim(t, dim):
     return torch.arange(t.shape[dim], device = device)
 
 def cycle(dl):
+    assert len(dl) > 0
+
     while True:
         for batch in dl:
             yield batch
@@ -214,7 +216,7 @@ class ContrastiveRLTrainer(Module):
         values_exist, inverse_compact = compact_with_inverse(values)
 
         dataset = TensorDataset(*values_exist)
-        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True, drop_last = True)
+        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True, drop_last = False)
 
         # prepare
 
