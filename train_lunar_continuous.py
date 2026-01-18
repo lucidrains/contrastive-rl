@@ -66,7 +66,7 @@ def main(
     cl_train_steps = 2_000,
     cl_batch_size = 256,
     actor_batch_size = 32,
-    actor_num_train_steps = 1000,
+    actor_num_train_steps = 100,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
     repetition_factor = 1,
@@ -214,7 +214,8 @@ def main(
                 data['state'],
                 actor_num_train_steps,
                 lens = data['episode_lens'],
-                sample_fn = actor_readout.sample
+                sample_fn = actor_readout.sample,
+                scale = critic_trainer.scale,
             )
 
 # fire

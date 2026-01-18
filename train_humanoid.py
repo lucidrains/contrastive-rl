@@ -233,7 +233,8 @@ def main(
                 data['state'],
                 actor_num_train_steps,
                 lens = data['episode_lens'],
-                sample_fn = actor_readout.sample
+                sample_fn = actor_readout.sample,
+                scale = critic_trainer.scale,
             )
 
 # fire

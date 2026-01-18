@@ -193,6 +193,10 @@ class ContrastiveRLTrainer(Module):
         )
 
     @property
+    def scale(self):
+        return self.contrast_wrapper.learned_log_temp.exp().item() if exists(self.contrast_wrapper.learned_log_temp) else 1.
+
+    @property
     def device(self):
         return self.accelerator.device
 
@@ -374,7 +378,8 @@ class ActorTrainer(Module):
         num_train_steps,
         *,
         lens = None,
-        sample_fn = None
+        sample_fn = None,
+        scale = 1.
     ):
 
         device = self.device
@@ -440,7 +445,7 @@ class ActorTrainer(Module):
                 if self.l2norm_embed:
                     encoded_goal = l2norm(encoded_goal)
 
-            sim = einsum(encoded_state_action, encoded_goal, 'b d, b d -> b')
+            sim = einsum(encoded_state_action, encoded_goal, 'b d, b d -> b') * scale
 
             # maximize the similarity between the encoded state action trained from contrastive RL and the encoded goal
 
