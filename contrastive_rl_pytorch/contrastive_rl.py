@@ -72,90 +72,99 @@ def cycle(dl):
 
 # tensor functions
 
-def contrastive_loss(
-    embeds1,                  # (b d)
-    embeds2,                  # (b d)
-    l2norm_embed = False,
-    scale = 1.,
-    eps = 1e-4
-):
-    assert embeds1.shape == embeds2.shape
 
-    # maybe norm
+# contrastive wrapper module
 
-    if l2norm_embed:
-        embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+class ContrastiveLearning(Module):
+    def __init__(
+        self,
+        l2norm_embed = True,
+        learned_temp = True
+    ):
+        super().__init__()
+        self.l2norm_embed = l2norm_embed
 
-    # similarity
+        self.learned_log_temp = None
+        if learned_temp:
+            self.learned_log_temp = Parameter(tensor(1.))
 
-    sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
+    @property
+    def scale(self):
+        return self.learned_log_temp.exp() if exists(self.learned_log_temp) else 1.
 
-    sim = sim * scale
+    def forward(
+        self,
+        embeds1,
+        embeds2,
+        return_contrastive_score = False
+    ):
+        if self.l2norm_embed:
+            embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
-    # labels, which is 1 across diagonal
+        if return_contrastive_score:
+            if embeds1.ndim == 2:
+                sim = einsum(embeds1, embeds2, 'b d, b d -> b')
+            else:
+                sim = (embeds1 * embeds2).sum(dim = -1)
 
-    labels = arange_from_tensor_dim(embeds1, dim = 0)
+            return sim * self.scale
 
-    # transpose
+        # similarity
 
-    sim_transpose = rearrange(sim, 'i j -> j i')
+        sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
+        sim = sim * self.scale
 
-    contrastive_loss = (
-        F.cross_entropy(sim, labels) +
-        F.cross_entropy(sim_transpose, labels)
-    ) * 0.5
+        # labels, which is 1 across diagonal
 
-    return contrastive_loss
+        labels = arange_from_tensor_dim(embeds1, dim = 0)
 
-def sigmoid_contrastive_loss(
-    embeds1,                  # (b d)
-    embeds2,                  # (b d)
-    l2norm_embed = False,
-    scale = 1.,
-    bias = -10.,
-    eps = 1e-4
-):
-    assert embeds1.shape == embeds2.shape
+        # transpose
 
-    # maybe norm
+        sim_transpose = rearrange(sim, 'i j -> j i')
 
-    if l2norm_embed:
-        embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+        loss = (
+            F.cross_entropy(sim, labels) +
+            F.cross_entropy(sim_transpose, labels)
+        ) * 0.5
 
-    # similarity
+        return loss
 
-    sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
+class SigmoidContrastiveLearning(Module):
+    def __init__(
+        self,
+        bias = -10.
+    ):
+        super().__init__()
+        self.bias = bias
 
-    sim = sim * scale + bias
+    def forward(
+        self,
+        embeds1,
+        embeds2,
+        return_contrastive_score = False
+    ):
+        if return_contrastive_score:
+            if embeds1.ndim == 2:
+                sim = einsum(embeds1, embeds2, 'b d, b d -> b')
+            else:
+                sim = (embeds1 * embeds2).sum(dim = -1)
 
-    # labels
+            return (sim + self.bias).sigmoid()
 
-    labels = torch.eye(sim.shape[0], device = sim.device)
+        # similarity
 
-    # binary cross entropy
+        sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
+        sim = sim + self.bias
 
-    loss = F.binary_cross_entropy_with_logits(sim, labels)
+        # labels
 
-    return loss
+        labels = torch.eye(sim.shape[0], device = sim.device)
 
-def get_contrastive_score(
-    embeds1,
-    embeds2,
-    scale = 1.,
-    bias = 0.,
-    use_sigmoid = False
-):
-    if embeds1.ndim == 2:
-        sim = einsum(embeds1, embeds2, 'b d, b d -> b')
-    else:
-        sim = (embeds1 * embeds2).sum(dim = -1)
+        # binary cross entropy
 
-    sim = sim * scale + (bias if use_sigmoid else 0.)
+        loss = F.binary_cross_entropy_with_logits(sim, labels)
 
-    if use_sigmoid:
-        return sim.sigmoid()
-
-    return sim
+        return loss
 
 # contrastive wrapper module
 
@@ -163,26 +172,15 @@ class ContrastiveWrapper(Module):
     def __init__(
         self,
         encoder: Module,
-        future_encoder: Module | None = None, # in negative section, they claim no benefit of separate encoder, but will allow for it
-        use_sigmoid_contrastive_learning = True,
-        sigmoid_bias = -10.,
-        contrastive_kwargs: dict = dict()
+        contrastive_learn: Module,
+        future_encoder: Module | None = None
     ):
         super().__init__()
 
         self.encode = encoder
         self.encode_future = default(future_encoder, encoder)
 
-        self.use_sigmoid = use_sigmoid_contrastive_learning
-        self.sigmoid_bias = sigmoid_bias
-
-        self.contrastive_loss_kwargs = contrastive_kwargs
-        self.is_cosine_sim = contrastive_kwargs.get('l2norm_embed', False)
-
-        self.learned_log_temp = None
-        if self.is_cosine_sim:
-            self.learned_log_temp = Parameter(tensor(1.))
-
+        self.contrastive_learn = contrastive_learn
         self.all_gather = AllGather()
 
     def forward(
@@ -202,17 +200,7 @@ class ContrastiveWrapper(Module):
             encoded_past, _ = self.all_gather(encoded_past)
             encoded_future, _ = self.all_gather(encoded_future)
 
-        scale = 1.
-        if exists(self.learned_log_temp):
-            scale = self.learned_log_temp.exp()
-
-        loss_fn = sigmoid_contrastive_loss if self.use_sigmoid else contrastive_loss
-        loss_kwargs = dict(scale = scale, **self.contrastive_loss_kwargs)
-
-        if self.use_sigmoid:
-            loss_kwargs.update(bias = self.sigmoid_bias)
-
-        return loss_fn(encoded_past, encoded_future, **loss_kwargs)
+        return self.contrastive_learn(encoded_past, encoded_future)
 
 # contrastive RL trainer
 
@@ -225,10 +213,8 @@ class ContrastiveRLTrainer(Module):
         repetition_factor = 2,
         learning_rate = 3e-4,
         discount = 0.99,
-        use_sigmoid_contrastive_learning = True,
-        sigmoid_bias = -10.,
+        contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
-        contrast_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         cpu = False
     ):
@@ -236,12 +222,13 @@ class ContrastiveRLTrainer(Module):
 
         self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
 
+        if not exists(contrastive_learn):
+            contrastive_learn = ContrastiveLearning()
+
         contrast_wrapper = ContrastiveWrapper(
             encoder = encoder,
             future_encoder = future_encoder,
-            use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
-            sigmoid_bias = sigmoid_bias,
-            contrastive_kwargs = contrast_kwargs
+            contrastive_learn = contrastive_learn
         )
 
         assert divisible_by(batch_size, repetition_factor)
@@ -262,7 +249,8 @@ class ContrastiveRLTrainer(Module):
 
     @property
     def scale(self):
-        return self.contrast_wrapper.learned_log_temp.exp().item() if exists(self.contrast_wrapper.learned_log_temp) else 1.
+        learned_log_temp = getattr(self.contrast_wrapper.contrastive_learn, 'learned_log_temp', None)
+        return learned_log_temp.exp().item() if exists(learned_log_temp) else 1.
 
     @property
     def use_sigmoid(self):
@@ -411,10 +399,8 @@ class ActorTrainer(Module):
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         softmax_actor_output = False,
-        use_sigmoid_contrastive_learning = True,
-        sigmoid_bias = -10.,
+        contrastive_learn: Module | None = None,
         cpu = False,
-        l2norm_embed = False
     ):
         super().__init__()
 
@@ -428,8 +414,10 @@ class ActorTrainer(Module):
 
         self.softmax_actor_output = softmax_actor_output
 
-        self.use_sigmoid = use_sigmoid_contrastive_learning
-        self.sigmoid_bias = sigmoid_bias
+        if not exists(contrastive_learn):
+            contrastive_learn = ContrastiveLearning()
+
+        self.contrastive_learn = contrastive_learn
 
         (
             self.actor,
@@ -444,8 +432,6 @@ class ActorTrainer(Module):
         self.goal_encoder = goal_encoder
         self.encoder = encoder
 
-        self.l2norm_embed = l2norm_embed
-
     @property
     def device(self):
         return self.accelerator.device
@@ -459,8 +445,7 @@ class ActorTrainer(Module):
         num_train_steps,
         *,
         lens = None,
-        sample_fn = None,
-        scale = 1.
+        sample_fn = None
     ):
 
         device = self.device
@@ -514,24 +499,14 @@ class ActorTrainer(Module):
             encoder.eval()
             encoded_state_action = encoder(cat((state, action), dim = -1))
 
-            if self.l2norm_embed:
-                encoded_state_action = l2norm(encoded_state_action)
-
-            # encode goal
-
             with torch.no_grad():
                 goal_encoder.eval()
                 encoded_goal = goal_encoder(goal)
 
-                if self.l2norm_embed:
-                    encoded_goal = l2norm(encoded_goal)
-
-            sim = get_contrastive_score(
+            sim = self.contrastive_learn(
                 encoded_state_action,
                 encoded_goal,
-                scale = scale,
-                bias = self.sigmoid_bias,
-                use_sigmoid = self.use_sigmoid
+                return_contrastive_score = True
             )
 
             # maximize the similarity between the encoded state action trained from contrastive RL and the encoded goal

@@ -27,9 +27,10 @@ import gymnasium as gym
 from memmap_replay_buffer import ReplayBuffer
 
 from contrastive_rl_pytorch import (
-    ContrastiveWrapper,
     ContrastiveRLTrainer,
-    ActorTrainer
+    ActorTrainer,
+    ContrastiveLearning,
+    SigmoidContrastiveLearning
 )
 
 from x_mlps_pytorch import ResidualNormedMLP
@@ -140,18 +141,21 @@ def main(
         keel_post_ln = True
     )
 
+    # contrastive learning module
+
+    if use_sigmoid_contrastive_learning:
+        contrastive_learn = SigmoidContrastiveLearning(bias = sigmoid_bias)
+    else:
+        contrastive_learn = ContrastiveLearning(l2norm_embed = True, learned_temp = True)
+
     critic_trainer = ContrastiveRLTrainer(
         critic_encoder,
         goal_encoder,
         batch_size = cl_batch_size,
         learning_rate = critic_learning_rate,
         repetition_factor = repetition_factor,
-        use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
-        sigmoid_bias = sigmoid_bias,
-        contrast_kwargs = dict(
-            l2norm_embed = True,
-        ),
-        cpu = cpu
+        cpu = cpu,
+        contrastive_learn = contrastive_learn
     )
 
     actor_trainer = ActorTrainer(
@@ -161,10 +165,8 @@ def main(
         batch_size = actor_batch_size,
         learning_rate = actor_learning_rate,
         softmax_actor_output = True,
-        use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
-        sigmoid_bias = sigmoid_bias,
-        l2norm_embed = True,
         cpu = cpu,
+        contrastive_learn = contrastive_learn
     )
 
     actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = module_device(actor_encoder))
@@ -230,7 +232,7 @@ def main(
                 data['state'],
                 actor_num_train_steps,
                 lens = data['episode_lens'],
-                scale = critic_trainer.scale,
+                sample_fn = actor_readout.sample
             )
 
 # fire
