@@ -22,7 +22,7 @@ from contrastive_rl_pytorch import ContrastiveRLTrainer
 
 from x_mlps_pytorch import ResidualNormedMLP # https://arxiv.org/abs/2503.14858
 
-encoder = ResidualNormedMLP(dim = 256, dim_in = 16, dim_out = 128)
+encoder = ResidualNormedMLP(dim = 256, dim_in = 16, dim_out = 128, keel_post_ln = True)
 
 trainer = ContrastiveRLTrainer(encoder)
 

@@ -107,6 +107,56 @@ def contrastive_loss(
 
     return contrastive_loss
 
+def sigmoid_contrastive_loss(
+    embeds1,                  # (b d)
+    embeds2,                  # (b d)
+    l2norm_embed = False,
+    scale = 1.,
+    bias = -10.,
+    eps = 1e-4
+):
+    assert embeds1.shape == embeds2.shape
+
+    # maybe norm
+
+    if l2norm_embed:
+        embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+
+    # similarity
+
+    sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
+
+    sim = sim * scale + bias
+
+    # labels
+
+    labels = torch.eye(sim.shape[0], device = sim.device)
+
+    # binary cross entropy
+
+    loss = F.binary_cross_entropy_with_logits(sim, labels)
+
+    return loss
+
+def get_contrastive_score(
+    embeds1,
+    embeds2,
+    scale = 1.,
+    bias = 0.,
+    use_sigmoid = False
+):
+    if embeds1.ndim == 2:
+        sim = einsum(embeds1, embeds2, 'b d, b d -> b')
+    else:
+        sim = (embeds1 * embeds2).sum(dim = -1)
+
+    sim = sim * scale + (bias if use_sigmoid else 0.)
+
+    if use_sigmoid:
+        return sim.sigmoid()
+
+    return sim
+
 # contrastive wrapper module
 
 class ContrastiveWrapper(Module):
@@ -114,12 +164,17 @@ class ContrastiveWrapper(Module):
         self,
         encoder: Module,
         future_encoder: Module | None = None, # in negative section, they claim no benefit of separate encoder, but will allow for it
+        use_sigmoid_contrastive_learning = True,
+        sigmoid_bias = -10.,
         contrastive_kwargs: dict = dict()
     ):
         super().__init__()
 
         self.encode = encoder
         self.encode_future = default(future_encoder, encoder)
+
+        self.use_sigmoid = use_sigmoid_contrastive_learning
+        self.sigmoid_bias = sigmoid_bias
 
         self.contrastive_loss_kwargs = contrastive_kwargs
         self.is_cosine_sim = contrastive_kwargs.get('l2norm_embed', False)
@@ -151,8 +206,13 @@ class ContrastiveWrapper(Module):
         if exists(self.learned_log_temp):
             scale = self.learned_log_temp.exp()
 
-        loss = contrastive_loss(encoded_past, encoded_future, scale = scale, **self.contrastive_loss_kwargs)
-        return loss
+        loss_fn = sigmoid_contrastive_loss if self.use_sigmoid else contrastive_loss
+        loss_kwargs = dict(scale = scale, **self.contrastive_loss_kwargs)
+
+        if self.use_sigmoid:
+            loss_kwargs.update(bias = self.sigmoid_bias)
+
+        return loss_fn(encoded_past, encoded_future, **loss_kwargs)
 
 # contrastive RL trainer
 
@@ -165,6 +225,8 @@ class ContrastiveRLTrainer(Module):
         repetition_factor = 2,
         learning_rate = 3e-4,
         discount = 0.99,
+        use_sigmoid_contrastive_learning = True,
+        sigmoid_bias = -10.,
         adam_kwargs: dict = dict(),
         contrast_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
@@ -174,7 +236,13 @@ class ContrastiveRLTrainer(Module):
 
         self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
 
-        contrast_wrapper = ContrastiveWrapper(encoder = encoder, future_encoder = future_encoder, contrastive_kwargs = contrast_kwargs)
+        contrast_wrapper = ContrastiveWrapper(
+            encoder = encoder,
+            future_encoder = future_encoder,
+            use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
+            sigmoid_bias = sigmoid_bias,
+            contrastive_kwargs = contrast_kwargs
+        )
 
         assert divisible_by(batch_size, repetition_factor)
         self.batch_size = batch_size // repetition_factor   # effective batch size is smaller and then repeated
@@ -195,6 +263,14 @@ class ContrastiveRLTrainer(Module):
     @property
     def scale(self):
         return self.contrast_wrapper.learned_log_temp.exp().item() if exists(self.contrast_wrapper.learned_log_temp) else 1.
+
+    @property
+    def use_sigmoid(self):
+        return self.contrast_wrapper.use_sigmoid
+
+    @property
+    def sigmoid_bias(self):
+        return self.contrast_wrapper.sigmoid_bias
 
     @property
     def device(self):
@@ -335,6 +411,8 @@ class ActorTrainer(Module):
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         softmax_actor_output = False,
+        use_sigmoid_contrastive_learning = True,
+        sigmoid_bias = -10.,
         cpu = False,
         l2norm_embed = False
     ):
@@ -349,6 +427,9 @@ class ActorTrainer(Module):
         # in a recent CRL paper, they made the discovery that passing softmax output directly to critic (without any hard one-hot straight-through) can work
 
         self.softmax_actor_output = softmax_actor_output
+
+        self.use_sigmoid = use_sigmoid_contrastive_learning
+        self.sigmoid_bias = sigmoid_bias
 
         (
             self.actor,
@@ -445,7 +526,13 @@ class ActorTrainer(Module):
                 if self.l2norm_embed:
                     encoded_goal = l2norm(encoded_goal)
 
-            sim = einsum(encoded_state_action, encoded_goal, 'b d, b d -> b') * scale
+            sim = get_contrastive_score(
+                encoded_state_action,
+                encoded_goal,
+                scale = scale,
+                bias = self.sigmoid_bias,
+                use_sigmoid = self.use_sigmoid
+            )
 
             # maximize the similarity between the encoded state action trained from contrastive RL and the encoded goal
 

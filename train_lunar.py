@@ -68,6 +68,8 @@ def main(
     actor_learning_rate = 3e-4,
     train_critic_soft_one_hot = True,
     repetition_factor = 1,
+    use_sigmoid_contrastive_learning = True,
+    sigmoid_bias = -10.,
     cpu = True
 ):
 
@@ -114,7 +116,8 @@ def main(
         dim = 32,
         depth = 4,
         residual_every = 2,
-        dim_out = dim_action
+        dim_out = dim_action,
+        keel_post_ln = True
     )
 
     actor_readout = Readout(num_discrete = 4, dim = 0)
@@ -125,6 +128,7 @@ def main(
         dim_out = dim_contrastive_embed,
         depth = 8,
         residual_every = 4,
+        keel_post_ln = True
     )
 
     goal_encoder = ResidualNormedMLP(
@@ -132,7 +136,8 @@ def main(
         dim = 64,
         dim_out = dim_contrastive_embed,
         depth = 8,
-        residual_every = 4
+        residual_every = 4,
+        keel_post_ln = True
     )
 
     critic_trainer = ContrastiveRLTrainer(
@@ -141,6 +146,8 @@ def main(
         batch_size = cl_batch_size,
         learning_rate = critic_learning_rate,
         repetition_factor = repetition_factor,
+        use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
+        sigmoid_bias = sigmoid_bias,
         contrast_kwargs = dict(
             l2norm_embed = True,
         ),
@@ -154,6 +161,8 @@ def main(
         batch_size = actor_batch_size,
         learning_rate = actor_learning_rate,
         softmax_actor_output = True,
+        use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
+        sigmoid_bias = sigmoid_bias,
         l2norm_embed = True,
         cpu = cpu,
     )
