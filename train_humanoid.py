@@ -75,14 +75,14 @@ def main(
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
-    repetition_factor = 2,
+    repetition_factor = 3,
     use_sigmoid_contrastive_learning = True,
     sigmoid_bias = -5.,
     cl_l2norm_embed = True,
-    exploration_random_goal_prob = 0.1,
+    exploration_random_goal_prob = 0.025,
     exploration_sample_from_buffer_prob = 0.5,
     use_wandb = False,
-    cpu = True
+    cpu = False
 ):
     # clear video folder
 

@@ -68,7 +68,7 @@ def main(
     buffer_size = 512,
     video_folder = './recordings',
     render_every_eps = None,
-    dim_contrastive_embed = 32,
+    dim_contrastive_embed = 64,
     cl_train_steps = 5000,
     cl_batch_size = 256,
     actor_batch_size = 128,
@@ -79,10 +79,10 @@ def main(
     use_sigmoid_contrastive_learning = True,
     sigmoid_bias = -5.,
     cl_l2norm_embed = True,
-    exploration_random_goal_prob = 0.1,
+    exploration_random_goal_prob = 0.025,
     exploration_sample_from_buffer_prob = 0.5,
     use_wandb = False,
-    cpu = True
+    cpu = False
 ):
     # clear video folder
 
