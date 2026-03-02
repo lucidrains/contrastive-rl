@@ -22,6 +22,9 @@ import torch
 from torch import from_numpy, cat, tensor
 import torch.nn.functional as F
 
+import numpy as np
+from einops import rearrange
+
 from tqdm import tqdm
 import gymnasium as gym
 from accelerate import Accelerator
@@ -32,7 +35,8 @@ from contrastive_rl_pytorch import (
     ContrastiveRLTrainer,
     ActorTrainer,
     ContrastiveLearning,
-    SigmoidContrastiveLearning
+    SigmoidContrastiveLearning,
+    sample_random_state
 )
 
 from x_mlps_pytorch import ResidualNormedMLP
@@ -75,6 +79,8 @@ def main(
     use_sigmoid_contrastive_learning = True,
     sigmoid_bias = -5.,
     cl_l2norm_embed = True,
+    exploration_random_goal_prob = 0.1,
+    exploration_sample_from_buffer_prob = 0.5,
     use_wandb = False,
     cpu = True
 ):
@@ -215,7 +221,9 @@ def main(
             max_timesteps = max_timesteps,
             train_critic_soft_one_hot = train_critic_soft_one_hot,
             repetition_factor = repetition_factor,
-            use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning
+            use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
+            exploration_random_goal_prob = exploration_random_goal_prob,
+            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob
         )
     )
 
@@ -229,6 +237,18 @@ def main(
             cl_loss = 0.
             actor_loss = 0.
 
+            # decide on goal for the episode
+
+            is_exploring = torch.rand(()) < exploration_random_goal_prob
+
+            eps_goal = actor_goal
+
+            if is_exploring:
+                eps_goal = sample_random_state(
+                    replay_buffer,
+                    env,
+                    exploration_sample_from_buffer_prob
+                ).to(device)
             states = []
             hard_one_hots = []
             soft_one_hots = []
@@ -237,7 +257,7 @@ def main(
 
                 actor_encoder.eval()
 
-                action_logits = actor_encoder(cat((from_numpy(state).to(device), actor_goal), dim = -1))
+                action_logits = actor_encoder(cat((from_numpy(state).to(device), eps_goal), dim = -1))
 
                 action = actor_readout.sample(action_logits)
 
@@ -268,13 +288,14 @@ def main(
                     action_soft_one_hot = soft_one_hots
                 )
 
-            rolling_reward.append(cum_reward)
-            rolling_steps.append(eps_steps)
+            if not is_exploring:
+                rolling_reward.append(cum_reward)
+                rolling_steps.append(eps_steps)
 
-            dashboard.update_diagnostics(
-                last_eps_reward = f"{cum_reward:.2f}",
-                last_eps_steps = eps_steps
-            )
+                dashboard.update_diagnostics(
+                    last_eps_reward = f"{cum_reward:.2f}",
+                    last_eps_steps = eps_steps
+                )
 
             live.update(dashboard.render())
 
@@ -316,22 +337,23 @@ def main(
 
             dashboard.advance_progress()
 
-            avg_reward = sum(rolling_reward) / len(rolling_reward)
-            avg_steps = sum(rolling_steps) / len(rolling_steps)
+            if not is_exploring:
+                avg_reward = sum(rolling_reward) / len(rolling_reward) if len(rolling_reward) > 0 else 0.
+                avg_steps = sum(rolling_steps) / len(rolling_steps) if len(rolling_steps) > 0 else 0.
 
-            dashboard.update_episode_info(
-                avg_cum_reward_100 = f"{avg_reward:.2f}",
-                avg_steps_100 = f"{avg_steps:.1f}"
-            )
+                dashboard.update_episode_info(
+                    avg_cum_reward_100 = f"{avg_reward:.2f}",
+                    avg_steps_100 = f"{avg_steps:.1f}"
+                )
 
-            if use_wandb:
-                accelerator.log({
-                    "avg_cum_reward_100": avg_reward,
-                    "avg_steps_100": avg_steps,
-                    "last_eps_reward": cum_reward,
-                    "critic_loss": cl_loss,
-                    "actor_loss": actor_loss
-                })
+                if use_wandb:
+                    accelerator.log({
+                        "avg_cum_reward_100": avg_reward,
+                        "avg_steps_100": avg_steps,
+                        "last_eps_reward": cum_reward,
+                        "critic_loss": cl_loss,
+                        "actor_loss": actor_loss
+                    })
 
             live.update(dashboard.render())
 

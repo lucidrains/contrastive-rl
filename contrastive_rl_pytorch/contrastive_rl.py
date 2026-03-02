@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import torch
-from torch import cat, arange, tensor
+from torch import cat, arange, tensor, from_numpy
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
@@ -71,6 +71,29 @@ def cycle(dl):
             yield batch
 
 # tensor functions
+
+def sample_random_state(
+    replay_buffer,
+    env,
+    exploration_sample_from_buffer_prob = 0.5,
+):
+    if replay_buffer.num_episodes > 0 and torch.rand(()) < exploration_sample_from_buffer_prob:
+        # sample from buffer
+
+        all_states = replay_buffer.get_all_data(fields = ['state'])['state']
+        states = rearrange(all_states, '... d -> (...) d')
+
+        num_states = states.shape[0]
+        rand_id = torch.randint(0, num_states, (1,), device = states.device)
+
+        random_state = states[rand_id]
+
+        return rearrange(random_state, '1 d -> d')
+
+    # sample from env
+
+    state = env.observation_space.sample()
+    return from_numpy(state).float()
 
 
 # contrastive wrapper module

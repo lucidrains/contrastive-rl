@@ -3,5 +3,6 @@ from contrastive_rl_pytorch.contrastive_rl import (
     SigmoidContrastiveLearning,
     ContrastiveWrapper,
     ContrastiveRLTrainer,
-    ActorTrainer
+    ActorTrainer,
+    sample_random_state
 )
