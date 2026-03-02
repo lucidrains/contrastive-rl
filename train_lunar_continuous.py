@@ -75,6 +75,8 @@ def main(
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
+    weight_decay = 1e-4,
+    max_grad_norm = 0.5,
     repetition_factor = 2,
     use_sigmoid_contrastive_learning = True,
     sigmoid_bias = -5.,
@@ -182,6 +184,8 @@ def main(
         goal_encoder,
         batch_size = cl_batch_size,
         learning_rate = critic_learning_rate,
+        weight_decay = weight_decay,
+        max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
         cpu = cpu,
         contrastive_learn = contrastive_learn
@@ -197,6 +201,9 @@ def main(
         goal_encoder,
         batch_size = actor_batch_size,
         learning_rate = actor_learning_rate,
+        weight_decay = weight_decay,
+        max_grad_norm = max_grad_norm,
+        softmax_actor_output = True,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
@@ -217,9 +224,11 @@ def main(
             actor_learning_rate = actor_learning_rate,
             cl_batch_size = cl_batch_size,
             actor_batch_size = actor_batch_size,
-            buffer_size = buffer_size,
-            max_timesteps = max_timesteps,
-            repetition_factor = repetition_factor,
+            buffer_size = f"{buffer_size}",
+            max_timesteps = f"{max_timesteps}",
+            weight_decay = f"{weight_decay}",
+            max_grad_norm = f"{max_grad_norm}",
+            repetition_factor = f"{repetition_factor}",
             use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
             exploration_random_goal_prob = exploration_random_goal_prob,
             exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob

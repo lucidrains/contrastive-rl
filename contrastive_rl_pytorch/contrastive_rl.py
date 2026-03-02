@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from accelerate import Accelerator
 
-from torch.optim import Adam
+from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
 
 import einx
@@ -249,6 +249,8 @@ class ContrastiveRLTrainer(Module):
         batch_size = 256,
         repetition_factor = 2,
         learning_rate = 3e-4,
+        weight_decay = 0.,
+        max_grad_norm = 0.5,
         discount = 0.99,
         contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
@@ -271,10 +273,10 @@ class ContrastiveRLTrainer(Module):
         assert divisible_by(batch_size, repetition_factor)
         self.batch_size = batch_size // repetition_factor   # effective batch size is smaller and then repeated
         self.repetition_factor = repetition_factor          # the in-trajectory repetition factor - basically having the network learn to distinguish negative features from within the same trajectory
-
+        self.max_grad_norm = max_grad_norm
         self.discount = discount
 
-        optimizer = Adam(contrast_wrapper.parameters(), lr = learning_rate, **adam_kwargs)
+        optimizer = AdamW(contrast_wrapper.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
 
         (
             self.contrast_wrapper,
@@ -422,6 +424,9 @@ class ContrastiveRLTrainer(Module):
 
             self.accelerator.backward(loss)
 
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.contrast_wrapper.parameters(), self.max_grad_norm)
+
             self.optimizer.step()
             self.optimizer.zero_grad()
 
@@ -437,6 +442,8 @@ class ActorTrainer(Module):
         goal_encoder: Module,
         batch_size = 32,
         learning_rate = 3e-4,
+        weight_decay = 0.,
+        max_grad_norm = 0.5,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         softmax_actor_output = False,
@@ -447,8 +454,9 @@ class ActorTrainer(Module):
 
         self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
 
-        optimizer = Adam(actor.parameters(), lr = learning_rate, **adam_kwargs)
+        self.max_grad_norm = max_grad_norm
 
+        optimizer = AdamW(actor.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
         self.actor = actor
 
         # in a recent CRL paper, they made the discovery that passing softmax output directly to critic (without any hard one-hot straight-through) can work
@@ -560,6 +568,9 @@ class ActorTrainer(Module):
             self.accelerator.backward(loss)
 
             pbar.set_description(f'actor loss: {loss.item():.3f}')
+
+            if exists(self.max_grad_norm):
+                self.accelerator.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
 
             self.optimizer.step()
             self.optimizer.zero_grad()
