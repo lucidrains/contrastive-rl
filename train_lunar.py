@@ -64,7 +64,7 @@ def main(
     num_episodes = 50_000,
     max_timesteps = 500,
     num_episodes_before_learn = 512,
-    buffer_size = 512,
+    buffer_size = 1536,
     video_folder = './recordings',
     render_every_eps = None,
     dim_contrastive_embed = 64,
