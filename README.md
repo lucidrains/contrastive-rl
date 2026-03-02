@@ -6,7 +6,7 @@ For following a [new line of research](https://arxiv.org/abs/2206.07568) that st
 
 This is important not because of contrastive learning, but because it happens to be a special case where the RL and SSL algorithm is one. It reveals how "traditional" RL is unable to build up representations alone.
 
-*Update: Finally seeing it, at about 3-4k steps, but lunar continuous not working yet*
+*Update: Finally seeing it, at about 2-3k steps*
 
 ## install
 
@@ -45,7 +45,7 @@ then
 $ uv run train_lunar.py
 ```
 
-wait until 5k steps at least
+wait until 2-3k steps at least
 
 ## citations
 

@@ -71,7 +71,7 @@ def main(
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
-    repetition_factor = 1,
+    repetition_factor = 2,
     use_sigmoid_contrastive_learning = True,
     sigmoid_bias = -5.,
     cl_l2norm_embed = True,
