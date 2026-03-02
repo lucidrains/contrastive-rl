@@ -14,8 +14,24 @@ from rich.progress import (
     MofNCompleteColumn
 )
 
+# helpers
+
+def exists(v):
+    return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
+
+# dashboard
+
 class Dashboard:
-    def __init__(self, num_episodes, title = "Contrastive RL Training", env_name = "Unknown", hyperparams = None):
+    def __init__(
+        self,
+        num_episodes,
+        title = "Contrastive RL Training",
+        env_name = "Unknown",
+        hyperparams = None
+    ):
         self.title = title
         self.progress = Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -25,9 +41,10 @@ class Dashboard:
             TimeRemainingColumn(),
             expand = True
         )
+
         self.pbar_task = self.progress.add_task("Episodes", total = num_episodes)
 
-        self.hyperparams = hyperparams or {}
+        self.hyperparams = default(hyperparams, {})
 
         self.episode_info = {
             "env_name": env_name,
@@ -40,20 +57,23 @@ class Dashboard:
         }
 
     def update_episode_info(self, **kwargs):
-        self.episode_info.update({k: str(v) for k, v in kwargs.items()})
+        self.episode_info.update({k: f"{v}" for k, v in kwargs.items()})
 
     def update_diagnostics(self, **kwargs):
-        self.episode_info.update({k: str(v) for k, v in kwargs.items()})
+        self.episode_info.update({k: f"{v}" for k, v in kwargs.items()})
 
     def advance_progress(self):
         self.progress.update(self.pbar_task, advance = 1)
 
     def _make_table(self, data, columns, styles):
         table = Table(box = box.ROUNDED, expand = True)
+
         for col, style in zip(columns, styles):
-            table.add_column(col, style = style, width = 30)
+            table.add_column(col, style = style)
+
         for k, v in data.items():
-            table.add_row(k, str(v))
+            table.add_row(k, f"{v}")
+
         return table
 
     def render(self):
