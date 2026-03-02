@@ -15,9 +15,10 @@ from __future__ import annotations
 
 from fire import Fire
 from shutil import rmtree
+import os
 
 import torch
-from torch import from_numpy, tensor
+from torch import from_numpy, cat, tensor
 import torch.nn.functional as F
 
 from tqdm import tqdm
@@ -37,6 +38,11 @@ from x_mlps_pytorch import ResidualNormedMLP
 
 from discrete_continuous_embed_readout import Readout
 
+from dashboard import Dashboard
+
+from accelerate import Accelerator
+from collections import deque
+
 # functions
 
 def exists(v):
@@ -54,25 +60,45 @@ def module_device(m):
 # main
 
 def main(
-    num_episodes = 100_000,
+    num_episodes = 50_000,
     max_timesteps = 500,
-    num_episodes_before_learn = 250,
-    buffer_size = 5_000,
+    num_episodes_before_learn = 512,
+    buffer_size = 512,
     video_folder = './recordings',
     render_every_eps = None,
     dim_contrastive_embed = 32,
-    cl_train_steps = 1000,
+    cl_train_steps = 5000,
     cl_batch_size = 256,
-    actor_batch_size = 16,
-    actor_num_train_steps = 100,
+    actor_batch_size = 128,
+    actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
-    train_critic_soft_one_hot = True,
+    train_critic_soft_one_hot = False,
     repetition_factor = 1,
     use_sigmoid_contrastive_learning = True,
-    sigmoid_bias = -10.,
+    sigmoid_bias = -5.,
+    cl_l2norm_embed = True,
+    use_wandb = False,
     cpu = True
 ):
+
+    # clear video folder
+
+    rmtree(video_folder, ignore_errors = True)
+    os.makedirs(video_folder, exist_ok = True)
+
+    # accelerator
+
+    accelerator = Accelerator(
+        log_with = 'wandb' if use_wandb else None,
+        cpu = cpu
+    )
+
+    if use_wandb:
+        accelerator.init_trackers(
+            project_name = 'contrastive-rl',
+            config = locals()
+        )
 
     # create env
 
@@ -98,7 +124,7 @@ def main(
     # replay buffer
 
     replay_buffer = ReplayBuffer(
-        './replay-lunar',
+        './replay-lunar-discrete',
         max_episodes = buffer_size,
         max_timesteps = max_timesteps + 1,
         fields = dict(
@@ -114,7 +140,7 @@ def main(
 
     actor_encoder = ResidualNormedMLP(
         dim_in = dim_state + dim_state, # state and goal
-        dim = 32,
+        dim = 64,
         depth = 4,
         residual_every = 2,
         dim_out = dim_action,
@@ -144,7 +170,7 @@ def main(
     # contrastive learning module
 
     if use_sigmoid_contrastive_learning:
-        contrastive_learn = SigmoidContrastiveLearning(bias = sigmoid_bias)
+        contrastive_learn = SigmoidContrastiveLearning(bias = sigmoid_bias, l2norm_embed = cl_l2norm_embed)
     else:
         contrastive_learn = ContrastiveLearning(l2norm_embed = True, learned_temp = True)
 
@@ -157,6 +183,10 @@ def main(
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
+
+    # assertions
+
+    assert num_episodes_before_learn > cl_batch_size
 
     actor_trainer = ActorTrainer(
         actor_encoder,
@@ -173,67 +203,135 @@ def main(
 
     # episodes
 
-    pbar = tqdm(range(num_episodes), desc = 'episodes')
-    for eps in pbar:
+    rolling_reward = deque(maxlen = 100)
+    rolling_steps = deque(maxlen = 100)
 
-        state, *_ = env.reset()
+    dashboard = Dashboard(num_episodes, title = "Contrastive RL - Lunar Lander", env_name = "LunarLander-v3", hyperparams = dict(
+        critic_learning_rate = critic_learning_rate,
+        actor_learning_rate = actor_learning_rate,
+        cl_batch_size = cl_batch_size,
+        actor_batch_size = actor_batch_size,
+        buffer_size = buffer_size,
+        max_timesteps = max_timesteps,
+        train_critic_soft_one_hot = train_critic_soft_one_hot,
+        repetition_factor = repetition_factor,
+        use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning
+    ))
 
-        cum_reward = 0.
+    with dashboard.create_renderable() as live:
+        for eps in range(num_episodes):
 
-        with replay_buffer.one_episode():
+            state, *_ = env.reset()
 
-            for _ in range(max_timesteps):
+            cum_reward = 0.
+            eps_steps = 0
+            cl_loss = 0.
+            actor_loss = 0.
 
-                action_logits = actor_encoder((from_numpy(state), actor_goal))
+            with replay_buffer.one_episode():
 
-                action = actor_readout.sample(action_logits)
+                for _ in range(max_timesteps):
 
-                next_state, reward, terminated, truncated, *_ = env.step(action.cpu().numpy())
+                    actor_encoder.eval()
+                    action_logits = actor_encoder(cat((from_numpy(state).to(module_device(actor_encoder)), actor_goal), dim = -1))
 
-                cum_reward += reward
+                    action = actor_readout.sample(action_logits)
 
-                done = truncated or terminated
+                    next_state, reward, terminated, truncated, *_ = env.step(action.cpu().numpy())
 
-                replay_buffer.store(
-                    state = state,
-                    action = action,
-                    action_soft_one_hot = action_logits.softmax(dim = -1)
+                    cum_reward += reward
+                    eps_steps += 1
+
+                    done = truncated or terminated
+
+                    replay_buffer.store(
+                        state = state,
+                        action = action,
+                        action_soft_one_hot = action_logits.softmax(dim = -1)
+                    )
+
+                    if done:
+                        break
+
+                    state = next_state
+
+                rolling_reward.append(cum_reward)
+                rolling_steps.append(eps_steps)
+
+                dashboard.update_diagnostics(
+                    last_eps_reward = f"{cum_reward:.2f}",
+                    last_eps_steps = eps_steps
                 )
 
-                if done:
-                    break
+                live.update(dashboard.render())
 
-                state = next_state
+            # train the critic with contrastive learning
 
-            pbar.set_description(f'cumulative reward: {cum_reward.item():.1f}')
+            # train the critic with contrastive learning
 
-        # train the critic with contrastive learning
+            if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, num_episodes_before_learn):
 
-        if divisible_by(eps + 1, num_episodes_before_learn):
+                data = replay_buffer.get_all_data(
+                    fields = ['state', 'action', 'action_soft_one_hot'],
+                    meta_fields = ['episode_lens']
+                )
 
-            data = replay_buffer.get_all_data(
-                fields = ['state', 'action', 'action_soft_one_hot'],
-                meta_fields = ['episode_lens']
+                trajectories = data['state']
+                episode_lens = data['episode_lens']
+
+                if train_critic_soft_one_hot:
+                    actions_for_critic = data['action_soft_one_hot']
+                else:
+                    actions_for_critic = F.one_hot(data['action'].long(), num_classes = 4)
+
+                # filter out episodes that are too short
+                keep_mask = episode_lens >= 2
+                trajectories = trajectories[keep_mask]
+                episode_lens = episode_lens[keep_mask]
+                actions_for_critic = actions_for_critic[keep_mask]
+
+                if episode_lens.shape[0] > 0:
+                    cl_loss = critic_trainer(
+                        trajectories,
+                        cl_train_steps,
+                        lens = episode_lens,
+                        actions = actions_for_critic
+                    )
+
+                    actor_loss = actor_trainer(
+                        trajectories,
+                        actor_num_train_steps,
+                        lens = episode_lens,
+                        sample_fn = actor_readout.sample
+                    )
+
+                dashboard.update_diagnostics(
+                    critic_loss = f"{cl_loss:.4f}",
+                    actor_loss = f"{actor_loss:.4f}"
+                )
+            dashboard.advance_progress()
+
+            avg_reward = sum(rolling_reward) / len(rolling_reward)
+            avg_steps = sum(rolling_steps) / len(rolling_steps)
+
+            dashboard.update_episode_info(
+                avg_cum_reward_100 = f"{avg_reward:.2f}",
+                avg_steps_100 = f"{avg_steps:.1f}"
             )
 
-            if train_critic_soft_one_hot:
-                actions = data['action_soft_one_hot']
-            else:
-                actions = F.one_hot(data['action'].long(), num_classes = 4)
+            if use_wandb:
+                accelerator.log({
+                    "avg_cum_reward_100": avg_reward,
+                    "avg_steps_100": avg_steps,
+                    "last_eps_reward": cum_reward,
+                    "critic_loss": cl_loss if 'cl_loss' in locals() else 0.,
+                    "actor_loss": actor_loss if 'actor_loss' in locals() else 0.
+                })
 
-            critic_trainer(
-                data['state'],
-                cl_train_steps,
-                lens = data['episode_lens'],
-                actions = actions
-            )
+            live.update(dashboard.render())
 
-            actor_trainer(
-                data['state'],
-                actor_num_train_steps,
-                lens = data['episode_lens'],
-                sample_fn = actor_readout.sample
-            )
+    if use_wandb:
+        accelerator.end_training()
 
 # fire
 

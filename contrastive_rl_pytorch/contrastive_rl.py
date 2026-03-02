@@ -132,10 +132,21 @@ class ContrastiveLearning(Module):
 class SigmoidContrastiveLearning(Module):
     def __init__(
         self,
-        bias = -10.
+        bias = -10.,
+        l2norm_embed = True,
+        learned_scale = True
     ):
         super().__init__()
         self.bias = bias
+        self.l2norm_embed = l2norm_embed
+
+        self.learned_log_scale = None
+        if learned_scale:
+            self.learned_log_scale = Parameter(tensor(1.)) # starts at ~2.7
+
+    @property
+    def scale(self):
+        return self.learned_log_scale.exp() if exists(self.learned_log_scale) else 1.
 
     def forward(
         self,
@@ -143,18 +154,21 @@ class SigmoidContrastiveLearning(Module):
         embeds2,
         return_contrastive_score = False
     ):
+        if self.l2norm_embed:
+            embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+
         if return_contrastive_score:
             if embeds1.ndim == 2:
                 sim = einsum(embeds1, embeds2, 'b d, b d -> b')
             else:
                 sim = (embeds1 * embeds2).sum(dim = -1)
 
-            return (sim + self.bias).sigmoid()
+            return (sim * self.scale + self.bias).sigmoid()
 
         # similarity
 
         sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
-        sim = sim + self.bias
+        sim = sim * self.scale + self.bias
 
         # labels
 
@@ -303,6 +317,7 @@ class ContrastiveRLTrainer(Module):
 
         # training steps
 
+        loss_item = 0.
         pbar = tqdm(range(num_train_steps), disable = not self.accelerator.is_main_process)
 
         for _ in pbar:
@@ -377,7 +392,8 @@ class ContrastiveRLTrainer(Module):
 
             loss = self.contrast_wrapper(past_obs, future_obs, past_action)
 
-            pbar.set_description(f'loss: {loss.item():.3f}')
+            loss_item = loss.item()
+            pbar.set_description(f'loss: {loss_item:.3f}')
 
             # backwards and optimizer step
 
@@ -385,6 +401,8 @@ class ContrastiveRLTrainer(Module):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
+
+        return loss_item
 
 # training the actor
 
@@ -452,9 +470,14 @@ class ActorTrainer(Module):
 
         # setup models
 
-        goal_encoder = self.goal_encoder.to(device)
+        goal_encoder = deepcopy(self.goal_encoder).to(device)
         encoder = deepcopy(self.encoder).to(device)
+
+        goal_encoder.requires_grad_(False)
         encoder.requires_grad_(False)
+
+        goal_encoder.eval()
+        encoder.eval()
 
         # data
 
@@ -496,11 +519,9 @@ class ActorTrainer(Module):
 
             # encode state
 
-            encoder.eval()
             encoded_state_action = encoder(cat((state, action), dim = -1))
 
             with torch.no_grad():
-                goal_encoder.eval()
                 encoded_goal = goal_encoder(goal)
 
             sim = self.contrastive_learn(
@@ -519,3 +540,5 @@ class ActorTrainer(Module):
 
             self.optimizer.step()
             self.optimizer.zero_grad()
+
+        return loss.item()

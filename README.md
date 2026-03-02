@@ -1,6 +1,6 @@
 <img src="./crtr.png" width="450px"></img>
 
-## contrastive-rl (wip)
+## contrastive-rl
 
 For following a [new line of research](https://arxiv.org/abs/2206.07568) that started in 2022 from [Eysenbach](https://ben-eysenbach.github.io/) et al.
 
@@ -45,29 +45,31 @@ then
 $ uv run train_lunar.py
 ```
 
+wait until 5k steps at least
+
 ## citations
 
 ```bibtex
 @misc{eysenbach2023contrastivelearninggoalconditionedreinforcement,
-    title   = {Contrastive Learning as Goal-Conditioned Reinforcement Learning}, 
+    title   = {Contrastive Learning as Goal-Conditioned Reinforcement Learning},
     author  = {Benjamin Eysenbach and Tianjun Zhang and Ruslan Salakhutdinov and Sergey Levine},
     year    = {2023},
     eprint  = {2206.07568},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2206.07568}, 
+    url     = {https://arxiv.org/abs/2206.07568},
 }
 ```
 
 ```bibtex
 @misc{ziarko2025contrastiverepresentationstemporalreasoning,
-    title   = {Contrastive Representations for Temporal Reasoning}, 
+    title   = {Contrastive Representations for Temporal Reasoning},
     author  = {Alicja Ziarko and Michal Bortkiewicz and Michal Zawalski and Benjamin Eysenbach and Piotr Milos},
     year    = {2025},
     eprint  = {2508.13113},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2508.13113}, 
+    url     = {https://arxiv.org/abs/2508.13113},
 }
 ```
 
@@ -84,13 +86,13 @@ $ uv run train_lunar.py
 
 ```bibtex
 @misc{liu2024singlegoalneedskills,
-    title   = {A Single Goal is All You Need: Skills and Exploration Emerge from Contrastive RL without Rewards, Demonstrations, or Subgoals}, 
+    title   = {A Single Goal is All You Need: Skills and Exploration Emerge from Contrastive RL without Rewards, Demonstrations, or Subgoals},
     author  = {Grace Liu and Michael Tang and Benjamin Eysenbach},
     year    = {2024},
     eprint  = {2408.05804},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2408.05804}, 
+    url     = {https://arxiv.org/abs/2408.05804},
 }
 ```
 
@@ -117,12 +119,12 @@ $ uv run train_lunar.py
 
 ```bibtex
 @misc{nimonkar2025selfsupervisedgoalreachingresultsmultiagent,
-    title   = {Self-Supervised Goal-Reaching Results in Multi-Agent Cooperation and Exploration}, 
+    title   = {Self-Supervised Goal-Reaching Results in Multi-Agent Cooperation and Exploration},
     author  = {Chirayu Nimonkar and Shlok Shah and Catherine Ji and Benjamin Eysenbach},
     year    = {2025},
     eprint  = {2509.10656},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2509.10656}, 
+    url     = {https://arxiv.org/abs/2509.10656},
 }
 ```

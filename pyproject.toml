@@ -1,6 +1,6 @@
 [project]
 name = "contrastive-rl-pytorch"
-version = "0.0.30"
+version = "0.1.0"
 description = "Contrastive RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -42,7 +42,7 @@ test = [
 
 [tool.pytest.ini_options]
 pythonpath = [
-  "."
+    "."
 ]
 
 [build-system]
@@ -58,3 +58,11 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["contrastive_rl"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "contrastive_rl",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
