@@ -42,7 +42,7 @@ make sure `uv` is installed `pip install uv`
 then
 
 ```shell
-$ uv run train_lunar.py
+$ uv run train_lunar.py --cpu
 ```
 
 wait until 2-3k steps at least
