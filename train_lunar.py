@@ -74,6 +74,12 @@ def main(
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
+    actor_dim = 64,
+    actor_depth = 4,
+    critic_dim = 64,
+    critic_depth = 8,
+    goal_dim = 64,
+    goal_depth = 8,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
     train_critic_soft_one_hot = False,
@@ -83,6 +89,8 @@ def main(
     cl_l2norm_embed = True,
     exploration_random_goal_prob = 0.025,
     exploration_sample_from_buffer_prob = 0.5,
+    reward_part_of_goal = False,
+    reward_norm = 100.,
     use_wandb = False,
     cpu = False
 ):
@@ -121,6 +129,7 @@ def main(
     )
 
     dim_state = 8
+    dim_goal = 8 + (1 if reward_part_of_goal else 0)
     dim_action = 4
 
     # replay buffer
@@ -131,6 +140,7 @@ def main(
         max_timesteps = max_timesteps + 1,
         fields = dict(
             state = ('float', dim_state),
+            reward = ('float', 1),
             action_hard_one_hot = ('float', dim_action),
             action_soft_one_hot = ('float', dim_action)
         ),
@@ -140,12 +150,12 @@ def main(
 
     # model
 
-    device = torch.device('cpu') if cpu else torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    device = accelerator.device
 
     actor_encoder = ResidualNormedMLP(
-        dim_in = dim_state + dim_state, # state and goal
-        dim = 64,
-        depth = 4,
+        dim_in = dim_state + dim_goal, # state and goal
+        dim = actor_dim,
+        depth = actor_depth,
         residual_every = 2,
         dim_out = dim_action,
         keel_post_ln = True
@@ -155,18 +165,18 @@ def main(
 
     critic_encoder = ResidualNormedMLP(
         dim_in = dim_state + dim_action,
-        dim = 64,
+        dim = critic_dim,
         dim_out = dim_contrastive_embed,
-        depth = 8,
+        depth = critic_depth,
         residual_every = 4,
         keel_post_ln = True
     ).to(device)
 
     goal_encoder = ResidualNormedMLP(
-        dim_in = dim_state,
-        dim = 64,
+        dim_in = dim_goal,
+        dim = goal_dim,
         dim_out = dim_contrastive_embed,
-        depth = 8,
+        depth = goal_depth,
         residual_every = 4,
         keel_post_ln = True
     ).to(device)
@@ -186,6 +196,8 @@ def main(
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
+        reward_part_of_goal = reward_part_of_goal,
+        reward_norm = reward_norm,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
@@ -203,11 +215,17 @@ def main(
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
         softmax_actor_output = True,
+        reward_part_of_goal = reward_part_of_goal,
+        reward_norm = reward_norm,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
 
     actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
+
+    if reward_part_of_goal:
+        max_reward = tensor([1.], device = device, dtype = torch.float32)
+        actor_goal = cat((actor_goal, max_reward), dim = -1)
 
     # episodes
 
@@ -231,7 +249,9 @@ def main(
             repetition_factor = repetition_factor,
             use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
             exploration_random_goal_prob = exploration_random_goal_prob,
-            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob
+            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob,
+            reward_part_of_goal = reward_part_of_goal,
+            reward_norm = reward_norm
         )
     )
 
@@ -247,7 +267,7 @@ def main(
 
             # decide on goal for the episode
 
-            is_exploring = torch.rand(()) < exploration_random_goal_prob
+            is_exploring = torch.rand((), device = device) < exploration_random_goal_prob
 
             eps_goal = actor_goal
 
@@ -257,7 +277,13 @@ def main(
                     env,
                     exploration_sample_from_buffer_prob
                 ).to(device)
+
+                if reward_part_of_goal and eps_goal.shape[-1] == dim_state:
+                    rand_reward = torch.rand((1,), device = device, dtype = torch.float32)
+                    eps_goal = cat((eps_goal, rand_reward), dim = -1)
+
             states = []
+            rewards = []
             hard_one_hots = []
             soft_one_hots = []
 
@@ -265,7 +291,9 @@ def main(
 
                 actor_encoder.eval()
 
-                action_logits = actor_encoder(cat((from_numpy(state).to(device), eps_goal), dim = -1))
+                curr_state = from_numpy(state).to(device)
+
+                action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
 
                 action = actor_readout.sample(action_logits)
 
@@ -274,6 +302,7 @@ def main(
                 # store transition data
 
                 states.append(state)
+                rewards.append(reward)
                 hard_one_hots.append(F.one_hot(action.long(), num_classes = dim_action).float().detach().cpu())
                 soft_one_hots.append(action_logits.softmax(dim = -1).detach().cpu())
 
@@ -292,6 +321,7 @@ def main(
             if len(states) >= 2:
                 replay_buffer.store_episode(
                     state = states,
+                    reward = rewards,
                     action_hard_one_hot = hard_one_hots,
                     action_soft_one_hot = soft_one_hots
                 )
@@ -312,11 +342,12 @@ def main(
             if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, num_episodes_before_learn):
 
                 data = replay_buffer.get_all_data(
-                    fields = ['state', 'action_hard_one_hot', 'action_soft_one_hot'],
+                    fields = ['state', 'reward', 'action_hard_one_hot', 'action_soft_one_hot'],
                     meta_fields = ['episode_lens']
                 )
 
                 trajectories = data['state']
+                rewards_for_critic = data['reward']
                 episode_lens = data['episode_lens']
 
                 if train_critic_soft_one_hot:
@@ -328,13 +359,15 @@ def main(
                     trajectories,
                     cl_train_steps,
                     lens = episode_lens,
-                    actions = actions_for_critic
+                    actions = actions_for_critic,
+                    rewards = rewards_for_critic
                 )
 
                 actor_loss = actor_trainer(
                     trajectories,
                     actor_num_train_steps,
                     lens = episode_lens,
+                    rewards = rewards_for_critic,
                     sample_fn = actor_readout.sample
                 )
 

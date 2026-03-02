@@ -252,6 +252,8 @@ class ContrastiveRLTrainer(Module):
         weight_decay = 0.,
         max_grad_norm = 0.5,
         discount = 0.99,
+        reward_part_of_goal = False,
+        reward_norm = 1.0,
         contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
@@ -275,6 +277,9 @@ class ContrastiveRLTrainer(Module):
         self.repetition_factor = repetition_factor          # the in-trajectory repetition factor - basically having the network learn to distinguish negative features from within the same trajectory
         self.max_grad_norm = max_grad_norm
         self.discount = discount
+
+        self.reward_part_of_goal = reward_part_of_goal
+        self.reward_norm = reward_norm
 
         optimizer = AdamW(contrast_wrapper.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
 
@@ -313,6 +318,7 @@ class ContrastiveRLTrainer(Module):
         *,
         lens = None,        # (n)
         actions = None,     # (n na)
+        rewards = None,     # (n t)
         goal_state = None   # (n t dg)
     ):
         traj_var_lens = exists(lens)
@@ -324,7 +330,7 @@ class ContrastiveRLTrainer(Module):
 
         # dataset and dataloader
 
-        all_data = dict(states = trajectories, lens = lens, actions = actions, goal_states = goal_state)
+        all_data = dict(states = trajectories, lens = lens, actions = actions, rewards = rewards, goal_states = goal_state)
 
         keys = list(all_data.keys())
         values = list(all_data.values())
@@ -402,6 +408,15 @@ class ContrastiveRLTrainer(Module):
 
             past_obs, future_obs = tuple(rearrange(t, 'b 1 ... -> b ...') for t in (past_obs, future_obs))
 
+            if self.reward_part_of_goal:
+                rewards = data_dict['rewards']
+                assert exists(rewards), 'rewards must be passed if reward_part_of_goal is True'
+
+                rewards = repeat(rewards, 'b ... -> (b r) ...', r = self.repetition_factor)
+                picked_rewards = rearrange(rewards[batch_arange, future_times], 'b 1 ... -> b ...')
+
+                future_obs = cat((future_obs, picked_rewards / self.reward_norm), dim = -1)
+
             # handle maybe action
 
             past_action = None
@@ -447,6 +462,8 @@ class ActorTrainer(Module):
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         softmax_actor_output = False,
+        reward_part_of_goal = False,
+        reward_norm = 1.0,
         contrastive_learn: Module | None = None,
         cpu = False,
     ):
@@ -481,6 +498,9 @@ class ActorTrainer(Module):
         self.goal_encoder = goal_encoder
         self.encoder = encoder
 
+        self.reward_part_of_goal = reward_part_of_goal
+        self.reward_norm = reward_norm
+
     @property
     def device(self):
         return self.accelerator.device
@@ -494,6 +514,7 @@ class ActorTrainer(Module):
         num_train_steps,
         *,
         lens = None,
+        rewards = None,
         sample_fn = None
     ):
 
@@ -520,8 +541,23 @@ class ActorTrainer(Module):
             states = rearrange(trajectories, '... d -> (...) d')
 
         dataset = TensorDataset(states)
+
+        goal_data = [states]
+
+        if self.reward_part_of_goal:
+            assert exists(rewards), 'rewards must be passed to actor trainer if reward_part_of_goal is True'
+
+            goal_rewards = rewards[mask] if exists(lens) else rearrange(rewards, '... -> (...)')
+
+            if goal_rewards.ndim == 1:
+                goal_rewards = rearrange(goal_rewards, 'b -> b 1')
+
+            goal_data.append(goal_rewards)
+
+        goal_dataset = TensorDataset(*goal_data)
+
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
-        goal_dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+        goal_dataloader = DataLoader(goal_dataset, batch_size = self.batch_size, shuffle = True)
 
         dataloader, goal_dataloader = self.accelerator.prepare(dataloader, goal_dataloader)
 
@@ -537,7 +573,12 @@ class ActorTrainer(Module):
         for _ in pbar:
 
             state, = next(iter_dataloader)
-            goal, = next(iter_goal_dataloader)
+            goal, *maybe_goal_rewards = next(iter_goal_dataloader)
+
+            if self.reward_part_of_goal:
+                goal_rewards, = maybe_goal_rewards
+
+                goal = cat((goal, goal_rewards / self.reward_norm), dim = -1)
 
             # forward state and goal
 
