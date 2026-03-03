@@ -1,7 +1,7 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
-#   "discrete-continuous-embed-readout",
+#   "discrete-continuous-embed-readout>=0.2.0",
 #   "fire",
 #   "gymnasium[box2d]",
 #   "gymnasium[other]",
@@ -65,16 +65,22 @@ def main(
     num_episodes = 50_000,
     max_timesteps = 500,
     num_episodes_before_learn = 512,
-    buffer_size = 512,
+    buffer_size = 1536,
     video_folder = './recordings',
     render_every_eps = None,
     dim_contrastive_embed = 64,
-    cl_train_steps = 5000,
+    cl_train_steps = 2500,
     cl_batch_size = 256,
     actor_batch_size = 128,
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
+    actor_dim = 64,
+    actor_depth = 4,
+    critic_dim = 64,
+    critic_depth = 8,
+    goal_dim = 64,
+    goal_depth = 8,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
     repetition_factor = 2,
@@ -83,6 +89,8 @@ def main(
     cl_l2norm_embed = True,
     exploration_random_goal_prob = 0.025,
     exploration_sample_from_buffer_prob = 0.5,
+    reward_part_of_goal = False,
+    reward_norm = 100.,
     use_wandb = False,
     cpu = False
 ):
@@ -121,6 +129,7 @@ def main(
     )
 
     dim_state = 8
+    dim_goal = 8 + (1 if reward_part_of_goal else 0)
     dim_action = 2
 
     # replay buffer
@@ -132,6 +141,7 @@ def main(
         fields = dict(
             state = ('float', dim_state),
             action = ('float', dim_action),
+            reward = ('float', 1),
         ),
         circular = True,
         overwrite = True
@@ -139,35 +149,41 @@ def main(
 
     # model
 
-    device = torch.device('cpu') if cpu else torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    device = accelerator.device
 
     actor_encoder = nn.Sequential(
         ResidualNormedMLP(
-            dim_in = dim_state * 2,
-            dim = 32,
-            depth = 4,
-            dim_out = dim_action * 2,
+            dim_in = dim_state + dim_goal, # state and goal
+            dim = actor_dim,
+            depth = actor_depth,
+            residual_every = 2,
+            dim_out = dim_action * 2, # for kumaraswamy alpha and beta
             keel_post_ln = True
         ),
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
     ).to(device)
 
-    actor_readout = Readout(num_continuous = dim_action, continuous_squashed = False, dim = 0)
+    actor_readout = Readout(
+        num_continuous = dim_action,
+        continuous_dist_type = 'kumaraswamy',
+        continuous_dist_kwargs = dict(unimodal = True),
+        dim = 0
+    )
 
     critic_encoder = ResidualNormedMLP(
         dim_in = dim_state + dim_action,
-        dim = 64,
+        dim = critic_dim,
         dim_out = dim_contrastive_embed,
-        depth = 8,
+        depth = critic_depth,
         residual_every = 4,
         keel_post_ln = True
     ).to(device)
 
     goal_encoder = ResidualNormedMLP(
-        dim_in = dim_state,
-        dim = 64,
+        dim_in = dim_goal,
+        dim = goal_dim,
         dim_out = dim_contrastive_embed,
-        depth = 8,
+        depth = goal_depth,
         residual_every = 4,
         keel_post_ln = True
     ).to(device)
@@ -187,6 +203,8 @@ def main(
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
+        reward_part_of_goal = reward_part_of_goal,
+        reward_norm = reward_norm,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
@@ -194,6 +212,10 @@ def main(
     # assertions
 
     assert num_episodes_before_learn > cl_batch_size
+
+    def sample_fn(logits, differentiable = False):
+        action = actor_readout.sample(logits, differentiable = differentiable)
+        return action * 2 - 1
 
     actor_trainer = ActorTrainer(
         actor_encoder,
@@ -203,12 +225,18 @@ def main(
         learning_rate = actor_learning_rate,
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
-        softmax_actor_output = True,
+        softmax_actor_output = False,
+        reward_part_of_goal = reward_part_of_goal,
+        reward_norm = reward_norm,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
 
     actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
+
+    if reward_part_of_goal:
+        max_reward = tensor([1.], device = device, dtype = torch.float32)
+        actor_goal = cat((actor_goal, max_reward), dim = -1)
 
     # episodes
 
@@ -257,16 +285,24 @@ def main(
                     env,
                     exploration_sample_from_buffer_prob
                 ).to(device)
+
+                if reward_part_of_goal and eps_goal.shape[-1] == dim_state:
+                    rand_reward = torch.rand((1,), device = device, dtype = torch.float32)
+                    eps_goal = cat((eps_goal, rand_reward), dim = -1)
+
             states = []
             actions = []
+            rewards = []
 
             for _ in range(max_timesteps):
 
                 actor_encoder.eval()
 
-                action_logits = actor_encoder(cat((from_numpy(state).to(device), eps_goal), dim = -1))
+                curr_state = from_numpy(state).to(device)
 
-                action = actor_readout.sample(action_logits)
+                action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
+
+                action = sample_fn(action_logits)
 
                 next_state, reward, terminated, truncated, *_ = env.step(action.detach().cpu().numpy())
 
@@ -274,6 +310,7 @@ def main(
 
                 states.append(state)
                 actions.append(action.detach().cpu())
+                rewards.append(reward)
 
                 cum_reward += reward
                 eps_steps += 1
@@ -290,7 +327,8 @@ def main(
             if len(states) >= 2:
                 replay_buffer.store_episode(
                     state = states,
-                    action = actions
+                    action = actions,
+                    reward = rewards
                 )
 
             if not is_exploring:
@@ -309,26 +347,29 @@ def main(
             if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, num_episodes_before_learn):
 
                 data = replay_buffer.get_all_data(
-                    fields = ['state', 'action'],
+                    fields = ['state', 'action', 'reward'],
                     meta_fields = ['episode_lens']
                 )
 
                 trajectories = data['state']
                 episode_lens = data['episode_lens']
                 actions_for_critic = data['action']
+                rewards_for_critic = data['reward']
 
                 cl_loss = critic_trainer(
                     trajectories,
                     cl_train_steps,
                     lens = episode_lens,
-                    actions = actions_for_critic
+                    actions = actions_for_critic,
+                    rewards = rewards_for_critic
                 )
 
                 actor_loss = actor_trainer(
                     trajectories,
                     actor_num_train_steps,
                     lens = episode_lens,
-                    sample_fn = actor_readout.sample
+                    rewards = rewards_for_critic,
+                    sample_fn = lambda logits: sample_fn(logits, differentiable = True)
                 )
 
                 dashboard.update_diagnostics(

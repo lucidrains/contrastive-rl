@@ -1,7 +1,7 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
-#   "discrete-continuous-embed-readout",
+#   "discrete-continuous-embed-readout>=0.2.0",
 #   "fire",
 #   "gymnasium[mujoco]",
 #   "memmap-replay-buffer>=0.0.10",
@@ -58,6 +58,22 @@ def divisible_by(num, den):
 
 def module_device(m):
     return next(m.parameters()).device
+
+def is_tensor(t):
+    return isinstance(t, torch.Tensor)
+
+def rescale(t, from_range, to_range):
+    if is_tensor(from_range):
+        from_min, from_max = from_range.unbind(dim = -1)
+    else:
+        from_min, from_max = from_range
+
+    if is_tensor(to_range):
+        to_min, to_max = to_range.unbind(dim = -1)
+    else:
+        to_min, to_max = to_range
+
+    return (t - from_min) / (from_max - from_min) * (to_max - to_min) + to_min
 
 # main
 
@@ -141,7 +157,7 @@ def main(
 
     # model
 
-    device = torch.device('cpu') if cpu else torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
+    device = accelerator.device
 
     actor_encoder = nn.Sequential(
         ResidualNormedMLP(
@@ -154,7 +170,12 @@ def main(
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
     ).to(device)
 
-    actor_readout = Readout(num_continuous = action_dim, continuous_squashed = False, dim = 0)
+    actor_readout = Readout(
+        num_continuous = action_dim,
+        continuous_dist_type = 'kumaraswamy',
+        continuous_dist_kwargs = dict(unimodal = True),
+        dim = 0
+    )
 
     critic_encoder = ResidualNormedMLP(
         dim_in = obs_dim + action_dim,
@@ -205,7 +226,7 @@ def main(
         learning_rate = actor_learning_rate,
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
-        softmax_actor_output = True,
+        softmax_actor_output = False,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
@@ -220,6 +241,15 @@ def main(
     actor_goal[0] = 1.3  # target height
     actor_goal[1] = 1.0  # target orientation
     actor_goal[22] = 1.0 # target x-velocity
+
+    # action limits for rescaling
+
+    action_low = torch.from_numpy(env.action_space.low).to(device)
+    action_high = torch.from_numpy(env.action_space.high).to(device)
+
+    def sample_fn(logits, differentiable = False):
+        action = actor_readout.sample(logits, differentiable = differentiable)
+        return rescale(action, (0., 1.), (action_low, action_high))
 
     # episodes
 
@@ -280,7 +310,7 @@ def main(
 
                 action_logits = actor_encoder(cat((from_numpy(state).to(device), eps_goal), dim = -1))
 
-                action = actor_readout.sample(action_logits)
+                action = sample_fn(action_logits, differentiable = False)
 
                 next_state, reward, terminated, truncated, *_ = env.step(action.detach().cpu().numpy())
 
@@ -342,7 +372,7 @@ def main(
                     trajectories,
                     num_train_steps = actor_num_train_steps,
                     lens = episode_lens,
-                    sample_fn = actor_readout.sample
+                    sample_fn = sample_fn
                 )
 
                 dashboard.update_diagnostics(
