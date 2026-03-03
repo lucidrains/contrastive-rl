@@ -22,6 +22,8 @@ import torch
 from torch import nn, from_numpy, cat
 import torch.nn.functional as F
 
+torch.autograd.set_detect_anomaly(True)
+
 from einops import rearrange, repeat
 
 import gymnasium as gym
@@ -114,7 +116,7 @@ def main(
     actor_batch_size = 128,
     actor_num_train_steps = 1_500,
     critic_learning_rate = 3e-4,
-    actor_learning_rate = 1e-4,
+    actor_learning_rate = 3e-4,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
     repetition_factor = 2,
@@ -126,6 +128,7 @@ def main(
     use_hl_gauss_critic_actions = True,
     hl_gauss_num_bins = 16,
     hl_gauss_sigma = 0.05,
+    actor_dist_type = 'squashed_gaussian',
     use_wandb = False,
     cpu = False
 ):
@@ -197,10 +200,24 @@ def main(
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
     ).to(device)
 
+    if actor_dist_type == 'squashed_gaussian':
+        continuous_dist_type = 'gaussian'
+        continuous_dist_kwargs = dict()
+        continuous_squashed = True
+        from_range = (-1., 1.)
+    elif actor_dist_type == 'kumaraswamy':
+        continuous_dist_type = 'kumaraswamy'
+        continuous_dist_kwargs = dict(unimodal = True)
+        continuous_squashed = False
+        from_range = (0., 1.)
+    else:
+        raise ValueError(f'invalid actor_dist_type {actor_dist_type}. must be "squashed_gaussian" or "kumaraswamy"')
+
     actor_readout = Readout(
         num_continuous = action_dim,
-        continuous_dist_type = 'kumaraswamy',
-        continuous_dist_kwargs = dict(unimodal = True),
+        continuous_dist_type = continuous_dist_type,
+        continuous_dist_kwargs = continuous_dist_kwargs,
+        continuous_squashed = continuous_squashed,
         dim = 0
     )
 
@@ -286,9 +303,9 @@ def main(
     action_low = torch.from_numpy(env.single_action_space.low).to(device)
     action_high = torch.from_numpy(env.single_action_space.high).to(device)
 
-    def sample_fn(logits, differentiable = False):
+    def sample_fn(logits, differentiable = False, from_range = from_range):
         action = actor_readout.sample(logits, differentiable = differentiable)
-        return action * 0.8 - 0.4
+        return rescale(action, from_range, (action_low, action_high))
 
     # goal sampling for exploration
 
@@ -325,7 +342,8 @@ def main(
             exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob,
             use_hl_gauss_critic_actions = use_hl_gauss_critic_actions,
             hl_gauss_num_bins = hl_gauss_num_bins,
-            hl_gauss_sigma = f'{hl_gauss_sigma}' if hl_gauss_sigma else 'None'
+            hl_gauss_sigma = f'{hl_gauss_sigma}' if hl_gauss_sigma else 'None',
+            actor_dist_type = actor_dist_type
         )
     )
 
@@ -359,7 +377,7 @@ def main(
 
             with torch.no_grad():
                 action_logits = actor_encoder(cat((from_numpy(state).to(device), eps_goal), dim = -1))
-                action = sample_fn(action_logits, differentiable = False)
+                action = sample_fn(action_logits, differentiable = False, from_range = from_range)
 
             # environment step
 
@@ -430,7 +448,7 @@ def main(
                     trajectories,
                     num_train_steps = actor_num_train_steps,
                     lens = episode_lens,
-                    sample_fn = lambda logits: sample_fn(logits, differentiable = True),
+                    sample_fn = lambda logits: sample_fn(logits, differentiable = True, from_range = from_range),
                     pbar = dashboard.actor_pbar
                 )
 
