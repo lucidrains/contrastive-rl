@@ -7,6 +7,7 @@
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.10",
 #   "x-mlps-pytorch>=0.1.32",
+#   "hl-gauss-pytorch@file:///Users/philwang/dl/hl-gauss-pytorch",
 #   "tqdm"
 # ]
 # ///
@@ -43,6 +44,8 @@ from einops.layers.torch import Rearrange
 from x_mlps_pytorch import ResidualNormedMLP
 from discrete_continuous_embed_readout import Readout
 
+from hl_gauss_pytorch import HLGaussLoss
+
 from dashboard import Dashboard
 
 # functions
@@ -58,6 +61,35 @@ def divisible_by(num, den):
 
 def module_device(m):
     return next(m.parameters()).device
+
+# classes
+
+class CriticWrapper(nn.Module):
+    def __init__(
+        self,
+        encoder: nn.Module,
+        hl_gauss: nn.Module | None,
+        dim_action: int
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.hl_gauss = hl_gauss
+        self.dim_action = dim_action
+
+    def forward(self, state_and_action):
+        if not exists(self.hl_gauss):
+            return self.encoder(state_and_action)
+
+        dim_action = self.dim_action
+
+        state, action = state_and_action[..., :-dim_action], state_and_action[..., -dim_action:]
+
+        action_probs = self.hl_gauss.transform_to_probs(action)
+        action_probs = rearrange(action_probs, '... a bins -> ... (a bins)')
+
+        state_and_action = cat((state, action_probs), dim = -1)
+
+        return self.encoder(state_and_action)
 
 # main
 
@@ -91,6 +123,9 @@ def main(
     exploration_sample_from_buffer_prob = 0.5,
     reward_part_of_goal = False,
     reward_norm = 100.,
+    use_hl_gauss_critic_actions = True,
+    hl_gauss_num_bins = 16,
+    hl_gauss_sigma = None,
     use_wandb = False,
     cpu = False
 ):
@@ -170,14 +205,29 @@ def main(
         dim = 0
     )
 
+    hl_gauss = None
+    critic_dim_action = dim_action
+
+    if use_hl_gauss_critic_actions:
+        hl_gauss = HLGaussLoss(
+            min_value = -1.,
+            max_value = 1.,
+            num_bins = hl_gauss_num_bins,
+            sigma = hl_gauss_sigma,
+            clamp_to_range = True
+        ).to(device)
+        critic_dim_action = dim_action * hl_gauss_num_bins
+
     critic_encoder = ResidualNormedMLP(
-        dim_in = dim_state + dim_action,
+        dim_in = dim_state + critic_dim_action,
         dim = critic_dim,
         dim_out = dim_contrastive_embed,
         depth = critic_depth,
         residual_every = 4,
         keel_post_ln = True
     ).to(device)
+
+    critic_encoder = CriticWrapper(critic_encoder, hl_gauss, dim_action)
 
     goal_encoder = ResidualNormedMLP(
         dim_in = dim_goal,
@@ -259,7 +309,10 @@ def main(
             repetition_factor = f"{repetition_factor}",
             use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
             exploration_random_goal_prob = exploration_random_goal_prob,
-            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob
+            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob,
+            use_hl_gauss_critic_actions = use_hl_gauss_critic_actions,
+            hl_gauss_num_bins = hl_gauss_num_bins,
+            hl_gauss_sigma = f"{hl_gauss_sigma}" if hl_gauss_sigma else "None"
         )
     )
 
@@ -335,7 +388,7 @@ def main(
                 rolling_reward.append(cum_reward)
                 rolling_steps.append(eps_steps)
 
-                dashboard.update_diagnostics(
+                dashboard.update_metrics(
                     last_eps_reward = f"{cum_reward:.2f}",
                     last_eps_steps = eps_steps
                 )
@@ -372,7 +425,7 @@ def main(
                     sample_fn = lambda logits: sample_fn(logits, differentiable = True)
                 )
 
-                dashboard.update_diagnostics(
+                dashboard.update_metrics(
                     critic_loss = f"{cl_loss:.4f}",
                     actor_loss = f"{actor_loss:.4f}"
                 )
@@ -383,7 +436,7 @@ def main(
                 avg_reward = sum(rolling_reward) / len(rolling_reward) if len(rolling_reward) > 0 else 0.
                 avg_steps = sum(rolling_steps) / len(rolling_steps) if len(rolling_steps) > 0 else 0.
 
-                dashboard.update_episode_info(
+                dashboard.update_metrics(
                     avg_cum_reward_100 = f"{avg_reward:.2f}",
                     avg_steps_100 = f"{avg_steps:.1f}"
                 )

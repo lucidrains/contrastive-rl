@@ -350,7 +350,7 @@ class ContrastiveRLTrainer(Module):
         # training steps
 
         loss_item = 0.
-        
+
         if not exists(pbar):
             pbar = tqdm
 
@@ -573,7 +573,7 @@ class ActorTrainer(Module):
         # training loop
 
         self.actor.train()
-        
+
         if not exists(pbar):
             pbar = tqdm
 
@@ -616,7 +616,7 @@ class ActorTrainer(Module):
             loss = -sim.mean()
 
             self.accelerator.backward(loss)
-            
+
             pbar_instance.set_description(f'actor loss: {loss.item():.3f}')
 
             if exists(self.max_grad_norm):
