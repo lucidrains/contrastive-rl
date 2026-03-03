@@ -319,7 +319,8 @@ class ContrastiveRLTrainer(Module):
         lens = None,        # (n)
         actions = None,     # (n na)
         rewards = None,     # (n t)
-        goal_state = None   # (n t dg)
+        goal_state = None,   # (n t dg)
+        pbar = None
     ):
         traj_var_lens = exists(lens)
 
@@ -349,9 +350,13 @@ class ContrastiveRLTrainer(Module):
         # training steps
 
         loss_item = 0.
-        pbar = tqdm(range(num_train_steps), disable = not self.accelerator.is_main_process)
+        
+        if not exists(pbar):
+            pbar = tqdm
 
-        for _ in pbar:
+        pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
+
+        for _ in pbar_instance:
 
             data = next(iter_dataloader)
 
@@ -433,7 +438,7 @@ class ContrastiveRLTrainer(Module):
             loss = self.contrast_wrapper(past_obs, future_obs, past_action)
 
             loss_item = loss.item()
-            pbar.set_description(f'loss: {loss_item:.3f}')
+            pbar_instance.set_description(f'loss: {loss_item:.3f}')
 
             # backwards and optimizer step
 
@@ -515,7 +520,8 @@ class ActorTrainer(Module):
         *,
         lens = None,
         rewards = None,
-        sample_fn = None
+        sample_fn = None,
+        pbar = None
     ):
 
         device = self.device
@@ -567,10 +573,13 @@ class ActorTrainer(Module):
         # training loop
 
         self.actor.train()
+        
+        if not exists(pbar):
+            pbar = tqdm
 
-        pbar = tqdm(range(num_train_steps), disable = not self.accelerator.is_main_process)
+        pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
 
-        for _ in pbar:
+        for _ in pbar_instance:
 
             state, = next(iter_dataloader)
             goal, *maybe_goal_rewards = next(iter_goal_dataloader)
@@ -607,8 +616,8 @@ class ActorTrainer(Module):
             loss = -sim.mean()
 
             self.accelerator.backward(loss)
-
-            pbar.set_description(f'actor loss: {loss.item():.3f}')
+            
+            pbar_instance.set_description(f'actor loss: {loss.item():.3f}')
 
             if exists(self.max_grad_norm):
                 self.accelerator.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)

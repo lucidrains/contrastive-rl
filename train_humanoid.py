@@ -3,10 +3,9 @@
 #   "contrastive-rl-pytorch",
 #   "discrete-continuous-embed-readout>=0.2.0",
 #   "fire",
-#   "gymnasium[mujoco]",
+#   "gymnasium[mujoco,other]",
 #   "memmap-replay-buffer>=0.0.10",
 #   "x-mlps-pytorch>=0.1.32",
-#   "tqdm"
 # ]
 # ///
 
@@ -16,16 +15,14 @@ import os
 import numpy as np
 from fire import Fire
 from shutil import rmtree
-from pathlib import Path
 from collections import deque
 
 import torch
-from torch import nn, from_numpy, cat, tensor, zeros_like
+from torch import nn, from_numpy, cat
 import torch.nn.functional as F
 
-from einops import rearrange
+from einops import rearrange, repeat
 
-from tqdm import tqdm
 import gymnasium as gym
 from accelerate import Accelerator
 
@@ -36,7 +33,6 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
-    sample_random_state
 )
 
 from einops.layers.torch import Rearrange
@@ -45,7 +41,7 @@ from discrete_continuous_embed_readout import Readout
 
 from dashboard import Dashboard
 
-# functions
+# helpers
 
 def exists(v):
     return v is not None
@@ -59,16 +55,13 @@ def divisible_by(num, den):
 def module_device(m):
     return next(m.parameters()).device
 
-def is_tensor(t):
-    return isinstance(t, torch.Tensor)
-
 def rescale(t, from_range, to_range):
-    if is_tensor(from_range):
+    if isinstance(from_range, torch.Tensor):
         from_min, from_max = from_range.unbind(dim = -1)
     else:
         from_min, from_max = from_range
 
-    if is_tensor(to_range):
+    if isinstance(to_range, torch.Tensor):
         to_min, to_max = to_range.unbind(dim = -1)
     else:
         to_min, to_max = to_range
@@ -79,16 +72,17 @@ def rescale(t, from_range, to_range):
 
 def main(
     num_episodes = 2_000_000,
+    num_envs = 8,
     max_timesteps = 1000,
     num_episodes_before_learn = 512,
-    buffer_size = 512,
+    buffer_size = 1536,
     video_folder = './recordings_humanoid',
     render_every_eps = None,
     dim_contrastive_embed = 64,
-    cl_train_steps = 10000,
+    cl_train_steps = 4_000,
     cl_batch_size = 256,
     actor_batch_size = 128,
-    actor_num_train_steps = 1000,
+    actor_num_train_steps = 1_500,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
     weight_decay = 1e-4,
@@ -122,13 +116,13 @@ def main(
 
     # env
 
-    env = gym.make('Humanoid-v5', render_mode = 'rgb_array')
+    env = gym.make_vec('Humanoid-v5', num_envs = num_envs, render_mode = 'rgb_array')
 
     # recording
 
-    render_every_eps = default(render_every_eps, num_episodes_before_learn)
+    render_every_eps = default(render_every_eps, num_episodes_before_learn // num_envs)
 
-    env = gym.wrappers.RecordVideo(
+    env = gym.wrappers.vector.RecordVideo(
         env = env,
         video_folder = video_folder,
         name_prefix = 'humanoid',
@@ -138,8 +132,8 @@ def main(
 
     # dims
 
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    obs_dim = env.single_observation_space.shape[0]
+    action_dim = env.single_action_space.shape[0]
 
     # replay buffer
 
@@ -202,6 +196,8 @@ def main(
     else:
         contrastive_learn = ContrastiveLearning(l2norm_embed = True, learned_temp = True)
 
+    # trainers
+
     critic_trainer = ContrastiveRLTrainer(
         critic_encoder,
         goal_encoder,
@@ -213,8 +209,6 @@ def main(
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
-
-    # assertions
 
     assert num_episodes_before_learn > cl_batch_size
 
@@ -231,176 +225,193 @@ def main(
         contrastive_learn = contrastive_learn
     )
 
-    # setup actor goal
-    # for Humanoid-v5 (default):
-    # obs[0] is torso height (qpos[2])
-    # obs[1:5] is torso orientation (qpos[3:7])
-    # obs[22] is x-velocity (qvel[0])
+    # actor goal
+    # Humanoid-v5: obs[0] = torso height, obs[1] = torso orientation, obs[22] = x-velocity
 
     actor_goal = torch.zeros(obs_dim, device = device)
-    actor_goal[0] = 1.3  # target height
-    actor_goal[1] = 1.0  # target orientation
-    actor_goal[22] = 1.0 # target x-velocity
+    actor_goal[0] = 1.3
+    actor_goal[1] = 1.0
+    actor_goal[22] = 1.0
 
-    # action limits for rescaling
+    # action rescaling
 
-    action_low = torch.from_numpy(env.action_space.low).to(device)
-    action_high = torch.from_numpy(env.action_space.high).to(device)
+    action_low = torch.from_numpy(env.single_action_space.low).to(device)
+    action_high = torch.from_numpy(env.single_action_space.high).to(device)
 
     def sample_fn(logits, differentiable = False):
         action = actor_readout.sample(logits, differentiable = differentiable)
         return rescale(action, (0., 1.), (action_low, action_high))
 
-    # episodes
+    # goal sampling for exploration
+
+    def sample_single_goal():
+        if replay_buffer.num_episodes > 0 and torch.rand(()) < exploration_sample_from_buffer_prob:
+            all_states = replay_buffer.get_all_data(fields = ['state'])['state']
+            flat = rearrange(all_states, '... d -> (...) d')
+            idx = torch.randint(0, flat.shape[0], (1,)).item()
+            return flat[idx].to(device)
+
+        return from_numpy(env.single_observation_space.sample()).float().to(device)
+
+    # dashboard
 
     rolling_reward = deque(maxlen = 100)
     rolling_steps = deque(maxlen = 100)
 
     dashboard = Dashboard(
         num_episodes,
-        title = "Contrastive RL - Humanoid",
-        env_name = "Humanoid-v5",
+        title = 'Contrastive RL - Humanoid',
+        env_name = 'Humanoid-v5',
         hyperparams = dict(
             critic_learning_rate = critic_learning_rate,
             actor_learning_rate = actor_learning_rate,
             cl_batch_size = cl_batch_size,
             actor_batch_size = actor_batch_size,
-            buffer_size = f"{buffer_size}",
-            max_timesteps = f"{max_timesteps}",
-            weight_decay = f"{weight_decay}",
-            max_grad_norm = f"{max_grad_norm}",
-            repetition_factor = f"{repetition_factor}",
+            buffer_size = buffer_size,
+            max_timesteps = max_timesteps,
+            weight_decay = weight_decay,
+            max_grad_norm = max_grad_norm,
+            repetition_factor = repetition_factor,
             use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
             exploration_random_goal_prob = exploration_random_goal_prob,
             exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob
         )
     )
 
+    # training loop
+
     with dashboard.create_renderable() as live:
-        for eps in range(num_episodes):
+        state, *_ = env.reset()
 
-            state, *_ = env.reset()
+        cum_reward = np.zeros(num_envs)
+        eps_steps = np.zeros(num_envs, dtype = int)
 
-            cum_reward = 0.
-            eps_steps = 0
-            cl_loss = 0.
-            actor_loss = 0.
+        is_exploring = torch.rand(num_envs) < exploration_random_goal_prob
+        eps_goal = repeat(actor_goal, 'd -> n d', n = num_envs)
 
-            # decide on goal for the episode
+        for i in range(num_envs):
+            if is_exploring[i]:
+                eps_goal[i] = sample_single_goal()
 
-            is_exploring = torch.rand(()) < exploration_random_goal_prob
+        states = [[] for _ in range(num_envs)]
+        actions = [[] for _ in range(num_envs)]
 
-            eps_goal = actor_goal
+        total_episodes = 0
+        episodes_since_last_learn = 0
 
-            if is_exploring:
-                eps_goal = sample_random_state(
-                    replay_buffer,
-                    env,
-                    exploration_sample_from_buffer_prob
-                ).to(device)
+        while total_episodes < num_episodes:
+            state = state.astype(np.float32)
 
-            states = []
-            actions = []
+            # actor inference
 
-            for _ in range(max_timesteps):
+            actor_encoder.eval()
 
-                state = state.astype(np.float32)
-
-                actor_encoder.eval()
-
+            with torch.no_grad():
                 action_logits = actor_encoder(cat((from_numpy(state).to(device), eps_goal), dim = -1))
-
                 action = sample_fn(action_logits, differentiable = False)
 
-                next_state, reward, terminated, truncated, *_ = env.step(action.detach().cpu().numpy())
+            # environment step
 
-                # store transition data
+            next_state, reward, terminated, truncated, infos = env.step(action.cpu().numpy())
 
-                states.append(state)
-                actions.append(action.detach().cpu())
+            for i in range(num_envs):
+                states[i].append(state[i])
+                actions[i].append(action[i].cpu())
 
-                cum_reward += reward
-                eps_steps += 1
+            cum_reward += reward
+            eps_steps += 1
 
-                done = truncated or terminated
+            # handle completed episodes
 
-                if done:
-                    break
+            done = terminated | truncated
 
-                state = next_state
+            for i in range(num_envs):
+                if not done[i]:
+                    continue
 
-            # store episode if length >= 2
+                total_episodes += 1
+                episodes_since_last_learn += 1
+                dashboard.advance_progress()
 
-            if len(states) >= 2:
-                replay_buffer.store_episode(
-                    state = states,
-                    action = actions
-                )
+                if len(actions[i]) >= 2:
+                    replay_buffer.store_episode(
+                        state = states[i],
+                        action = actions[i]
+                    )
 
-            if not is_exploring:
-                rolling_reward.append(cum_reward)
-                rolling_steps.append(eps_steps)
+                if not is_exploring[i]:
+                    rolling_reward.append(cum_reward[i])
+                    rolling_steps.append(int(eps_steps[i]))
 
-                dashboard.update_diagnostics(
-                    last_eps_reward = f"{cum_reward:.2f}",
-                    last_eps_steps = eps_steps
-                )
+                # reset accumulators and resample goal
 
-            live.update(dashboard.render())
+                states[i] = []
+                actions[i] = []
+                cum_reward[i] = 0.
+                eps_steps[i] = 0
 
-            # train the critic and actor
+                is_exploring[i] = torch.rand(()) < exploration_random_goal_prob
+                eps_goal[i] = sample_single_goal() if is_exploring[i] else actor_goal
 
-            if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, num_episodes_before_learn):
+            # training
+
+            if episodes_since_last_learn >= num_episodes_before_learn:
+                episodes_since_last_learn = 0
 
                 data = replay_buffer.get_all_data(
                     fields = ['state', 'action'],
                     meta_fields = ['episode_lens']
                 )
 
-                trajectories = data['state']
-                episode_lens = data['episode_lens']
-                actions_for_critic = data['action']
+                trajectories = torch.as_tensor(data['state']).to(device)
+                episode_lens = torch.as_tensor(data['episode_lens']).to(device)
+                actions_for_critic = torch.as_tensor(data['action']).to(device)
 
                 cl_loss = critic_trainer(
                     trajectories,
                     cl_train_steps,
                     lens = episode_lens,
-                    actions = actions_for_critic
+                    actions = actions_for_critic,
+                    pbar = dashboard.critic_pbar
                 )
 
                 actor_loss = actor_trainer(
                     trajectories,
                     num_train_steps = actor_num_train_steps,
                     lens = episode_lens,
-                    sample_fn = sample_fn
+                    sample_fn = sample_fn,
+                    pbar = dashboard.actor_pbar
                 )
 
-                dashboard.update_diagnostics(
-                    critic_loss = f"{cl_loss:.4f}",
-                    actor_loss = f"{actor_loss:.4f}"
+                dashboard.update_metrics(
+                    critic_loss = f'{cl_loss:.4f}',
+                    actor_loss = f'{actor_loss:.4f}'
                 )
 
-            dashboard.advance_progress()
+            # update dashboard
 
-            if not is_exploring:
-                avg_reward = sum(rolling_reward) / len(rolling_reward) if len(rolling_reward) > 0 else 0.
-                avg_steps = sum(rolling_steps) / len(rolling_steps) if len(rolling_steps) > 0 else 0.
+            if len(rolling_reward) > 0:
+                avg_reward = sum(rolling_reward) / len(rolling_reward)
+                avg_steps = sum(rolling_steps) / len(rolling_steps)
 
-                dashboard.update_episode_info(
-                    avg_cum_reward_100 = f"{avg_reward:.2f}",
-                    avg_steps_100 = f"{avg_steps:.1f}"
+                dashboard.update_metrics(
+                    avg_cum_reward_100 = f'{avg_reward:.2f}',
+                    avg_steps_100 = f'{avg_steps:.1f}',
+                    last_eps_reward = f'{rolling_reward[-1]:.2f}',
+                    last_eps_steps = rolling_steps[-1]
                 )
 
                 if use_wandb:
                     accelerator.log({
-                        "avg_cum_reward_100": avg_reward,
-                        "avg_steps_100": avg_steps,
-                        "last_eps_reward": cum_reward,
-                        "critic_loss": cl_loss,
-                        "actor_loss": actor_loss
+                        'avg_cum_reward_100': avg_reward,
+                        'avg_steps_100': avg_steps,
+                        'last_eps_reward': rolling_reward[-1],
+                        'critic_loss': cl_loss if 'cl_loss' in locals() else 0.,
+                        'actor_loss': actor_loss if 'actor_loss' in locals() else 0.
                     })
 
-            live.update(dashboard.render())
+            dashboard.refresh()
+            state = next_state
 
     if use_wandb:
         accelerator.end_training()
