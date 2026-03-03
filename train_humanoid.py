@@ -6,6 +6,7 @@
 #   "gymnasium[mujoco,other]",
 #   "memmap-replay-buffer>=0.0.10",
 #   "x-mlps-pytorch>=0.1.32",
+#   "hl-gauss-pytorch"
 # ]
 # ///
 
@@ -39,7 +40,36 @@ from einops.layers.torch import Rearrange
 from x_mlps_pytorch import ResidualNormedMLP
 from discrete_continuous_embed_readout import Readout
 
+from hl_gauss_pytorch import HLGaussLoss
+
 from dashboard import Dashboard
+
+# classes
+
+class CriticWrapper(nn.Module):
+    def __init__(
+        self,
+        encoder: nn.Module,
+        hl_gauss: nn.Module | None,
+        dim_action: int
+    ):
+        super().__init__()
+        self.encoder = encoder
+        self.hl_gauss = hl_gauss
+        self.dim_action = dim_action
+
+    def forward(self, state_and_action):
+        if not exists(self.hl_gauss):
+            return self.encoder(state_and_action)
+
+        dim_action = self.dim_action
+        state, action = state_and_action[..., :-dim_action], state_and_action[..., -dim_action:]
+
+        action_probs = self.hl_gauss.transform_to_probs(action)
+        action_probs = rearrange(action_probs, '... a bins -> ... (a bins)')
+
+        state_and_action = cat((state, action_probs), dim = -1)
+        return self.encoder(state_and_action)
 
 # helpers
 
@@ -84,7 +114,7 @@ def main(
     actor_batch_size = 128,
     actor_num_train_steps = 1_500,
     critic_learning_rate = 3e-4,
-    actor_learning_rate = 3e-4,
+    actor_learning_rate = 1e-4,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
     repetition_factor = 2,
@@ -93,6 +123,9 @@ def main(
     cl_l2norm_embed = True,
     exploration_random_goal_prob = 0.025,
     exploration_sample_from_buffer_prob = 0.5,
+    use_hl_gauss_critic_actions = True,
+    hl_gauss_num_bins = 16,
+    hl_gauss_sigma = 0.05,
     use_wandb = False,
     cpu = False
 ):
@@ -171,14 +204,29 @@ def main(
         dim = 0
     )
 
+    hl_gauss = None
+    critic_dim_action = action_dim
+
+    if use_hl_gauss_critic_actions:
+        hl_gauss = HLGaussLoss(
+            min_value = -0.4,
+            max_value = 0.4,
+            num_bins = hl_gauss_num_bins,
+            sigma = hl_gauss_sigma,
+        ).to(device)
+
+        critic_dim_action = action_dim * hl_gauss_num_bins
+
     critic_encoder = ResidualNormedMLP(
-        dim_in = obs_dim + action_dim,
+        dim_in = obs_dim + critic_dim_action,
         dim = 256,
         dim_out = dim_contrastive_embed,
         depth = 16,
         residual_every = 4,
         keel_post_ln = True
     ).to(device)
+
+    critic_encoder = CriticWrapper(critic_encoder, hl_gauss, action_dim)
 
     goal_encoder = ResidualNormedMLP(
         dim_in = obs_dim,
@@ -240,7 +288,7 @@ def main(
 
     def sample_fn(logits, differentiable = False):
         action = actor_readout.sample(logits, differentiable = differentiable)
-        return rescale(action, (0., 1.), (action_low, action_high))
+        return action * 0.8 - 0.4
 
     # goal sampling for exploration
 
@@ -274,7 +322,10 @@ def main(
             repetition_factor = repetition_factor,
             use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
             exploration_random_goal_prob = exploration_random_goal_prob,
-            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob
+            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob,
+            use_hl_gauss_critic_actions = use_hl_gauss_critic_actions,
+            hl_gauss_num_bins = hl_gauss_num_bins,
+            hl_gauss_sigma = f'{hl_gauss_sigma}' if hl_gauss_sigma else 'None'
         )
     )
 
@@ -379,7 +430,7 @@ def main(
                     trajectories,
                     num_train_steps = actor_num_train_steps,
                     lens = episode_lens,
-                    sample_fn = sample_fn,
+                    sample_fn = lambda logits: sample_fn(logits, differentiable = True),
                     pbar = dashboard.actor_pbar
                 )
 
