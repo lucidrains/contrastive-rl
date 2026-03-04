@@ -1,7 +1,7 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
-#   "discrete-continuous-embed-readout>=0.2.0",
+#   "discrete-continuous-embed-readout>=0.2.1",
 #   "fire",
 #   "gymnasium[mujoco,other]",
 #   "memmap-replay-buffer>=0.0.10",
@@ -21,8 +21,6 @@ from collections import deque
 import torch
 from torch import nn, from_numpy, cat
 import torch.nn.functional as F
-
-torch.autograd.set_detect_anomaly(True)
 
 from einops import rearrange, repeat
 
@@ -86,19 +84,6 @@ def divisible_by(num, den):
 
 def module_device(m):
     return next(m.parameters()).device
-
-def rescale(t, from_range, to_range):
-    if isinstance(from_range, torch.Tensor):
-        from_min, from_max = from_range.unbind(dim = -1)
-    else:
-        from_min, from_max = from_range
-
-    if isinstance(to_range, torch.Tensor):
-        to_min, to_max = to_range.unbind(dim = -1)
-    else:
-        to_min, to_max = to_range
-
-    return (t - from_min) / (from_max - from_min) * (to_max - to_min) + to_min
 
 # main
 
@@ -303,9 +288,8 @@ def main(
     action_low = torch.from_numpy(env.single_action_space.low).to(device)
     action_high = torch.from_numpy(env.single_action_space.high).to(device)
 
-    def sample_fn(logits, differentiable = False, from_range = from_range):
-        action = actor_readout.sample(logits, differentiable = differentiable)
-        return rescale(action, from_range, (action_low, action_high))
+    def sample_fn(logits, differentiable = False):
+        return actor_readout.sample(logits, differentiable = differentiable, rescale_range = (action_low, action_high))
 
     # goal sampling for exploration
 
@@ -377,7 +361,7 @@ def main(
 
             with torch.no_grad():
                 action_logits = actor_encoder(cat((from_numpy(state).to(device), eps_goal), dim = -1))
-                action = sample_fn(action_logits, differentiable = False, from_range = from_range)
+                action = sample_fn(action_logits, differentiable = False)
 
             # environment step
 
@@ -448,7 +432,7 @@ def main(
                     trajectories,
                     num_train_steps = actor_num_train_steps,
                     lens = episode_lens,
-                    sample_fn = lambda logits: sample_fn(logits, differentiable = True, from_range = from_range),
+                    sample_fn = lambda logits: sample_fn(logits, differentiable = True),
                     pbar = dashboard.actor_pbar
                 )
 

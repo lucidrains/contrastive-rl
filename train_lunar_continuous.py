@@ -1,13 +1,13 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
-#   "discrete-continuous-embed-readout>=0.2.0",
+#   "discrete-continuous-embed-readout>=0.2.1",
 #   "fire",
 #   "gymnasium[box2d]",
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.10",
 #   "x-mlps-pytorch>=0.1.32",
-#   "hl-gauss-pytorch@file:///Users/philwang/dl/hl-gauss-pytorch",
+#   "hl-gauss-pytorch>=0.2.2",
 #   "tqdm"
 # ]
 # ///
@@ -192,7 +192,7 @@ def main(
             dim = actor_dim,
             depth = actor_depth,
             residual_every = 2,
-            dim_out = dim_action * 2, # for kumaraswamy alpha and beta
+            dim_out = dim_action * 2, # for squashed gaussian mu and logvar
             keel_post_ln = True
         ),
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
@@ -200,8 +200,8 @@ def main(
 
     actor_readout = Readout(
         num_continuous = dim_action,
-        continuous_dist_type = 'kumaraswamy',
-        continuous_dist_kwargs = dict(unimodal = True),
+        continuous_dist_type = 'gaussian',
+        continuous_squashed = True,
         dim = 0
     )
 
@@ -264,8 +264,7 @@ def main(
     assert num_episodes_before_learn > cl_batch_size
 
     def sample_fn(logits, differentiable = False):
-        action = actor_readout.sample(logits, differentiable = differentiable)
-        return action * 2 - 1
+        return actor_readout.sample(logits, differentiable = differentiable, rescale_range = (-1., 1.))
 
     actor_trainer = ActorTrainer(
         actor_encoder,
