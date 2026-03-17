@@ -98,6 +98,8 @@ class Dashboard:
         critic_task = self.train_progress.add_task('Critic', total = 100, visible = True)
         actor_task = self.train_progress.add_task('Actor', total = 100, visible = True)
 
+        self.actor_task = actor_task
+
         self.critic_pbar = DashboardPBar(self, critic_task, 'Critic')
         self.actor_pbar = DashboardPBar(self, actor_task, 'Actor')
 
@@ -119,6 +121,8 @@ class Dashboard:
 
     def show_training_bar(self, task_id, total):
         self.train_progress.update(task_id, total = total, completed = 0, visible = True)
+        if task_id == self.critic_pbar.task_id:
+            self.train_progress.update(self.actor_task, completed = 0)
         self.is_training = True
 
     def advance_training_bar(self, task_id):

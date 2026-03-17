@@ -231,7 +231,7 @@ def main(
     )
 
     base_actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
-    max_step_reward = 1.0
+    max_step_reward = 3.0
 
     # episodes
 
@@ -296,7 +296,7 @@ def main(
                 ).to(device)
 
                 if reward_part_of_goal and eps_goal.shape[-1] == dim_state:
-                    rand_reward = torch.rand((1,), device = device, dtype = torch.float32)
+                    rand_reward = torch.rand((1,), device = device, dtype = torch.float32) * (max_step_reward / reward_norm)
 
                     if reward_fourier_encode:
                         actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(device)
@@ -338,9 +338,6 @@ def main(
                     break
 
                 state = next_state
-
-            if len(rewards) > 0:
-                max_step_reward = max(max_step_reward, max(rewards))
 
             # store episode if length >= 2
 
