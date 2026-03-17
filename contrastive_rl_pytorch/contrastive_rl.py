@@ -96,6 +96,24 @@ def sample_random_state(
     return from_numpy(state).float()
 
 
+# fourier encode
+
+class FourierEncode(Module):
+    def __init__(
+        self,
+        dim
+    ):
+        super().__init__()
+        assert divisible_by(dim, 2)
+        self.dim = dim
+        self.register_buffer('weight', torch.randn(1, dim // 2))
+
+    def forward(self, x):
+        if x.ndim == 1:
+            x = rearrange(x, '... -> ... 1')
+        x = x @ self.weight
+        return cat((x.sin(), x.cos()), dim = -1)
+
 # contrastive wrapper module
 
 class ContrastiveLearning(Module):
@@ -254,6 +272,8 @@ class ContrastiveRLTrainer(Module):
         discount = 0.99,
         reward_part_of_goal = False,
         reward_norm = 1.0,
+        reward_fourier_encode = False,
+        reward_fourier_dim = 16,
         contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
@@ -280,6 +300,10 @@ class ContrastiveRLTrainer(Module):
 
         self.reward_part_of_goal = reward_part_of_goal
         self.reward_norm = reward_norm
+        self.reward_fourier_encode = None
+
+        if reward_part_of_goal and reward_fourier_encode:
+            self.reward_fourier_encode = FourierEncode(reward_fourier_dim)
 
         optimizer = AdamW(contrast_wrapper.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
 
@@ -420,7 +444,15 @@ class ContrastiveRLTrainer(Module):
                 rewards = repeat(rewards, 'b ... -> (b r) ...', r = self.repetition_factor)
                 picked_rewards = rearrange(rewards[batch_arange, future_times], 'b 1 ... -> b ...')
 
-                future_obs = cat((future_obs, picked_rewards / self.reward_norm), dim = -1)
+                future_obs_rewards = picked_rewards / self.reward_norm
+
+                if exists(self.reward_fourier_encode):
+                    self.reward_fourier_encode = self.reward_fourier_encode.to(self.device)
+                    future_obs_rewards = self.reward_fourier_encode(future_obs_rewards)
+                elif future_obs_rewards.ndim == 1:
+                    future_obs_rewards = rearrange(future_obs_rewards, '... -> ... 1')
+
+                future_obs = cat((future_obs, future_obs_rewards), dim = -1)
 
             # handle maybe action
 
@@ -469,6 +501,8 @@ class ActorTrainer(Module):
         softmax_actor_output = False,
         reward_part_of_goal = False,
         reward_norm = 1.0,
+        reward_fourier_encode = False,
+        reward_fourier_dim = 16,
         contrastive_learn: Module | None = None,
         cpu = False,
     ):
@@ -505,6 +539,10 @@ class ActorTrainer(Module):
 
         self.reward_part_of_goal = reward_part_of_goal
         self.reward_norm = reward_norm
+        self.reward_fourier_encode = None
+
+        if reward_part_of_goal and reward_fourier_encode:
+            self.reward_fourier_encode = FourierEncode(reward_fourier_dim)
 
     @property
     def device(self):
@@ -587,7 +625,15 @@ class ActorTrainer(Module):
             if self.reward_part_of_goal:
                 goal_rewards, = maybe_goal_rewards
 
-                goal = cat((goal, goal_rewards / self.reward_norm), dim = -1)
+                goal_rewards = goal_rewards / self.reward_norm
+
+                if exists(self.reward_fourier_encode):
+                    self.reward_fourier_encode = self.reward_fourier_encode.to(self.device)
+                    goal_rewards = self.reward_fourier_encode(goal_rewards)
+                elif goal_rewards.ndim == 1:
+                    goal_rewards = rearrange(goal_rewards, '... -> ... 1')
+
+                goal = cat((goal, goal_rewards), dim = -1)
 
             # forward state and goal
 

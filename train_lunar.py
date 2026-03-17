@@ -64,13 +64,13 @@ def module_device(m):
 def main(
     num_episodes = 50_000,
     max_timesteps = 500,
-    num_episodes_before_learn = 64,
+    num_episodes_before_learn = 128,
     buffer_size = 512,
     video_folder = './recordings',
     render_every_eps = None,
     dim_contrastive_embed = 64,
     cl_train_steps = 2_500,
-    cl_batch_size = 32,
+    cl_batch_size = 64,
     actor_batch_size = 128,
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
@@ -92,6 +92,8 @@ def main(
     exploration_sample_from_buffer_prob = 0.5,
     reward_part_of_goal = False,
     reward_norm = 100.,
+    reward_fourier_encode = False,
+    reward_fourier_dim = 16,
     use_attn_residual_mlp = True,
     use_wandb = False,
     cpu = False
@@ -131,7 +133,9 @@ def main(
     )
 
     dim_state = 8
-    dim_goal = 8 + (1 if reward_part_of_goal else 0)
+    dim_goal = 8
+    if reward_part_of_goal:
+        dim_goal += reward_fourier_dim if reward_fourier_encode else 1
     dim_action = 4
 
     # replay buffer
@@ -199,6 +203,8 @@ def main(
         repetition_factor = repetition_factor,
         reward_part_of_goal = reward_part_of_goal,
         reward_norm = reward_norm,
+        reward_fourier_encode = reward_fourier_encode,
+        reward_fourier_dim = reward_fourier_dim,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
@@ -218,15 +224,14 @@ def main(
         softmax_actor_output = True,
         reward_part_of_goal = reward_part_of_goal,
         reward_norm = reward_norm,
+        reward_fourier_encode = reward_fourier_encode,
+        reward_fourier_dim = reward_fourier_dim,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
 
-    actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
-
-    if reward_part_of_goal:
-        max_reward = tensor([1.], device = device, dtype = torch.float32)
-        actor_goal = cat((actor_goal, max_reward), dim = -1)
+    base_actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
+    max_step_reward = 1.0
 
     # episodes
 
@@ -253,6 +258,8 @@ def main(
             exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob,
             reward_part_of_goal = reward_part_of_goal,
             reward_norm = reward_norm,
+            reward_fourier_encode = reward_fourier_encode,
+            reward_fourier_dim = reward_fourier_dim,
             use_attn_residual_mlp = use_attn_residual_mlp
         )
     )
@@ -271,7 +278,15 @@ def main(
 
             is_exploring = torch.rand((), device = device) < exploration_random_goal_prob
 
-            eps_goal = actor_goal
+            eps_goal = base_actor_goal
+
+            if reward_part_of_goal:
+                max_reward_tensor = tensor([max_step_reward / reward_norm], device = device, dtype = torch.float32)
+                if reward_fourier_encode:
+                    actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(device)
+                    max_reward_tensor = actor_trainer.reward_fourier_encode(max_reward_tensor)
+                    max_reward_tensor = rearrange(max_reward_tensor, '1 d -> d')
+                eps_goal = cat((eps_goal, max_reward_tensor), dim = -1)
 
             if is_exploring:
                 eps_goal = sample_random_state(
@@ -282,6 +297,12 @@ def main(
 
                 if reward_part_of_goal and eps_goal.shape[-1] == dim_state:
                     rand_reward = torch.rand((1,), device = device, dtype = torch.float32)
+
+                    if reward_fourier_encode:
+                        actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(device)
+                        rand_reward = actor_trainer.reward_fourier_encode(rand_reward)
+                        rand_reward = rearrange(rand_reward, '1 d -> d')
+
                     eps_goal = cat((eps_goal, rand_reward), dim = -1)
 
             states = []
@@ -317,6 +338,9 @@ def main(
                     break
 
                 state = next_state
+
+            if len(rewards) > 0:
+                max_step_reward = max(max_step_reward, max(rewards))
 
             # store episode if length >= 2
 
