@@ -6,7 +6,7 @@
 #   "gymnasium[box2d]",
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.10",
-#   "x-mlps-pytorch>=0.1.32",
+#   "x-mlps-pytorch>=0.3.0",
 #   "hl-gauss-pytorch>=0.2.2",
 #   "tqdm"
 # ]
@@ -18,6 +18,7 @@ import os
 from fire import Fire
 from shutil import rmtree
 from collections import deque
+from functools import partial
 
 import torch
 from torch import nn, from_numpy, cat, tensor
@@ -41,7 +42,7 @@ from contrastive_rl_pytorch import (
 )
 
 from einops.layers.torch import Rearrange
-from x_mlps_pytorch import ResidualNormedMLP
+from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
 from discrete_continuous_embed_readout import Readout
 
 from hl_gauss_pytorch import HLGaussLoss
@@ -96,13 +97,13 @@ class CriticWrapper(nn.Module):
 def main(
     num_episodes = 50_000,
     max_timesteps = 500,
-    num_episodes_before_learn = 512,
-    buffer_size = 1536,
+    num_episodes_before_learn = 64,
+    buffer_size = 512,
     video_folder = './recordings',
     render_every_eps = None,
     dim_contrastive_embed = 64,
-    cl_train_steps = 2500,
-    cl_batch_size = 256,
+    cl_train_steps = 2_500,
+    cl_batch_size = 32,
     actor_batch_size = 128,
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
@@ -126,6 +127,7 @@ def main(
     use_hl_gauss_critic_actions = True,
     hl_gauss_num_bins = 16,
     hl_gauss_sigma = None,
+    use_attn_residual_mlp = True,
     use_wandb = False,
     cpu = False
 ):
@@ -186,14 +188,17 @@ def main(
 
     device = accelerator.device
 
+    if use_attn_residual_mlp:
+        MLP = AttnResidualNormedMLP
+    else:
+        MLP = partial(ResidualNormedMLP, residual_every = 4, keel_post_ln = True)
+
     actor_encoder = nn.Sequential(
-        ResidualNormedMLP(
+        MLP(
             dim_in = dim_state + dim_goal, # state and goal
             dim = actor_dim,
             depth = actor_depth,
-            residual_every = 2,
-            dim_out = dim_action * 2, # for squashed gaussian mu and logvar
-            keel_post_ln = True
+            dim_out = dim_action * 2 # for squashed gaussian mu and logvar
         ),
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
     ).to(device)
@@ -218,24 +223,20 @@ def main(
         ).to(device)
         critic_dim_action = dim_action * hl_gauss_num_bins
 
-    critic_encoder = ResidualNormedMLP(
+    critic_encoder = MLP(
         dim_in = dim_state + critic_dim_action,
         dim = critic_dim,
         dim_out = dim_contrastive_embed,
-        depth = critic_depth,
-        residual_every = 4,
-        keel_post_ln = True
+        depth = critic_depth
     ).to(device)
 
     critic_encoder = CriticWrapper(critic_encoder, hl_gauss, dim_action)
 
-    goal_encoder = ResidualNormedMLP(
+    goal_encoder = MLP(
         dim_in = dim_goal,
         dim = goal_dim,
         dim_out = dim_contrastive_embed,
-        depth = goal_depth,
-        residual_every = 4,
-        keel_post_ln = True
+        depth = goal_depth
     ).to(device)
 
     # contrastive learning module
@@ -311,7 +312,8 @@ def main(
             exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob,
             use_hl_gauss_critic_actions = use_hl_gauss_critic_actions,
             hl_gauss_num_bins = hl_gauss_num_bins,
-            hl_gauss_sigma = f"{hl_gauss_sigma}" if hl_gauss_sigma else "None"
+            hl_gauss_sigma = f"{hl_gauss_sigma}" if hl_gauss_sigma else "None",
+            use_attn_residual_mlp = use_attn_residual_mlp
         )
     )
 
@@ -413,7 +415,8 @@ def main(
                     cl_train_steps,
                     lens = episode_lens,
                     actions = actions_for_critic,
-                    rewards = rewards_for_critic
+                    rewards = rewards_for_critic,
+                    pbar = dashboard.critic_pbar
                 )
 
                 actor_loss = actor_trainer(
@@ -421,6 +424,7 @@ def main(
                     actor_num_train_steps,
                     lens = episode_lens,
                     rewards = rewards_for_critic,
+                    pbar = dashboard.actor_pbar,
                     sample_fn = lambda logits: sample_fn(logits, differentiable = True)
                 )
 

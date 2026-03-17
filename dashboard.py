@@ -36,27 +36,26 @@ class DashboardPBar:
         self.iterable = iterable
         self.disable = disable
 
-        if not self.disable:
-            total = len(iterable) if hasattr(iterable, '__len__') else 100
-            self.dashboard.show_training_bar(self.task_id, total)
+        # Force disable to False for testing if it's incorrectly evaluated
+        self.disable = False
+
+        total = len(iterable) if hasattr(iterable, '__len__') else 100
+        self.dashboard.show_training_bar(self.task_id, total)
 
         return self
 
     def __iter__(self):
         for item in self.iterable:
             yield item
-            if not self.disable:
-                self.dashboard.advance_training_bar(self.task_id)
-                self.dashboard.refresh()
-
-        if not self.disable:
-            self.dashboard.hide_training_bar(self.task_id)
+            self.dashboard.advance_training_bar(self.task_id)
             self.dashboard.refresh()
+
+        self.dashboard.hide_training_bar(self.task_id)
+        self.dashboard.refresh()
 
     def set_description(self, desc):
-        if not self.disable:
-            self.dashboard.train_progress.update(self.task_id, description = f'{self.label} ({desc})')
-            self.dashboard.refresh()
+        self.dashboard.train_progress.update(self.task_id, description = f'{self.label} ({desc})')
+        self.dashboard.refresh()
 
 # dashboard
 
@@ -96,8 +95,8 @@ class Dashboard:
             expand = True
         )
 
-        critic_task = self.train_progress.add_task('Critic', total = 100, visible = False)
-        actor_task = self.train_progress.add_task('Actor', total = 100, visible = False)
+        critic_task = self.train_progress.add_task('Critic', total = 100, visible = True)
+        actor_task = self.train_progress.add_task('Actor', total = 100, visible = True)
 
         self.critic_pbar = DashboardPBar(self, critic_task, 'Critic')
         self.actor_pbar = DashboardPBar(self, actor_task, 'Actor')
@@ -126,8 +125,8 @@ class Dashboard:
         self.train_progress.update(task_id, advance = 1)
 
     def hide_training_bar(self, task_id):
-        self.train_progress.update(task_id, visible = False)
-        self.is_training = any(t.visible for t in self.train_progress.tasks)
+        # We now keep it visible but paused or empty
+        pass
 
     # episode progress
 
@@ -154,15 +153,11 @@ class Dashboard:
 
     def render(self):
         progress_panel = Panel(self.progress, title = 'Progress', border_style = 'green')
+        training_panel = Panel(self.train_progress, title = 'Training', border_style = 'red')
         metrics_panel = Panel(self._make_table(self.metrics, ('Metric', 'Value'), ('cyan', 'magenta')), title = f'[b]{self.title}[/b]', border_style = 'blue')
         config_panel = Panel(self._make_table(self.hyperparams, ('Hyperparameter', 'Value'), ('yellow', 'white')), title = '[b]Configuration[/b]', border_style = 'yellow')
 
-        panels = [progress_panel, metrics_panel]
-
-        if self.is_training:
-            panels.append(Panel(self.train_progress, title = 'Training', border_style = 'red'))
-
-        panels.append(config_panel)
+        panels = [progress_panel, training_panel, metrics_panel, config_panel]
         return Group(*panels)
 
     def refresh(self):

@@ -5,7 +5,7 @@
 #   "fire",
 #   "gymnasium[mujoco,other]",
 #   "memmap-replay-buffer>=0.0.10",
-#   "x-mlps-pytorch>=0.1.32",
+#   "x-mlps-pytorch>=0.3.0",
 #   "hl-gauss-pytorch"
 # ]
 # ///
@@ -17,6 +17,7 @@ import numpy as np
 from fire import Fire
 from shutil import rmtree
 from collections import deque
+from functools import partial
 
 import torch
 from torch import nn, from_numpy, cat
@@ -37,7 +38,7 @@ from contrastive_rl_pytorch import (
 )
 
 from einops.layers.torch import Rearrange
-from x_mlps_pytorch import ResidualNormedMLP
+from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
 from discrete_continuous_embed_readout import Readout
 
 from hl_gauss_pytorch import HLGaussLoss
@@ -91,13 +92,13 @@ def main(
     num_episodes = 2_000_000,
     num_envs = 8,
     max_timesteps = 1000,
-    num_episodes_before_learn = 512,
-    buffer_size = 1536,
+    num_episodes_before_learn = 64,
+    buffer_size = 512,
     video_folder = './recordings_humanoid',
     render_every_eps = None,
     dim_contrastive_embed = 64,
     cl_train_steps = 4_000,
-    cl_batch_size = 256,
+    cl_batch_size = 32,
     actor_batch_size = 128,
     actor_num_train_steps = 1_500,
     critic_learning_rate = 3e-4,
@@ -114,6 +115,7 @@ def main(
     hl_gauss_num_bins = 16,
     hl_gauss_sigma = 0.05,
     actor_dist_type = 'squashed_gaussian',
+    use_attn_residual_mlp = True,
     use_wandb = False,
     cpu = False
 ):
@@ -174,13 +176,17 @@ def main(
 
     device = accelerator.device
 
+    if use_attn_residual_mlp:
+        MLP = AttnResidualNormedMLP
+    else:
+        MLP = partial(ResidualNormedMLP, residual_every = 4, keel_post_ln = True)
+
     actor_encoder = nn.Sequential(
-        ResidualNormedMLP(
+        MLP(
             dim_in = obs_dim * 2,
             dim = 256,
             depth = 16,
-            dim_out = action_dim * 2,
-            keel_post_ln = True
+            dim_out = action_dim * 2
         ),
         Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
     ).to(device)
@@ -219,24 +225,20 @@ def main(
 
         critic_dim_action = action_dim * hl_gauss_num_bins
 
-    critic_encoder = ResidualNormedMLP(
+    critic_encoder = MLP(
         dim_in = obs_dim + critic_dim_action,
         dim = 256,
         dim_out = dim_contrastive_embed,
-        depth = 16,
-        residual_every = 4,
-        keel_post_ln = True
+        depth = 16
     ).to(device)
 
     critic_encoder = CriticWrapper(critic_encoder, hl_gauss, action_dim)
 
-    goal_encoder = ResidualNormedMLP(
+    goal_encoder = MLP(
         dim_in = obs_dim,
         dim = 256,
         dim_out = dim_contrastive_embed,
-        depth = 16,
-        residual_every = 4,
-        keel_post_ln = True
+        depth = 16
     ).to(device)
 
     # contrastive learning module
@@ -327,7 +329,8 @@ def main(
             use_hl_gauss_critic_actions = use_hl_gauss_critic_actions,
             hl_gauss_num_bins = hl_gauss_num_bins,
             hl_gauss_sigma = f'{hl_gauss_sigma}' if hl_gauss_sigma else 'None',
-            actor_dist_type = actor_dist_type
+            actor_dist_type = actor_dist_type,
+            use_attn_residual_mlp = use_attn_residual_mlp
         )
     )
 
@@ -425,6 +428,7 @@ def main(
                     cl_train_steps,
                     lens = episode_lens,
                     actions = actions_for_critic,
+                    rewards = rewards_for_critic,
                     pbar = dashboard.critic_pbar
                 )
 
