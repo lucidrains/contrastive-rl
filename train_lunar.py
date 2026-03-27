@@ -96,7 +96,8 @@ def main(
     reward_fourier_dim = 16,
     use_attn_residual_mlp = True,
     use_wandb = False,
-    cpu = False
+    cpu = False,
+    sigreg_loss_weight = 0.1
 ):
     # clear video folder
 
@@ -206,7 +207,8 @@ def main(
         reward_fourier_encode = reward_fourier_encode,
         reward_fourier_dim = reward_fourier_dim,
         cpu = cpu,
-        contrastive_learn = contrastive_learn
+        contrastive_learn = contrastive_learn,
+        sigreg_loss_weight = sigreg_loss_weight
     )
 
     # assertions
@@ -260,7 +262,8 @@ def main(
             reward_norm = reward_norm,
             reward_fourier_encode = reward_fourier_encode,
             reward_fourier_dim = reward_fourier_dim,
-            use_attn_residual_mlp = use_attn_residual_mlp
+            use_attn_residual_mlp = use_attn_residual_mlp,
+            sigreg_loss_weight = sigreg_loss_weight
         )
     )
 
@@ -378,7 +381,7 @@ def main(
                 else:
                     actions_for_critic = data['action_hard_one_hot']
 
-                cl_loss = critic_trainer(
+                cl_loss, critic_sigreg_loss = critic_trainer(
                     trajectories,
                     cl_train_steps,
                     lens = episode_lens,
@@ -398,6 +401,7 @@ def main(
 
                 dashboard.update_metrics(
                     critic_loss = f"{cl_loss:.4f}",
+                    critic_sigreg_loss = f"{critic_sigreg_loss:.4f}",
                     actor_loss = f"{actor_loss:.4f}"
                 )
 
@@ -418,6 +422,7 @@ def main(
                         "avg_steps_100": avg_steps,
                         "last_eps_reward": cum_reward,
                         "critic_loss": cl_loss,
+                        "critic_sigreg_loss": critic_sigreg_loss,
                         "actor_loss": actor_loss
                     })
 

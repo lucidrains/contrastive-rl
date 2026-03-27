@@ -3,7 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import torch
-from torch import cat, arange, tensor, from_numpy
+from torch import cat, arange, tensor, from_numpy, is_tensor
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
@@ -95,6 +95,43 @@ def sample_random_state(
     state = env.observation_space.sample()
     return from_numpy(state).float()
 
+
+def sigreg_loss(
+    x,
+    num_slices = 1024,
+    domain = (-5, 5),
+    num_knots = 17
+):
+    # Randall Balestriero - https://arxiv.org/abs/2511.08544
+
+    dim, device = x.shape[-1], x.device
+
+    # slice sampling
+
+    rand_projs = torch.randn((num_slices, dim), device = device)
+    rand_projs = l2norm(rand_projs)
+
+    # integration points
+
+    t = torch.linspace(*domain, num_knots, device = device)
+
+    # theoretical CF for N(0, 1) and Gauss. window
+
+    exp_f = (-0.5 * t.square()).exp()
+
+    # empirical CF
+
+    x_t = einsum(x, rand_projs, '... d, m d -> ... m')
+    x_t = rearrange(x_t, '... m -> (...) m')
+
+    x_t = rearrange(x_t, 'n m -> n m 1') * t
+    ecf = (1j * x_t).exp().mean(dim = 0)
+
+    # weighted L2 distance
+
+    err = ecf.sub(exp_f).abs().square().mul(exp_f)
+
+    return torch.trapz(err, t, dim = -1).mean()
 
 # fourier encode
 
@@ -228,7 +265,8 @@ class ContrastiveWrapper(Module):
         self,
         encoder: Module,
         contrastive_learn: Module,
-        future_encoder: Module | None = None
+        future_encoder: Module | None = None,
+        sigreg_loss_weight = 0.
     ):
         super().__init__()
 
@@ -237,6 +275,10 @@ class ContrastiveWrapper(Module):
 
         self.contrastive_learn = contrastive_learn
         self.all_gather = AllGather()
+
+        self.sigreg_loss_weight = sigreg_loss_weight
+
+        self.register_buffer('zero', tensor(0.), persistent = False)
 
     def forward(
         self,
@@ -255,7 +297,14 @@ class ContrastiveWrapper(Module):
             encoded_past, _ = self.all_gather(encoded_past)
             encoded_future, _ = self.all_gather(encoded_future)
 
-        return self.contrastive_learn(encoded_past, encoded_future)
+        loss = self.contrastive_learn(encoded_past, encoded_future)
+
+        sigreg_loss_val = self.zero
+        if self.sigreg_loss_weight > 0.:
+            sigreg_loss_val = (sigreg_loss(encoded_past) + sigreg_loss(encoded_future)) * 0.5
+            loss = loss + sigreg_loss_val * self.sigreg_loss_weight
+
+        return loss, sigreg_loss_val
 
 # contrastive RL trainer
 
@@ -277,7 +326,8 @@ class ContrastiveRLTrainer(Module):
         contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
-        cpu = False
+        cpu = False,
+        sigreg_loss_weight = 0.
     ):
         super().__init__()
 
@@ -289,7 +339,8 @@ class ContrastiveRLTrainer(Module):
         contrast_wrapper = ContrastiveWrapper(
             encoder = encoder,
             future_encoder = future_encoder,
-            contrastive_learn = contrastive_learn
+            contrastive_learn = contrastive_learn,
+            sigreg_loss_weight = sigreg_loss_weight
         )
 
         assert divisible_by(batch_size, repetition_factor)
@@ -467,10 +518,17 @@ class ContrastiveRLTrainer(Module):
 
             # contrastive learning
 
-            loss = self.contrast_wrapper(past_obs, future_obs, past_action)
+            loss, sigreg_loss_val = self.contrast_wrapper(past_obs, future_obs, past_action)
 
             loss_item = loss.item()
-            pbar_instance.set_description(f'loss: {loss_item:.3f}')
+            sigreg_loss_item = sigreg_loss_val.item() if is_tensor(sigreg_loss_val) else sigreg_loss_val
+
+            desc = f'loss: {loss_item:.3f}'
+
+            if self.contrast_wrapper.sigreg_loss_weight > 0.:
+                desc += f' | sigreg: {sigreg_loss_item:.3f}'
+
+            pbar_instance.set_description(desc)
 
             # backwards and optimizer step
 
@@ -482,7 +540,7 @@ class ContrastiveRLTrainer(Module):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-        return loss_item
+        return loss_item, sigreg_loss_item
 
 # training the actor
 
