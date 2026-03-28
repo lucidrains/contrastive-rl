@@ -11,6 +11,7 @@ from accelerate import Accelerator
 
 from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
+from typing import Callable, Any
 
 import einx
 from einops import einsum, rearrange, repeat
@@ -55,6 +56,9 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def identity(t):
+    return t
 
 def l2norm(t):
     return F.normalize(t, dim = -1)
@@ -327,9 +331,14 @@ class ContrastiveRLTrainer(Module):
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         cpu = False,
-        sigreg_loss_weight = 0.
+        sigreg_loss_weight = 0.,
+        state_to_goal_fn: Callable = identity,
+        state_to_critic_state_fn: Callable = identity
     ):
         super().__init__()
+
+        self.state_to_goal_fn = state_to_goal_fn
+        self.state_to_critic_state_fn = state_to_critic_state_fn
 
         self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
 
@@ -488,6 +497,9 @@ class ContrastiveRLTrainer(Module):
 
             past_obs, future_obs = tuple(rearrange(t, 'b 1 ... -> b ...') for t in (past_obs, future_obs))
 
+            past_obs = self.state_to_critic_state_fn(past_obs)
+            future_obs = self.state_to_goal_fn(future_obs)
+
             if self.reward_part_of_goal:
                 rewards = data_dict['rewards']
                 assert exists(rewards), 'rewards must be passed if reward_part_of_goal is True'
@@ -563,12 +575,21 @@ class ActorTrainer(Module):
         reward_fourier_dim = 16,
         contrastive_learn: Module | None = None,
         cpu = False,
+        action_entropy_loss_weight = 0.,
+        state_to_goal_fn: Callable = identity,
+        state_to_actor_state_fn: Callable = identity,
+        state_to_critic_state_fn: Callable = identity
     ):
         super().__init__()
+
+        self.state_to_goal_fn = state_to_goal_fn
+        self.state_to_actor_state_fn = state_to_actor_state_fn
+        self.state_to_critic_state_fn = state_to_critic_state_fn
 
         self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
 
         self.max_grad_norm = max_grad_norm
+        self.action_entropy_loss_weight = action_entropy_loss_weight
 
         optimizer = AdamW(actor.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
         self.actor = actor
@@ -617,6 +638,7 @@ class ActorTrainer(Module):
         lens = None,
         rewards = None,
         sample_fn = None,
+        entropy_fn = None,
         pbar = None
     ):
 
@@ -633,11 +655,13 @@ class ActorTrainer(Module):
         goal_encoder.eval()
         encoder.eval()
 
-        # data
-
+        if not is_tensor(trajectories):
+            trajectories = from_numpy(trajectories)
+            
         if exists(lens):
+            lens = tensor(lens) if not is_tensor(lens) else lens
             traj_len = trajectories.shape[-2]
-            mask = einx.less('t, b -> b t', arange(traj_len, device = self.device), lens)
+            mask = einx.less('t, b -> b t', arange(traj_len, device = lens.device), lens)
             states = trajectories[mask]
         else:
             states = rearrange(trajectories, '... d -> (...) d')
@@ -648,6 +672,9 @@ class ActorTrainer(Module):
 
         if self.reward_part_of_goal:
             assert exists(rewards), 'rewards must be passed to actor trainer if reward_part_of_goal is True'
+
+            if not is_tensor(rewards):
+                rewards = from_numpy(rewards)
 
             goal_rewards = rewards[mask] if exists(lens) else rearrange(rewards, '... -> (...)')
 
@@ -680,6 +707,11 @@ class ActorTrainer(Module):
             state, = next(iter_dataloader)
             goal, *maybe_goal_rewards = next(iter_goal_dataloader)
 
+            # forward state and goal
+
+            actor_state = self.state_to_actor_state_fn(state)
+            actor_goal = self.state_to_goal_fn(goal)
+
             if self.reward_part_of_goal:
                 goal_rewards, = maybe_goal_rewards
 
@@ -691,23 +723,24 @@ class ActorTrainer(Module):
                 elif goal_rewards.ndim == 1:
                     goal_rewards = rearrange(goal_rewards, '... -> ... 1')
 
-                goal = cat((goal, goal_rewards), dim = -1)
+                actor_goal = cat((actor_goal, goal_rewards), dim = -1)
 
-            # forward state and goal
-
-            action = self.actor((state, goal))
+            action_logits = self.actor((actor_state, actor_goal))
 
             if self.softmax_actor_output:
-                action = action.softmax(dim = -1)
+                action = action_logits.softmax(dim = -1)
             elif exists(sample_fn):
-                action = sample_fn(action)
+                action = sample_fn(action_logits)
+            else:
+                action = action_logits
 
             # encode state
 
-            encoded_state_action = encoder(cat((state, action), dim = -1))
+            critic_state = self.state_to_critic_state_fn(state)
+            encoded_state_action = encoder(cat((critic_state, action), dim = -1))
 
             with torch.no_grad():
-                encoded_goal = goal_encoder(goal)
+                encoded_goal = goal_encoder(actor_goal)
 
             sim = self.contrastive_learn(
                 encoded_state_action,
@@ -718,6 +751,10 @@ class ActorTrainer(Module):
             # maximize the similarity between the encoded state action trained from contrastive RL and the encoded goal
 
             loss = -sim.mean()
+
+            if self.action_entropy_loss_weight > 0. and exists(entropy_fn):
+                entropy = entropy_fn(action_logits)
+                loss = loss - entropy.mean() * self.action_entropy_loss_weight
 
             self.accelerator.backward(loss)
 
