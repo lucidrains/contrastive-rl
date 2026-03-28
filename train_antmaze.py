@@ -140,7 +140,8 @@ def main(
     use_hl_gauss_critic_actions = True,
     hl_gauss_num_bins = 16,
     hl_gauss_sigma = None,
-    sigreg_loss_weight = 0.1
+    sigreg_loss_weight = 0.1,
+    goal_includes_obs = False
 ):
     # clear video folder
 
@@ -171,8 +172,13 @@ def main(
     action_dim = env.single_action_space.shape[0]
 
     dim_state = obs_dim + goal_dim_env  # full state = obs + achieved_goal
-    dim_goal = goal_dim_env             # goal encoder ONLY sees achieved_goal now
+    dim_goal = dim_state if goal_includes_obs else goal_dim_env
     dim_action = action_dim
+
+    # target observation if goal_includes_obs
+    UPRIGHT_OBS = np.zeros(obs_dim, dtype=np.float32)
+    UPRIGHT_OBS[0] = 0.75 # z height
+    UPRIGHT_OBS[1] = 1.0  # w component of quaternion (identity)
 
     dim_reward = reward_fourier_dim if reward_fourier_encode else 1
     dim_goal_encoder_in = dim_goal + (dim_reward if reward_part_of_goal else 0)
@@ -318,12 +324,21 @@ def main(
             idx = torch.randint(0, flat.shape[0], (1,)).item()
             state_slice = flat[idx]
             goal_slice = state_slice[..., -goal_dim_env:]
+            
+            if goal_includes_obs:
+                goal_slice = np.concatenate([UPRIGHT_OBS, goal_slice], axis=-1)
+                
             return from_numpy(goal_slice).float().to(env_device) if isinstance(goal_slice, np.ndarray) else goal_slice.float().to(env_device)
 
         temp_env = gym.make(env_name)
         state_dict, _ = temp_env.reset()
         temp_env.close()
-        return from_numpy(state_dict['achieved_goal'].astype(np.float32)).to(env_device)
+        
+        target_goal = state_dict['desired_goal'].astype(np.float32)
+        if goal_includes_obs:
+            target_goal = np.concatenate([UPRIGHT_OBS, target_goal], axis=-1)
+            
+        return from_numpy(target_goal).to(env_device)
 
     # evaluation video recording setup
 
@@ -341,6 +356,9 @@ def main(
         state = concat_goal_obs(state_dict).astype(np.float32)
 
         desired_goal = state_dict['desired_goal'].astype(np.float32)
+        if goal_includes_obs:
+            desired_goal = np.concatenate([UPRIGHT_OBS, desired_goal], axis=-1)
+            
         eps_goal = from_numpy(desired_goal).to(env_device)
 
         if reward_part_of_goal:
@@ -422,7 +440,12 @@ def main(
             if is_exploring[i]:
                 eps_goal[i, :dim_goal] = sample_random_goal()
             else:
-                eps_goal[i, :dim_goal] = from_numpy(target_goal_dict_i.astype(np.float32)).to(env_device)
+                target_xy = target_goal_dict_i.astype(np.float32)
+                if goal_includes_obs:
+                    target_goal = np.concatenate([UPRIGHT_OBS, target_xy], axis=-1)
+                else:
+                    target_goal = target_xy
+                eps_goal[i, :dim_goal] = from_numpy(target_goal).to(env_device)
 
         for i in range(num_envs):
             reset_eps_goal(i, state_dict['desired_goal'][i])

@@ -478,7 +478,8 @@ class ContrastiveRLTrainer(Module):
 
             # future times, using delta time drawn from geometric distribution
 
-            future_times = past_times + torch.empty_like(past_times).geometric_(1. - self.discount).clamp(min = 1)
+            delta_times = torch.empty(past_times.shape, dtype = torch.long, device = 'cpu').geometric_(1. - self.discount).to(self.device)
+            future_times = past_times + delta_times.clamp(min = 1)
 
             # clamping future times by max_traj_len if not variable lengths else prepare variable length
 
@@ -639,6 +640,8 @@ class ActorTrainer(Module):
         rewards = None,
         sample_fn = None,
         entropy_fn = None,
+        q_critic = None,
+        q_loss_weight = 0.,
         pbar = None
     ):
 
@@ -756,6 +759,18 @@ class ActorTrainer(Module):
                 entropy = entropy_fn(action_logits)
                 loss = loss - entropy.mean() * self.action_entropy_loss_weight
 
+            if q_loss_weight > 0. and exists(q_critic):
+                with torch.no_grad():
+                    q_values = q_critic(actor_state)
+
+                if self.softmax_actor_output:
+                    action_probs = action_logits.softmax(dim = -1)
+                else:
+                    action_probs = action_logits
+
+                expected_q = (action_probs * q_values).sum(dim = -1)
+                loss = loss - expected_q.mean() * q_loss_weight
+
             self.accelerator.backward(loss)
 
             pbar_instance.set_description(f'actor loss: {loss.item():.3f}')
@@ -767,3 +782,115 @@ class ActorTrainer(Module):
             self.optimizer.zero_grad()
 
         return loss.item()
+
+# TD Trainer
+
+class TDTrainer(Module):
+    def __init__(
+        self,
+        q_critic,
+        ema_q_critic,
+        batch_size = 128,
+        learning_rate = 3e-4,
+        weight_decay = 0.,
+        td_gamma = 0.9,
+        max_grad_norm = 0.5,
+        cpu = False,
+        **adam_kwargs
+    ):
+        super().__init__()
+        self.accelerator = Accelerator(cpu = cpu)
+        self.device = self.accelerator.device
+
+        self.q_critic = q_critic.to(self.device)
+        self.ema_q_critic = ema_q_critic.to(self.device)
+
+        self.batch_size = batch_size
+        self.td_gamma = td_gamma
+        self.max_grad_norm = max_grad_norm
+
+        optimizer = AdamW(self.q_critic.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
+
+        self.q_critic, self.optimizer = self.accelerator.prepare(self.q_critic, optimizer)
+
+    def forward(
+        self,
+        trajectories,
+        num_train_steps,
+        *,
+        actions,
+        rewards,
+        lens,
+        pbar = None
+    ):
+        device = self.device
+
+        if not is_tensor(trajectories): trajectories = from_numpy(trajectories)
+        if not is_tensor(actions): actions = from_numpy(actions)
+        if not is_tensor(rewards): rewards = from_numpy(rewards)
+        if not is_tensor(lens): lens = tensor(lens)
+        
+        trajectories, actions, rewards, lens = trajectories.to(device), actions.to(device), rewards.to(device), lens.to(device)
+
+        batch, seq_len, _ = trajectories.shape
+
+        state = trajectories[:, :-1]
+        next_state = trajectories[:, 1:]
+        action = actions[:, :-1]
+        reward = rewards[:, :-1]
+
+        if reward.ndim == 3:
+            reward = rearrange(reward, 'b t 1 -> b t')
+
+        lens_clamped = lens.clamp(max = seq_len).long()
+        lens_clamped = rearrange(lens_clamped, 'b -> b 1')
+
+        seq = torch.arange(seq_len - 1, device = device)
+        seq = rearrange(seq, 'n -> 1 n')
+
+        is_valid = seq < (lens_clamped - 1)
+        is_done = seq == (lens_clamped - 2)
+
+        state = state[is_valid]
+        next_state = next_state[is_valid]
+        action = action[is_valid]
+        reward = reward[is_valid]
+        is_done = is_done[is_valid]
+
+        dataset = TensorDataset(state, next_state, action, reward, is_done)
+        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+        dataloader = self.accelerator.prepare(dataloader)
+
+        td_loss_float = 0.
+        
+        self.q_critic.train()
+
+        if not exists(pbar):
+            pbar = tqdm
+
+        pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
+
+        for _, (state, next_state, action, reward, is_done) in zip(pbar_instance, cycle(dataloader)):
+            q = self.q_critic(state)
+            q = q.gather(-1, rearrange(action, 'b -> b 1')).squeeze(-1)
+
+            with torch.no_grad():
+                next_q = self.ema_q_critic(next_state).max(dim = -1).values
+                target_q = reward + self.td_gamma * next_q * (~is_done).float()
+
+            td_loss = F.mse_loss(q, target_q)
+
+            self.optimizer.zero_grad(set_to_none = True)
+            self.accelerator.backward(td_loss)
+
+            if self.max_grad_norm > 0.:
+                self.accelerator.clip_grad_norm_(self.q_critic.parameters(), self.max_grad_norm)
+
+            self.optimizer.step()
+            self.ema_q_critic.update()
+
+            td_loss_float = td_loss.item()
+            
+            pbar_instance.set_description(f'td loss: {td_loss_float:.3f}')
+
+        return td_loss_float

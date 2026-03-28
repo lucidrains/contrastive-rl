@@ -35,13 +35,19 @@ from memmap_replay_buffer import ReplayBuffer
 from contrastive_rl_pytorch import (
     ContrastiveRLTrainer,
     ActorTrainer,
+    TDTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
     sample_random_state
 )
 
+
 from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
 from discrete_continuous_embed_readout import Readout
+
+from ema_pytorch import EMA
+from torch.optim import AdamW
+
 
 from dashboard import Dashboard
 
@@ -69,7 +75,7 @@ def main(
     video_folder = './recordings',
     render_every_eps = None,
     dim_contrastive_embed = 64,
-    cl_train_steps = 2_500,
+    cl_train_steps = 2_000,
     cl_batch_size = 64,
     actor_batch_size = 128,
     actor_num_train_steps = 1000,
@@ -97,7 +103,12 @@ def main(
     use_attn_residual_mlp = True,
     use_wandb = False,
     cpu = False,
-    sigreg_loss_weight = 0.1
+    sigreg_loss_weight = 0.,
+    use_td_learning = False,
+    td_gamma = 0.9,
+    td_loss_weight = 0.1,
+    td_learning_rate = 3e-4,
+    action_entropy_loss_weight = 1e-2
 ):
     # clear video folder
 
@@ -187,6 +198,29 @@ def main(
         depth = goal_depth
     ).to(device)
 
+    td_critic = None
+    ema_td_critic = None
+    td_trainer = None
+
+    if use_td_learning:
+        td_critic = MLP(
+            dim_in = dim_state,
+            dim = critic_dim,
+            dim_out = dim_action,
+            depth = 2
+        )
+        ema_td_critic = EMA(td_critic, beta = 0.99, include_online_model = False)
+        td_trainer = TDTrainer(
+            q_critic = td_critic,
+            ema_q_critic = ema_td_critic,
+            batch_size = actor_batch_size,
+            learning_rate = td_learning_rate,
+            td_gamma = td_gamma,
+            weight_decay = weight_decay,
+            max_grad_norm = max_grad_norm,
+            cpu = cpu
+        )
+
     # contrastive learning module
 
     if use_sigmoid_contrastive_learning:
@@ -229,7 +263,8 @@ def main(
         reward_fourier_encode = reward_fourier_encode,
         reward_fourier_dim = reward_fourier_dim,
         cpu = cpu,
-        contrastive_learn = contrastive_learn
+        contrastive_learn = contrastive_learn,
+        action_entropy_loss_weight = action_entropy_loss_weight
     )
 
     base_actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
@@ -263,7 +298,10 @@ def main(
             reward_fourier_encode = reward_fourier_encode,
             reward_fourier_dim = reward_fourier_dim,
             use_attn_residual_mlp = use_attn_residual_mlp,
-            sigreg_loss_weight = sigreg_loss_weight
+            sigreg_loss_weight = sigreg_loss_weight,
+            use_td_learning = f"{use_td_learning}",
+            td_gamma = td_gamma,
+            td_loss_weight = td_loss_weight
         )
     )
 
@@ -381,6 +419,19 @@ def main(
                 else:
                     actions_for_critic = data['action_hard_one_hot']
 
+                td_loss_val = 0.
+                if use_td_learning:
+                    hard_actions = data['action_hard_one_hot'].argmax(dim=-1)
+                    
+                    td_loss_val = td_trainer(
+                        trajectories,
+                        actor_num_train_steps,
+                        actions = hard_actions,
+                        rewards = data['reward'],
+                        lens = episode_lens,
+                        pbar = dashboard.critic_pbar
+                    )
+
                 cl_loss, critic_sigreg_loss = critic_trainer(
                     trajectories,
                     cl_train_steps,
@@ -396,13 +447,17 @@ def main(
                     lens = episode_lens,
                     rewards = rewards_for_critic,
                     sample_fn = actor_readout.sample,
+                    q_critic = td_critic if use_td_learning else None,
+                    q_loss_weight = td_loss_weight if use_td_learning else 0.,
+                    entropy_fn = actor_readout.entropy,
                     pbar = dashboard.actor_pbar
                 )
 
                 dashboard.update_metrics(
                     critic_loss = f"{cl_loss:.4f}",
                     critic_sigreg_loss = f"{critic_sigreg_loss:.4f}",
-                    actor_loss = f"{actor_loss:.4f}"
+                    actor_loss = f"{actor_loss:.4f}",
+                    td_loss = f"{td_loss_val:.4f}" if use_td_learning else "N/A"
                 )
 
             dashboard.advance_progress()

@@ -1,6 +1,6 @@
 [project]
 name = "contrastive-rl-pytorch"
-version = "0.4.1"
+version = "0.4.2"
 description = "Contrastive RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,6 +30,7 @@ dependencies = [
     "x-mlps-pytorch>=0.3.0",
     "hl-gauss-pytorch>=0.2.2",
     "discrete-continuous-embed-readout>=0.2.1",
+    "ema-pytorch>=0.3.0",
 ]
 
 [project.urls]

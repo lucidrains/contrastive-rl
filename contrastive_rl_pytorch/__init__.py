@@ -4,5 +4,6 @@ from contrastive_rl_pytorch.contrastive_rl import (
     ContrastiveWrapper,
     ContrastiveRLTrainer,
     ActorTrainer,
+    TDTrainer,
     sample_random_state
 )
