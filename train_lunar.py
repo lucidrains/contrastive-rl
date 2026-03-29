@@ -2,6 +2,7 @@
 # dependencies = [
 #   "contrastive-rl-pytorch",
 #   "discrete-continuous-embed-readout",
+#   "ema-pytorch",
 #   "fire",
 #   "gymnasium[box2d]",
 #   "gymnasium[other]",
@@ -104,9 +105,9 @@ def main(
     use_wandb = False,
     cpu = False,
     sigreg_loss_weight = 0.,
-    use_td_learning = False,
-    td_tau = 0.9,
-    td_loss_weight = 0.025,
+    use_td_learning = True,
+    td_gamma = 0.95,
+    td_loss_weight = 1e-2,
     td_learning_rate = 3e-4,
     action_entropy_loss_weight = 1e-2
 ):

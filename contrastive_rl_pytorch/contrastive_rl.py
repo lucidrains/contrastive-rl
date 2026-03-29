@@ -724,12 +724,12 @@ class ActorTrainer(Module):
 
             action_logits = self.actor((actor_state, actor_goal))
 
-            actor_output = sample_fn(action_logits) if exists(sample_fn) else action_logits
-
             if self.softmax_actor_output:
-                action = actor_output.softmax(dim = -1)
+                action = action_logits.softmax(dim = -1)
+            elif exists(sample_fn):
+                action = sample_fn(action_logits)
             else:
-                action = actor_output
+                action = action_logits
 
             # encode state
 
