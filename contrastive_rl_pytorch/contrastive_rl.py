@@ -184,17 +184,14 @@ class ContrastiveLearning(Module):
             embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
         if return_contrastive_score:
-            if embeds1.ndim == 2:
-                sim = einsum(embeds1, embeds2, 'b d, b d -> b')
-            else:
-                sim = (embeds1 * embeds2).sum(dim = -1)
+            sim = (embeds1 * embeds2).sum(dim = -1)
+        else:
+            sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
 
-            return sim * self.scale
-
-        # similarity
-
-        sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
         sim = sim * self.scale
+
+        if return_contrastive_score:
+            return sim
 
         # labels, which is 1 across diagonal
 
@@ -240,17 +237,14 @@ class SigmoidContrastiveLearning(Module):
             embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
         if return_contrastive_score:
-            if embeds1.ndim == 2:
-                sim = einsum(embeds1, embeds2, 'b d, b d -> b')
-            else:
-                sim = (embeds1 * embeds2).sum(dim = -1)
+            sim = (embeds1 * embeds2).sum(dim = -1)
+        else:
+            sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
 
-            return (sim * self.scale + self.bias).sigmoid()
-
-        # similarity
-
-        sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
         sim = sim * self.scale + self.bias
+
+        if return_contrastive_score:
+            return sim
 
         # labels
 
@@ -730,12 +724,12 @@ class ActorTrainer(Module):
 
             action_logits = self.actor((actor_state, actor_goal))
 
+            actor_output = sample_fn(action_logits) if exists(sample_fn) else action_logits
+
             if self.softmax_actor_output:
-                action = action_logits.softmax(dim = -1)
-            elif exists(sample_fn):
-                action = sample_fn(action_logits)
+                action = actor_output.softmax(dim = -1)
             else:
-                action = action_logits
+                action = actor_output
 
             # encode state
 
@@ -750,8 +744,6 @@ class ActorTrainer(Module):
                 encoded_goal,
                 return_contrastive_score = True
             )
-
-            # maximize the similarity between the encoded state action trained from contrastive RL and the encoded goal
 
             loss = -sim.mean()
 

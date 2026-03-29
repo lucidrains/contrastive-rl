@@ -76,7 +76,7 @@ def main(
     render_every_eps = None,
     dim_contrastive_embed = 64,
     cl_train_steps = 2_000,
-    cl_batch_size = 64,
+    cl_batch_size = 128,
     actor_batch_size = 128,
     actor_num_train_steps = 1000,
     critic_learning_rate = 3e-4,
@@ -105,8 +105,8 @@ def main(
     cpu = False,
     sigreg_loss_weight = 0.,
     use_td_learning = False,
-    td_gamma = 0.9,
-    td_loss_weight = 0.1,
+    td_tau = 0.9,
+    td_loss_weight = 0.025,
     td_learning_rate = 3e-4,
     action_entropy_loss_weight = 1e-2
 ):
@@ -247,7 +247,7 @@ def main(
 
     # assertions
 
-    assert num_episodes_before_learn > cl_batch_size
+    assert num_episodes_before_learn >= cl_batch_size
 
     actor_trainer = ActorTrainer(
         actor_encoder,
@@ -300,7 +300,6 @@ def main(
             use_attn_residual_mlp = use_attn_residual_mlp,
             sigreg_loss_weight = sigreg_loss_weight,
             use_td_learning = f"{use_td_learning}",
-            td_gamma = td_gamma,
             td_loss_weight = td_loss_weight
         )
     )
@@ -313,7 +312,9 @@ def main(
             cum_reward = 0.
             eps_steps = 0
             cl_loss = 0.
+            critic_sigreg_loss = 0.
             actor_loss = 0.
+            td_loss_val = 0.
 
             # decide on goal for the episode
 
