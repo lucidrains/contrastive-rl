@@ -89,7 +89,9 @@ def module_device(module):
     return next(module.parameters()).device
 
 def normalize(t, eps = 1e-5):
-    return (t - t.mean()) / (t.std() + eps)
+    if t.numel() <= 1:
+        return torch.zeros_like(t)
+    return (t - t.mean()) / t.std(unbiased = False).clamp(min = eps)
 
 def update_network_(loss, optimizer, max_grad_norm = 0.5):
     optimizer.zero_grad()
@@ -104,78 +106,39 @@ def update_network_(loss, optimizer, max_grad_norm = 0.5):
 def l2norm(t):
     return F.normalize(t, dim = -1)
 
-
-# SimBa MLP
-
-class ReluSquared(Module):
-    def forward(self, x):
-        return x.sign() * F.relu(x) ** 2
-
-class SimBa(Module):
-    def __init__(self, dim, dim_hidden = None, depth = 3, dropout = 0., expansion_factor = 2, num_residual_streams = 4):
-        super().__init__()
-        dim_hidden = default(dim_hidden, dim * expansion_factor)
-        self.proj_in = nn.Linear(dim, dim_hidden)
-        dim_inner = dim_hidden * expansion_factor
-
-        init_hyper_conn, self.expand_stream, self.reduce_stream = ManifoldConstrainedHyperConnections.get_init_and_expand_reduce_stream_functions(1, num_fracs = num_residual_streams, sinkhorn_iters = 2)
-
-        layers = []
-        for ind in range(depth):
-            layer = nn.Sequential(
-                nn.RMSNorm(dim_hidden),
-                nn.Linear(dim_hidden, dim_inner),
-                ReluSquared(),
-                nn.Linear(dim_inner, dim_hidden),
-                nn.Dropout(dropout),
-            )
-            layer = init_hyper_conn(dim = dim_hidden, layer_index = ind, branch = layer)
-            layers.append(layer)
-
-        self.layers = ModuleList(layers)
-        self.final_norm = nn.RMSNorm(dim_hidden)
-
-    def forward(self, x):
-        no_batch = x.ndim == 1
-        if no_batch:
-            x = rearrange(x, '... -> 1 ...')
-        x = self.proj_in(x)
-        x = self.expand_stream(x)
-        for layer in self.layers:
-            x = layer(x)
-        x = self.reduce_stream(x)
-        out = self.final_norm(x)
-        if no_batch:
-            out = rearrange(out, '1 ... -> ...')
-        return out
-
 # actor and critic
 
 class Actor(Module):
-    def __init__(self, state_dim, hidden_dim, num_actions, goal_dim = 8, mlp_depth = 2, dropout = 0.1):
+    def __init__(self, state_dim, hidden_dim, num_actions, goal_dim = 8, mlp_depth = 2):
         super().__init__()
-        self.net = SimBa(state_dim + goal_dim, dim_hidden = hidden_dim * 2, depth = mlp_depth, dropout = dropout)
-        self.action_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            ReluSquared(),
-            nn.Linear(hidden_dim, num_actions)
+        self.net = ResidualNormedMLP(
+            dim_in = state_dim + goal_dim,
+            dim = hidden_dim * 2,
+            dim_out = num_actions,
+            depth = mlp_depth,
+            residual_every = 2,
+            keel_post_ln = True
         )
 
     def forward(self, x, goal):
         x = cat((x, goal), dim = -1)
-        hidden = self.net(x)
-        return self.action_head(hidden)
+        return self.net(x)
 
 class Critic(Module):
-    def __init__(self, state_dim, hidden_dim, num_actions, goal_dim = 8, dim_pred = 1, mlp_depth = 4, dropout = 0.1):
+    def __init__(self, state_dim, hidden_dim, num_actions, goal_dim = 8, dim_pred = 1, mlp_depth = 4):
         super().__init__()
-        self.net = SimBa(state_dim + goal_dim + num_actions, dim_hidden = hidden_dim, depth = mlp_depth, dropout = dropout)
-        self.value_head = nn.Linear(hidden_dim, dim_pred)
+        self.net = ResidualNormedMLP(
+            dim_in = state_dim + goal_dim + num_actions,
+            dim = hidden_dim,
+            dim_out = dim_pred,
+            depth = mlp_depth,
+            residual_every = 2,
+            keel_post_ln = True
+        )
 
     def forward(self, x, goal, past_action):
         x = cat((x, goal, past_action), dim = -1)
-        hidden = self.net(x)
-        return self.value_head(hidden)
+        return self.net(x)
 
 # GAE via associative scan
 
@@ -309,11 +272,8 @@ class PPO(Module):
                 ratios = (action_log_probs - old_log_probs).exp()
                 advantages = normalize(returns - scalar_old_values.detach())
 
-                maybe_gated_advantages = advantages
-
-                if self.use_delight_gating:
-                    delight_gate = (-action_log_probs * advantages).sigmoid().detach()
-                    maybe_gated_advantages = advantages * delight_gate
+                delight_gate = (-action_log_probs * advantages).sigmoid().detach() if self.use_delight_gating else 1.
+                maybe_gated_advantages = advantages * delight_gate
 
                 surr1 = ratios * maybe_gated_advantages
                 surr2 = ratios.clamp(1 - self.eps_clip, 1 + self.eps_clip) * maybe_gated_advantages
@@ -375,7 +335,7 @@ def main(
     contrastive_encoder_depth = 4,
     goal_encoder_dim = 64,
     goal_encoder_depth = 4,
-    cl_train_steps = 500,
+    cl_train_steps = 2000,
     cl_batch_size = 128,
     cl_repetition_factor = 2,
     cl_learning_rate = 3e-4,
@@ -437,7 +397,7 @@ def main(
 
     cl_replay_buffer = ReplayBuffer(
         './lunar-memories-goal-ppo/contrastive',
-        max_episodes = cl_batch_size * 2,
+        max_episodes = cl_batch_size * 6,
         max_timesteps = max_timesteps + 1,
         fields = dict(
             state = ('float', state_dim),
@@ -518,14 +478,7 @@ def main(
         past_action = torch.zeros(num_actions).to(device)
 
         is_exploring = torch.rand((), device = device) < exploration_random_goal_prob
-        eps_goal = goal_state
-
-        if is_exploring:
-            eps_goal = sample_random_state(
-                cl_replay_buffer,
-                env,
-                exploration_sample_from_buffer_prob
-            ).to(device)
+        eps_goal = sample_random_state(cl_replay_buffer, env, exploration_sample_from_buffer_prob).to(device) if is_exploring else goal_state
 
         ep_states = []
         ep_action_one_hots = []
@@ -566,10 +519,7 @@ def main(
 
                     sim = (critic_embed * goal_embed).sum(dim = -1)
 
-                    cl_loss_weight = 0.
-                    if last_cl_loss < float('inf'):
-                        cl_loss_weight = torch.tensor((cl_bonus_loss_threshold - last_cl_loss) / cl_bonus_loss_temperature).sigmoid().item()
-
+                    cl_loss_weight = torch.tensor((cl_bonus_loss_threshold - last_cl_loss) / cl_bonus_loss_temperature).sigmoid().item() if last_cl_loss < float('inf') else 0.
                     bonus = sim.sigmoid().item() * goal_bonus_weight * cl_loss_weight
 
                 reward += bonus
