@@ -571,6 +571,8 @@ class ActorTrainer(Module):
         contrastive_learn: Module | None = None,
         cpu = False,
         action_entropy_loss_weight = 0.,
+        advantage_weighting = False,
+        advantage_temperature = 1.0,
         state_to_goal_fn: Callable = identity,
         state_to_actor_state_fn: Callable = identity,
         state_to_critic_state_fn: Callable = identity
@@ -585,6 +587,8 @@ class ActorTrainer(Module):
 
         self.max_grad_norm = max_grad_norm
         self.action_entropy_loss_weight = action_entropy_loss_weight
+        self.advantage_weighting = advantage_weighting
+        self.advantage_temperature = advantage_temperature
 
         optimizer = AdamW(actor.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
         self.actor = actor
@@ -632,11 +636,13 @@ class ActorTrainer(Module):
         *,
         lens = None,
         rewards = None,
+        returns = None,
         sample_fn = None,
         entropy_fn = None,
         q_critic = None,
         q_loss_weight = 0.,
-        pbar = None
+        pbar = None,
+        value_network = None
     ):
 
         device = self.device
@@ -654,7 +660,7 @@ class ActorTrainer(Module):
 
         if not is_tensor(trajectories):
             trajectories = from_numpy(trajectories)
-            
+
         if exists(lens):
             lens = tensor(lens) if not is_tensor(lens) else lens
             traj_len = trajectories.shape[-2]
@@ -680,6 +686,18 @@ class ActorTrainer(Module):
 
             goal_data.append(goal_rewards)
 
+        if self.advantage_weighting:
+            assert exists(returns), 'returns must be passed if advantage_weighting is True'
+            if not is_tensor(returns):
+                returns = from_numpy(returns).float()
+            eval_returns = returns[mask] if exists(lens) else rearrange(returns, '... -> (...)')
+            if eval_returns.ndim == 1:
+                eval_returns = rearrange(eval_returns, 'b -> b 1')
+
+            # append Returns to dataset and goal_dataset!
+            dataset = TensorDataset(states, eval_returns)
+            goal_data.append(eval_returns)
+
         goal_dataset = TensorDataset(*goal_data)
 
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
@@ -701,8 +719,22 @@ class ActorTrainer(Module):
 
         for _ in pbar_instance:
 
-            state, = next(iter_dataloader)
-            goal, *maybe_goal_rewards = next(iter_goal_dataloader)
+            data = next(iter_dataloader)
+            state = data[0]
+
+            goal_data = next(iter_goal_dataloader)
+            goal = goal_data[0]
+
+            if self.advantage_weighting:
+                if exists(value_network):
+                    value_network.eval()
+                    with torch.no_grad():
+                        state_returns = rearrange(value_network(state), '... 1 -> ...')
+                        goal_returns = rearrange(value_network(goal_data[0]), '... 1 -> ...')
+                else:
+                    state_returns = data[1]
+                    goal_returns = rearrange(goal_data[-1], '... 1 -> ...')  # empirical returns is appended last
+                advantage = goal_returns - state_returns
 
             # forward state and goal
 
@@ -710,7 +742,7 @@ class ActorTrainer(Module):
             actor_goal = self.state_to_goal_fn(goal)
 
             if self.reward_part_of_goal:
-                goal_rewards, = maybe_goal_rewards
+                goal_rewards = goal_data[1]
 
                 goal_rewards = goal_rewards / self.reward_norm
 
@@ -745,7 +777,16 @@ class ActorTrainer(Module):
                 return_contrastive_score = True
             )
 
-            loss = -sim.mean()
+            if self.advantage_weighting:
+                adv_mean = advantage.mean()
+                adv_std = advantage.std(unbiased=False).clamp(min=1e-5)
+                norm_adv = (advantage - adv_mean) / adv_std
+
+                weight = torch.sigmoid(norm_adv / self.advantage_temperature)
+
+                loss = -(sim * weight).mean()
+            else:
+                loss = -sim.mean()
 
             if self.action_entropy_loss_weight > 0. and exists(entropy_fn):
                 entropy = entropy_fn(action_logits)
@@ -821,7 +862,7 @@ class TDTrainer(Module):
         if not is_tensor(actions): actions = from_numpy(actions)
         if not is_tensor(rewards): rewards = from_numpy(rewards)
         if not is_tensor(lens): lens = tensor(lens)
-        
+
         trajectories, actions, rewards, lens = trajectories.to(device), actions.to(device), rewards.to(device), lens.to(device)
 
         batch, seq_len, _ = trajectories.shape
@@ -854,7 +895,7 @@ class TDTrainer(Module):
         dataloader = self.accelerator.prepare(dataloader)
 
         td_loss_float = 0.
-        
+
         self.q_critic.train()
 
         if not exists(pbar):
@@ -864,7 +905,8 @@ class TDTrainer(Module):
 
         for _, (state, next_state, action, reward, is_done) in zip(pbar_instance, cycle(dataloader)):
             q = self.q_critic(state)
-            q = q.gather(-1, rearrange(action, 'b -> b 1')).squeeze(-1)
+            action_for_q = rearrange(action, 'b -> b 1')
+            q = rearrange(q.gather(-1, action_for_q), '... 1 -> ...')
 
             with torch.no_grad():
                 next_q = self.ema_q_critic(next_state).max(dim = -1).values
@@ -882,7 +924,95 @@ class TDTrainer(Module):
             self.ema_q_critic.update()
 
             td_loss_float = td_loss.item()
-            
+
             pbar_instance.set_description(f'td loss: {td_loss_float:.3f}')
 
         return td_loss_float
+
+# target value trainer
+
+class ValueTrainer(Module):
+    def __init__(
+        self,
+        value_network,
+        batch_size = 128,
+        learning_rate = 3e-4,
+        weight_decay = 0.,
+        max_grad_norm = 0.5,
+        cpu = False,
+        **adam_kwargs
+    ):
+        super().__init__()
+        self.accelerator = Accelerator(cpu = cpu)
+        self.device = self.accelerator.device
+
+        self.value_network = value_network
+        self.batch_size = batch_size
+        self.max_grad_norm = max_grad_norm
+
+        optimizer = AdamW(value_network.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
+
+        self.optimizer, self.value_network = self.accelerator.prepare(optimizer, self.value_network)
+
+    def forward(
+        self,
+        trajectories,
+        num_train_steps,
+        *,
+        lens = None,
+        returns = None,
+        pbar = None
+    ):
+        assert exists(returns), 'empirical returns must be provided for the Value network regression'
+
+        if not is_tensor(returns):
+            returns = from_numpy(returns).float()
+
+        target_returns = returns.to(self.device)
+
+        # Build empirical distribution batching
+        if exists(lens):
+            traj_len = trajectories.shape[-2]
+            mask = einx.less('t, b -> b t', arange(traj_len, device = target_returns.device), lens)
+            states = trajectories[mask]
+            target_returns = target_returns[mask]
+        else:
+            states = rearrange(trajectories, 'b t d -> (b t) d')
+            target_returns = rearrange(target_returns, 'b t ... -> (b t) ...')
+
+        target_returns = rearrange(target_returns, '... 1 -> ...')
+
+        dataset = TensorDataset(states, target_returns)
+        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
+        dataloader = self.accelerator.prepare(dataloader)
+        iter_dataloader = cycle(dataloader)
+
+        self.value_network.train()
+
+        if not exists(pbar):
+            pbar = tqdm
+        pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
+
+        for _ in pbar_instance:
+            data = next(iter_dataloader)
+            batch_states, batch_returns = data
+
+            # predict
+            values = rearrange(self.value_network(batch_states), '... 1 -> ...')
+
+            # MSE loss vs empirical returns
+            loss = F.mse_loss(values, batch_returns)
+
+            # update
+            self.optimizer.zero_grad()
+            self.accelerator.backward(loss)
+
+            if self.max_grad_norm > 0.:
+                self.accelerator.clip_grad_norm_(self.value_network.parameters(), self.max_grad_norm)
+
+            self.optimizer.step()
+
+            loss_float = loss.item()
+            pbar_instance.set_description(f'vf loss: {loss_float:.3f}')
+
+        return loss_float

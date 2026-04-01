@@ -65,7 +65,8 @@ class Dashboard:
         num_episodes,
         title = 'Contrastive RL Training',
         env_name = 'Unknown',
-        hyperparams = None
+        hyperparams = None,
+        has_value_network = False
     ):
         self.title = title
         self.live = None
@@ -96,11 +97,14 @@ class Dashboard:
         )
 
         critic_task = self.train_progress.add_task('Critic', total = 100, visible = True)
+        value_task = self.train_progress.add_task('Value', total = 100, visible = has_value_network)
         actor_task = self.train_progress.add_task('Actor', total = 100, visible = True)
 
         self.actor_task = actor_task
+        self.value_task = value_task
 
         self.critic_pbar = DashboardPBar(self, critic_task, 'Critic')
+        self.value_pbar = DashboardPBar(self, value_task, 'Value')
         self.actor_pbar = DashboardPBar(self, actor_task, 'Actor')
 
         # data
@@ -114,6 +118,7 @@ class Dashboard:
             'last_eps_reward': '0.00',
             'last_eps_steps': '0',
             'critic_loss': '0.0000',
+            'value_loss': '0.0000' if has_value_network else 'N/A',
             'actor_loss': '0.0000',
         }
 

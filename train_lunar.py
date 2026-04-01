@@ -8,23 +8,30 @@
 #   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.10",
 #   "x-mlps-pytorch>=0.3.0",
-#   "tqdm"
+#   "tqdm",
+#   "assoc-scan",
+#   "einops",
+#   "wandb"
 # ]
 # ///
 
 from __future__ import annotations
 
 import os
+from pathlib import Path
+import wandb
+
 from fire import Fire
 from shutil import rmtree
 from collections import deque
 from functools import partial
 
 import torch
-from torch import from_numpy, cat, tensor
+from torch import from_numpy, cat, tensor, arange
 import torch.nn.functional as F
 
 import numpy as np
+import einx
 from einops import rearrange
 
 from tqdm import tqdm
@@ -37,10 +44,23 @@ from contrastive_rl_pytorch import (
     ContrastiveRLTrainer,
     ActorTrainer,
     TDTrainer,
+    ValueTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
     sample_random_state
 )
+
+from assoc_scan import AssocScan
+
+def calc_returns(
+    rewards,
+    masks,
+    gamma = 0.99,
+    use_accelerated = False
+):
+    gates = gamma * masks
+    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
+    return scan(gates, rewards)
 
 
 from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
@@ -105,11 +125,13 @@ def main(
     use_wandb = False,
     cpu = False,
     sigreg_loss_weight = 0.,
-    use_td_learning = True,
+    use_td_learning = False,
     td_gamma = 0.95,
     td_loss_weight = 1e-2,
     td_learning_rate = 3e-4,
-    action_entropy_loss_weight = 1e-2
+    action_entropy_loss_weight = 1e-2,
+    use_advantage_weighting = True,
+    rollout_cpu = True
 ):
     # clear video folder
 
@@ -176,8 +198,10 @@ def main(
     else:
         MLP = partial(ResidualNormedMLP, residual_every = 4, keel_post_ln = True)
 
+    actor_dim_in = dim_state + dim_goal
+
     actor_encoder = MLP(
-        dim_in = dim_state + dim_goal, # state and goal
+        dim_in = actor_dim_in, # state and goal
         dim = actor_dim,
         depth = actor_depth,
         dim_out = dim_action
@@ -217,6 +241,28 @@ def main(
             batch_size = actor_batch_size,
             learning_rate = td_learning_rate,
             td_gamma = td_gamma,
+            weight_decay = weight_decay,
+            max_grad_norm = max_grad_norm,
+            cpu = cpu
+        )
+
+    # value network (if computing advantage with expected-returns baseline)
+
+    value_network = None
+    value_trainer = None
+
+    if use_advantage_weighting:
+        value_network = MLP(
+            dim_in = dim_state,
+            dim = critic_dim,
+            dim_out = 1,
+            depth = 2
+        )
+
+        value_trainer = ValueTrainer(
+            value_network,
+            batch_size = actor_batch_size,
+            learning_rate = actor_learning_rate,
             weight_decay = weight_decay,
             max_grad_norm = max_grad_norm,
             cpu = cpu
@@ -265,7 +311,8 @@ def main(
         reward_fourier_dim = reward_fourier_dim,
         cpu = cpu,
         contrastive_learn = contrastive_learn,
-        action_entropy_loss_weight = action_entropy_loss_weight
+        action_entropy_loss_weight = action_entropy_loss_weight,
+        advantage_weighting = use_advantage_weighting
     )
 
     base_actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
@@ -302,11 +349,20 @@ def main(
             sigreg_loss_weight = sigreg_loss_weight,
             use_td_learning = f"{use_td_learning}",
             td_loss_weight = td_loss_weight
-        )
+        ),
+        has_value_network = use_advantage_weighting
     )
 
     with dashboard.create_renderable() as live:
+
+        rollout_device = torch.device('cpu') if rollout_cpu else device
+
         for eps in range(num_episodes):
+
+            if rollout_cpu:
+                actor_encoder.cpu()
+                if exists(actor_trainer.reward_fourier_encode):
+                    actor_trainer.reward_fourier_encode.cpu()
 
             state, *_ = env.reset()
 
@@ -316,17 +372,18 @@ def main(
             critic_sigreg_loss = 0.
             actor_loss = 0.
             td_loss_val = 0.
+            value_loss_val = 0.
 
             # decide on goal for the episode
 
             is_exploring = torch.rand((), device = device) < exploration_random_goal_prob
 
-            eps_goal = base_actor_goal
+            eps_goal = base_actor_goal.to(rollout_device)
 
             if reward_part_of_goal:
-                max_reward_tensor = tensor([max_step_reward / reward_norm], device = device, dtype = torch.float32)
+                max_reward_tensor = tensor([max_step_reward / reward_norm], device = rollout_device, dtype = torch.float32)
                 if reward_fourier_encode:
-                    actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(device)
+                    actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(rollout_device)
                     max_reward_tensor = actor_trainer.reward_fourier_encode(max_reward_tensor)
                     max_reward_tensor = rearrange(max_reward_tensor, '1 d -> d')
                 eps_goal = cat((eps_goal, max_reward_tensor), dim = -1)
@@ -336,13 +393,13 @@ def main(
                     replay_buffer,
                     env,
                     exploration_sample_from_buffer_prob
-                ).to(device)
+                ).to(rollout_device)
 
                 if reward_part_of_goal and eps_goal.shape[-1] == dim_state:
-                    rand_reward = torch.rand((1,), device = device, dtype = torch.float32) * (max_step_reward / reward_norm)
+                    rand_reward = torch.rand((1,), device = rollout_device, dtype = torch.float32) * (max_step_reward / reward_norm)
 
                     if reward_fourier_encode:
-                        actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(device)
+                        actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(rollout_device)
                         rand_reward = actor_trainer.reward_fourier_encode(rand_reward)
                         rand_reward = rearrange(rand_reward, '1 d -> d')
 
@@ -357,9 +414,11 @@ def main(
 
                 actor_encoder.eval()
 
-                curr_state = from_numpy(state).to(device)
+                curr_state = from_numpy(state).to(rollout_device)
 
-                action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
+                actor_inputs = [curr_state, eps_goal]
+
+                action_logits = actor_encoder(cat(actor_inputs, dim = -1))
 
                 action = actor_readout.sample(action_logits)
 
@@ -407,6 +466,11 @@ def main(
 
             if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, num_episodes_before_learn):
 
+                if rollout_cpu:
+                    actor_encoder.to(device)
+                    if exists(actor_trainer.reward_fourier_encode):
+                        actor_trainer.reward_fourier_encode.to(device)
+
                 data = replay_buffer.get_all_data(
                     fields = ['state', 'reward', 'action_hard_one_hot', 'action_soft_one_hot'],
                     meta_fields = ['episode_lens']
@@ -424,7 +488,7 @@ def main(
                 td_loss_val = 0.
                 if use_td_learning:
                     hard_actions = data['action_hard_one_hot'].argmax(dim=-1)
-                    
+
                     td_loss_val = td_trainer(
                         trajectories,
                         actor_num_train_steps,
@@ -443,21 +507,46 @@ def main(
                     pbar = dashboard.critic_pbar
                 )
 
+                discounted_returns = None
+                if use_advantage_weighting:
+                    max_len = trajectories.shape[1]
+                    eps_lens_tensor = episode_lens.clone().detach().to(device) if torch.is_tensor(episode_lens) else tensor(episode_lens, device = device)
+                    masks = einx.less('t, b -> b t', arange(max_len, device = device), eps_lens_tensor).float()
+
+                    rewards_tensor = rearrange(rewards_for_critic.to(device), '... 1 -> ...')
+                    discounted_returns = calc_returns(
+                        rewards_tensor,
+                        masks,
+                        gamma = 0.99
+                    )
+                    discounted_returns = rearrange(discounted_returns, '... -> ... 1').cpu()
+
+                    value_loss_val = value_trainer(
+                        trajectories,
+                        actor_num_train_steps,
+                        lens = episode_lens,
+                        returns = discounted_returns,
+                        pbar = dashboard.value_pbar
+                    )
+
                 actor_loss = actor_trainer(
                     trajectories,
                     actor_num_train_steps,
                     lens = episode_lens,
                     rewards = rewards_for_critic,
+                    returns = discounted_returns,
                     sample_fn = actor_readout.sample,
                     q_critic = td_critic if use_td_learning else None,
                     q_loss_weight = td_loss_weight if use_td_learning else 0.,
                     entropy_fn = actor_readout.entropy,
-                    pbar = dashboard.actor_pbar
+                    pbar = dashboard.actor_pbar,
+                    value_network = value_network
                 )
 
                 dashboard.update_metrics(
                     critic_loss = f"{cl_loss:.4f}",
                     critic_sigreg_loss = f"{critic_sigreg_loss:.4f}",
+                    value_loss = f"{value_loss_val:.4f}" if use_advantage_weighting else "N/A",
                     actor_loss = f"{actor_loss:.4f}",
                     td_loss = f"{td_loss_val:.4f}" if use_td_learning else "N/A"
                 )
@@ -474,14 +563,30 @@ def main(
                 )
 
                 if use_wandb:
-                    accelerator.log({
+                    log_data = {
                         "avg_cum_reward_100": avg_reward,
                         "avg_steps_100": avg_steps,
                         "last_eps_reward": cum_reward,
                         "critic_loss": cl_loss,
                         "critic_sigreg_loss": critic_sigreg_loss,
                         "actor_loss": actor_loss
-                    })
+                    }
+                    if use_advantage_weighting:
+                        log_data["value_loss"] = value_loss_val
+                    accelerator.log(log_data)
+
+                    mp4s = sorted(Path(video_folder).glob("*.mp4"))
+
+                    if len(mp4s) > 0:
+                        latest_mp4 = str(mp4s[-1])
+                        last_logged = getattr(live, 'last_logged_video', None)
+
+                        if latest_mp4 != last_logged:
+                            try:
+                                accelerator.log({"video": wandb.Video(latest_mp4)})
+                                live.last_logged_video = latest_mp4
+                            except:
+                                pass
 
             live.update(dashboard.render())
 

@@ -22,7 +22,7 @@ def test_contrast_wrapper():
 
     wrapper = ContrastiveWrapper(encoder, ContrastiveLearning())
 
-    loss = wrapper(past_obs, future_obs)
+    loss, _ = wrapper(past_obs, future_obs)
     assert loss.numel() == 1
 
 @param('var_traj_len', (False, True))

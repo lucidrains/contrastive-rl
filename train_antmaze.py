@@ -324,20 +324,20 @@ def main(
             idx = torch.randint(0, flat.shape[0], (1,)).item()
             state_slice = flat[idx]
             goal_slice = state_slice[..., -goal_dim_env:]
-            
+
             if goal_includes_obs:
                 goal_slice = np.concatenate([UPRIGHT_OBS, goal_slice], axis=-1)
-                
+
             return from_numpy(goal_slice).float().to(env_device) if isinstance(goal_slice, np.ndarray) else goal_slice.float().to(env_device)
 
         temp_env = gym.make(env_name)
         state_dict, _ = temp_env.reset()
         temp_env.close()
-        
+
         target_goal = state_dict['desired_goal'].astype(np.float32)
         if goal_includes_obs:
             target_goal = np.concatenate([UPRIGHT_OBS, target_goal], axis=-1)
-            
+
         return from_numpy(target_goal).to(env_device)
 
     # evaluation video recording setup
@@ -351,14 +351,14 @@ def main(
             episode_trigger = lambda _: True,
             disable_logger = True
         )
-        
+
         state_dict, _ = eval_env.reset()
         state = concat_goal_obs(state_dict).astype(np.float32)
 
         desired_goal = state_dict['desired_goal'].astype(np.float32)
         if goal_includes_obs:
             desired_goal = np.concatenate([UPRIGHT_OBS, desired_goal], axis=-1)
-            
+
         eps_goal = from_numpy(desired_goal).to(env_device)
 
         if reward_part_of_goal:
@@ -377,10 +377,10 @@ def main(
                 action = sample_fn(action_logits, is_rollout=True)
 
             next_state_dict, reward, terminated, truncated, _ = eval_env.step(action.detach().cpu().numpy())
-            
+
             if terminated or truncated:
                 break
-                
+
             state = concat_goal_obs(next_state_dict).astype(np.float32)
 
         eval_env.close()
@@ -428,7 +428,7 @@ def main(
 
         is_exploring = torch.rand(num_envs) < exploration_random_goal_prob
         eps_goal = torch.zeros((num_envs, dim_goal_encoder_in), device = env_device)
-        
+
         if reward_part_of_goal:
             desired_rewards = torch.ones((num_envs, 1), device=env_device) / reward_norm
             if reward_fourier_encode:
@@ -494,7 +494,7 @@ def main(
                 if "final_info" in infos and infos["_final_info"][i]:
                     if "is_success" in infos["final_info"][i]:
                         has_success = bool(infos["final_info"][i]["is_success"])
-                
+
                 rolling_success.append(1.0 if has_success else 0.0)
 
                 if len(states[i]) >= 2:
