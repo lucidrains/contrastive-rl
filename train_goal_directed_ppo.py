@@ -65,7 +65,8 @@ from memmap_replay_buffer import ReplayBuffer
 from contrastive_rl_pytorch import (
     ContrastiveRLTrainer,
     SigmoidContrastiveLearning,
-    sample_random_state
+    sample_random_state,
+    ActorTrainer
 )
 
 from x_mlps_pytorch import ResidualNormedMLP
@@ -109,10 +110,10 @@ def l2norm(t):
 # actor and critic
 
 class Actor(Module):
-    def __init__(self, state_dim, hidden_dim, num_actions, goal_dim = 8, mlp_depth = 2):
+    def __init__(self, state_dim, hidden_dim, num_actions, goal_dim = 8, num_skills = 5, mlp_depth = 2):
         super().__init__()
         self.net = ResidualNormedMLP(
-            dim_in = state_dim + goal_dim,
+            dim_in = state_dim + goal_dim + num_skills,
             dim = hidden_dim * 2,
             dim_out = num_actions,
             depth = mlp_depth,
@@ -120,15 +121,15 @@ class Actor(Module):
             keel_post_ln = True
         )
 
-    def forward(self, x, goal):
-        x = cat((x, goal), dim = -1)
+    def forward(self, x, goal, skill):
+        x = cat((x, goal, skill), dim = -1)
         return self.net(x)
 
 class Critic(Module):
-    def __init__(self, state_dim, hidden_dim, num_actions, goal_dim = 8, dim_pred = 1, mlp_depth = 4):
+    def __init__(self, state_dim, hidden_dim, num_actions, goal_dim = 8, num_skills = 5, dim_pred = 1, mlp_depth = 4):
         super().__init__()
         self.net = ResidualNormedMLP(
-            dim_in = state_dim + goal_dim + num_actions,
+            dim_in = state_dim + goal_dim + num_actions + num_skills,
             dim = hidden_dim,
             dim_out = dim_pred,
             depth = mlp_depth,
@@ -136,9 +137,38 @@ class Critic(Module):
             keel_post_ln = True
         )
 
-    def forward(self, x, goal, past_action):
-        x = cat((x, goal, past_action), dim = -1)
+    def forward(self, x, goal, past_action, skill):
+        x = cat((x, goal, past_action, skill), dim = -1)
         return self.net(x)
+
+class Discriminator(Module):
+    def __init__(self, state_dim, hidden_dim, num_skills, mlp_depth = 2):
+        super().__init__()
+        self.net = ResidualNormedMLP(
+            dim_in = state_dim,
+            dim = hidden_dim,
+            dim_out = num_skills,
+            depth = mlp_depth,
+            residual_every = 2,
+            keel_post_ln = True
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class ActorWrapper(Module):
+    def __init__(self, actor, state_dim, num_skills):
+        super().__init__()
+        self.actor = actor
+        self.state_dim = state_dim
+        self.num_skills = num_skills
+
+    def forward(self, state_goal_tuple):
+        actor_state, actor_goal = state_goal_tuple
+        state = actor_state[..., :self.state_dim]
+        skill = actor_state[..., self.state_dim:]
+        goal = actor_goal[..., :self.state_dim]
+        return self.actor(state, goal, skill)
 
 # GAE via associative scan
 
@@ -177,12 +207,16 @@ class PPO(Module):
         actor_mlp_depth = 2,
         critic_mlp_depth = 4,
         goal_dim = 8,
+        num_skills = 5,
         save_path = './ppo.pt'
     ):
         super().__init__()
 
-        self.actor = Actor(state_dim, actor_hidden_dim, num_actions, goal_dim = goal_dim, mlp_depth = actor_mlp_depth)
-        self.critic = Critic(state_dim, critic_hidden_dim, num_actions, goal_dim = goal_dim, dim_pred = critic_pred_num_bins, mlp_depth = critic_mlp_depth)
+        self.num_skills = num_skills
+
+        self.actor = Actor(state_dim, actor_hidden_dim, num_actions, goal_dim = goal_dim, num_skills = num_skills, mlp_depth = actor_mlp_depth)
+        self.critic = Critic(state_dim, critic_hidden_dim, num_actions, goal_dim = goal_dim, num_skills = num_skills, dim_pred = critic_pred_num_bins, mlp_depth = critic_mlp_depth)
+        self.discriminator = Discriminator(state_dim, critic_hidden_dim, num_skills)
 
         self.critic_hl_gauss_loss = HLGaussLoss(
             min_value = reward_range[0],
@@ -193,12 +227,15 @@ class PPO(Module):
 
         self.ema_actor = EMA(self.actor, beta = ema_decay, include_online_model = False, update_model_with_ema_every = 1000)
         self.ema_critic = EMA(self.critic, beta = ema_decay, include_online_model = False, update_model_with_ema_every = 1000)
+        self.ema_discriminator = EMA(self.discriminator, beta = ema_decay, include_online_model = False, update_model_with_ema_every = 1000)
 
         self.opt_actor = AdoptAtan2(self.actor.parameters(), lr = lr, betas = betas)
         self.opt_critic = AdoptAtan2(self.critic.parameters(), lr = lr, betas = betas)
+        self.opt_discriminator = AdoptAtan2(self.discriminator.parameters(), lr = lr, betas = betas)
 
         self.ema_actor.add_to_optimizer_post_step_hook(self.opt_actor)
         self.ema_critic.add_to_optimizer_post_step_hook(self.opt_critic)
+        self.ema_discriminator.add_to_optimizer_post_step_hook(self.opt_discriminator)
 
         self.minibatch_size = minibatch_size
         self.epochs = epochs
@@ -213,7 +250,8 @@ class PPO(Module):
     def save(self):
         torch.save({
             'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict()
+            'critic': self.critic.state_dict(),
+            'discriminator': self.discriminator.state_dict()
         }, str(self.save_path))
 
     def load(self):
@@ -222,6 +260,22 @@ class PPO(Module):
         data = torch.load(str(self.save_path), weights_only = True)
         self.actor.load_state_dict(data['actor'])
         self.critic.load_state_dict(data['critic'])
+        self.discriminator.load_state_dict(data.get('discriminator', self.discriminator.state_dict()))
+
+    @torch.no_grad()
+    def calc_diayn_reward(self, state, skill_int):
+        import math
+        if state.ndim == 1:
+            state = rearrange(state, '... -> 1 ...')
+            skill_int = tensor([skill_int], device = state.device)
+
+        logits = self.ema_discriminator.forward_eval(state)
+        log_qz_s = logits.log_softmax(dim = -1)
+
+        log_pz = math.log(1. / logits.shape[-1])
+        reward = log_qz_s[torch.arange(state.shape[0]), skill_int] - log_pz
+
+        return reward.squeeze()
 
     def learn(self, memories: ReplayBuffer, device = None):
         hl_gauss = self.critic_hl_gauss_loss
@@ -251,18 +305,20 @@ class PPO(Module):
             batch_size = self.minibatch_size,
             shuffle = True,
             filter_fields = dict(learnable = True),
-            to_named_tuple = ('state', 'action', 'action_log_prob', 'returns', 'value', 'past_action', 'target_goal'),
+            to_named_tuple = ('state', 'action', 'action_log_prob', 'returns', 'value', 'past_action', 'target_goal', 'skill'),
             timestep_level = True,
             device = device
         )
 
         self.actor.train()
         self.critic.train()
+        self.discriminator.train()
 
         for _ in range(self.epochs):
-            for _, (states, actions, old_log_probs, returns, old_values, past_action, target_goals) in enumerate(dl):
+            for _, (states, actions, old_log_probs, returns, old_values, past_action, target_goals, skill) in enumerate(dl):
+                skills = F.one_hot(skill.long(), num_classes = self.num_skills).float()
 
-                action_logits = self.actor(states, target_goals)
+                action_logits = self.actor(states, target_goals, skills)
                 dist = Categorical(logits = action_logits)
                 action_log_probs = dist.log_prob(actions)
                 entropy = dist.entropy()
@@ -283,7 +339,7 @@ class PPO(Module):
 
                 # critic update
                 clip = self.value_clip
-                values = self.critic(states, target_goals, past_action)
+                values = self.critic(states, target_goals, past_action, skills)
                 scalar_values = hl_gauss(values)
 
                 clipped_returns = returns.clamp(scalar_old_values - clip, scalar_old_values + clip)
@@ -302,6 +358,12 @@ class PPO(Module):
                 ).mean()
 
                 update_network_(value_loss, self.opt_critic)
+
+                # discriminator update
+                discrim_logits = self.discriminator(states)
+                discrim_loss = F.cross_entropy(discrim_logits, skill.long())
+                
+                update_network_(discrim_loss, self.opt_discriminator)
 
 # main
 
@@ -329,7 +391,9 @@ def main(
     ema_decay = 0.9,
     epochs = 2,
     use_delight_gating = True,
-    goal_bonus_weight = 1.0,
+    goal_bonus_weight = 0.1,
+    num_skills = 5,
+    diayn_weight = 0.1,
     contrastive_embed_dim = 64,
     contrastive_encoder_dim = 64,
     contrastive_encoder_depth = 4,
@@ -339,6 +403,9 @@ def main(
     cl_batch_size = 128,
     cl_repetition_factor = 2,
     cl_learning_rate = 3e-4,
+    actor_train_every_eps = 500,
+    actor_train_steps = 1000,
+    actor_learning_rate = 3e-4,
     cl_bonus_loss_threshold = 0.04,
     cl_bonus_loss_temperature = 0.01,
     sigmoid_bias = -5.,
@@ -388,6 +455,7 @@ def main(
             returns = 'float',
             past_action = ('int', num_actions),
             target_goal = ('float', state_dim),
+            skill = 'int',
         ),
         circular = True,
         overwrite = True
@@ -402,6 +470,7 @@ def main(
         fields = dict(
             state = ('float', state_dim),
             action_one_hot = ('float', num_actions),
+            skill_tensor = ('float', num_skills),
         ),
         circular = True,
         overwrite = True
@@ -417,6 +486,7 @@ def main(
         actor_mlp_depth = actor_mlp_depth,
         critic_mlp_depth = critic_mlp_depth,
         goal_dim = state_dim,
+        num_skills = num_skills,
         save_path = './goal_directed_ppo.pt'
     ).to(device)
 
@@ -455,6 +525,21 @@ def main(
         cpu = not torch.cuda.is_available()
     )
 
+    actor_wrapper = ActorWrapper(agent.actor, state_dim, num_skills)
+
+    actor_trainer = ActorTrainer(
+        actor = actor_wrapper,
+        encoder = critic_encoder,
+        goal_encoder = goal_encoder,
+        batch_size = cl_batch_size,
+        learning_rate = actor_learning_rate,
+        contrastive_learn = contrastive_learn,
+        softmax_actor_output = True,
+        state_to_critic_state_fn = lambda x: x[..., :state_dim],
+        state_to_goal_fn = lambda x: x[..., :state_dim],
+        cpu = not torch.cuda.is_available()
+    )
+
     # goal state for LunarLander: x=0, y=0, vx=0, vy=0, angle=0, angular_vel=0, left_leg=1, right_leg=1
     goal_state = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
 
@@ -465,14 +550,20 @@ def main(
     time = 0
     reward_window = deque(maxlen = 100)
     bonus_window = deque(maxlen = 100)
+    diayn_window = deque(maxlen = 100)
     steps_window = deque(maxlen = 100)
     last_cl_loss = float('inf')
+    last_actor_loss = float('inf')
 
     pbar = tqdm(range(num_episodes), desc = 'episodes')
     for eps in pbar:
 
+        skill_z = eps % num_skills
+        skill_tensor = F.one_hot(tensor(skill_z, device = device), num_classes = num_skills).float()
+
         episode_reward = 0.
         episode_bonus = 0.
+        episode_diayn = 0.
         state, _ = env.reset(seed = seed)
         state = torch.from_numpy(state).float().to(device)
         past_action = torch.zeros(num_actions).to(device)
@@ -482,13 +573,14 @@ def main(
 
         ep_states = []
         ep_action_one_hots = []
+        ep_skills = []
 
         with memories.one_episode():
             for timestep in range(max_timesteps):
                 time += 1
 
-                action_logits = agent.ema_actor.forward_eval(state, eps_goal)
-                value = agent.ema_critic.forward_eval(state, eps_goal, past_action)
+                action_logits = agent.ema_actor.forward_eval(state, eps_goal, skill_tensor)
+                value = agent.ema_critic.forward_eval(state, eps_goal, past_action, skill_tensor)
 
                 dist = Categorical(logits = action_logits)
                 action = dist.sample()
@@ -525,12 +617,16 @@ def main(
                 reward += bonus
                 episode_bonus += bonus
 
+                diayn_bonus = agent.calc_diayn_reward(next_state, skill_z).item()
+                reward += diayn_weight * diayn_bonus
+                episode_diayn += diayn_bonus
+
                 # bootstrap for non-terminal truncation
                 updating_agent = divisible_by(time, update_timesteps)
                 done = terminated or truncated or updating_agent
 
                 if done and not terminated:
-                    next_value = agent.ema_critic.forward_eval(next_state, eps_goal, action_one_hot)
+                    next_value = agent.ema_critic.forward_eval(next_state, eps_goal, action_one_hot, skill_tensor)
                     scalar_next_value = agent.critic_hl_gauss_loss(next_value).item()
                     reward += agent.gamma * scalar_next_value
 
@@ -539,6 +635,7 @@ def main(
                 # store for contrastive training
                 ep_states.append(state.cpu())
                 ep_action_one_hots.append(action_one_hot.cpu())
+                ep_skills.append(skill_tensor.cpu())
 
                 memories.store(
                     learnable = True,
@@ -550,6 +647,7 @@ def main(
                     value = value,
                     past_action = past_action,
                     target_goal = eps_goal,
+                    skill = skill_z,
                 )
 
                 state = next_state
@@ -566,11 +664,13 @@ def main(
             cl_replay_buffer.store_episode(
                 state = ep_states,
                 action_one_hot = ep_action_one_hots,
+                skill_tensor = ep_skills,
             )
 
         if not is_exploring:
             reward_window.append(episode_reward)
             bonus_window.append(episode_bonus)
+            diayn_window.append(episode_diayn)
             steps_window.append(timestep + 1)
 
         # periodically train contrastive encoders
@@ -587,12 +687,30 @@ def main(
                 pbar = partial(tqdm, leave = False)
             )
 
-        pbar.set_postfix(
-            reward = f"{sum(reward_window) / len(reward_window):.2f}" if len(reward_window) > 0 else "0.00",
-            bonus = f"{sum(bonus_window) / len(bonus_window):.3f}" if len(bonus_window) > 0 else "0.000",
-            steps = f"{sum(steps_window) / len(steps_window):.1f}" if len(steps_window) > 0 else "0.0",
-            cl_loss = f"{last_cl_loss:.3f}"
-        )
+        # periodically train actor directly with ActorTrainer
+        if cl_replay_buffer.num_episodes >= cl_batch_size and divisible_by(eps + 1, actor_train_every_eps):
+            data = cl_replay_buffer.get_all_data(
+                fields = ['state', 'skill_tensor'],
+                meta_fields = ['episode_lens']
+            )
+
+            trajectories_with_skills = torch.cat((data['state'], data['skill_tensor']), dim = -1)
+
+            last_actor_loss = actor_trainer(
+                trajectories_with_skills,
+                actor_train_steps,
+                lens = data['episode_lens'],
+                pbar = partial(tqdm, leave = False)
+            )
+
+        pbar.set_postfix({
+            'reward': f"{sum(reward_window) / len(reward_window):.2f}" if len(reward_window) > 0 else "0.00",
+            'bonus': f"{sum(bonus_window) / len(bonus_window):.3f}" if len(bonus_window) > 0 else "0.000",
+            'diayn': f"{sum(diayn_window) / len(diayn_window):.3f}" if len(diayn_window) > 0 else "0.000",
+            'steps': f"{sum(steps_window) / len(steps_window):.1f}" if len(steps_window) > 0 else "0.0",
+            'cl_loss': f"{last_cl_loss:.3f}",
+            'act_loss': f"{last_actor_loss:.3f}"
+        })
 
         if divisible_by(eps, save_every):
             agent.save()
