@@ -128,3 +128,15 @@ wait until 3-5k steps at least
     url     = {https://arxiv.org/abs/2509.10656},
 }
 ```
+
+```bibtex
+@misc{yin2026emergentdexteritydiverseresets,
+    title   = {Emergent Dexterity via Diverse Resets and Large-Scale Reinforcement Learning}, 
+    author  = {Patrick Yin and Tyler Westenbroek and Zhengyu Zhang and Joshua Tran and Ignacio Dagnino and Eeshani Shilamkar and Numfor Mbiziwo-Tiapo and Simran Bagaria and Xinlei Liu and Galen Mullins and Andrey Kolobov and Abhishek Gupta},
+    year    = {2026},
+    eprint  = {2603.15789},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2603.15789}, 
+}
+```
