@@ -22,7 +22,7 @@ def test_contrast_wrapper():
 
     wrapper = ContrastiveWrapper(encoder, ContrastiveLearning())
 
-    loss, _ = wrapper(past_obs, future_obs)
+    loss = wrapper(past_obs, future_obs)
     assert loss.numel() == 1
 
 @param('var_traj_len', (False, True))
@@ -115,3 +115,170 @@ def test_readme():
     trajectories = torch.randn(256, 512, 16)
 
     trainer(trajectories, 1)
+
+@param('num_discrete_actions', (2, 4))
+@param('normalize_q_values', (False, True))
+@param('use_target_goals', ('none', '1d', '2d'))
+@param('use_sigmoid', (False, True))
+def test_discrete_actor_trainer(
+    num_discrete_actions,
+    normalize_q_values,
+    use_target_goals,
+    use_sigmoid
+):
+    from contrastive_rl_pytorch import ActorTrainer, ContrastiveLearning, SigmoidContrastiveLearning
+    from x_mlps_pytorch import MLP
+
+    dim_state = 16
+    dim_goal = 16
+    dim_action = num_discrete_actions
+    dim_contrastive_embed = 64
+
+    actor = MLP(dim_state + dim_goal, 64, 64, dim_action)
+    encoder = MLP(dim_state + dim_action, 64, 64, dim_contrastive_embed)
+    goal_encoder = MLP(dim_goal, 64, 64, dim_contrastive_embed)
+
+    contrastive_learn = SigmoidContrastiveLearning() if use_sigmoid else ContrastiveLearning()
+
+    actor_trainer = ActorTrainer(
+        actor,
+        encoder,
+        goal_encoder,
+        num_discrete_actions = num_discrete_actions,
+        normalize_q_values = normalize_q_values,
+        cpu = True,
+        contrastive_learn = contrastive_learn
+    )
+
+    trajectories = torch.randn(32, 64, dim_state)
+    lens = torch.randint(32, 64, (32,))
+
+    target_goals = None
+    if use_target_goals == '1d':
+        target_goals = torch.randn(dim_goal)
+    elif use_target_goals == '2d':
+        target_goals = torch.randn(8, dim_goal)
+
+    loss = actor_trainer(trajectories, 2, lens = lens, target_goals = target_goals, pbar = False)
+    assert isinstance(loss, float) and not torch.tensor(loss).isnan()
+
+@param('use_target_goals', (False, True))
+@param('use_sigmoid', (False, True))
+def test_continuous_actor_trainer(use_target_goals, use_sigmoid):
+    from contrastive_rl_pytorch import ActorTrainer, ContrastiveLearning, SigmoidContrastiveLearning
+    from x_mlps_pytorch import MLP
+
+    dim_state = 16
+    dim_goal = 16
+    dim_action = 2
+    dim_contrastive_embed = 64
+
+    actor = MLP(dim_state + dim_goal, 64, 64, dim_action)
+    encoder = MLP(dim_state + dim_action, 64, 64, dim_contrastive_embed)
+    goal_encoder = MLP(dim_goal, 64, 64, dim_contrastive_embed)
+
+    contrastive_learn = SigmoidContrastiveLearning() if use_sigmoid else ContrastiveLearning()
+
+    actor_trainer = ActorTrainer(
+        actor,
+        encoder,
+        goal_encoder,
+        cpu = True,
+        contrastive_learn = contrastive_learn
+    )
+
+    trajectories = torch.randn(32, 64, dim_state)
+    target_goals = torch.randn(dim_goal) if use_target_goals else None
+
+    loss = actor_trainer(
+        trajectories,
+        2,
+        target_goals = target_goals,
+        sample_fn = lambda logits: torch.tanh(logits),
+        pbar = False
+    )
+    assert isinstance(loss, float) and not torch.tensor(loss).isnan()
+
+@param('use_sigmoid', (False, True))
+@param('l2norm_embed', (False, True))
+def test_euclidean_contrast_learning(use_sigmoid, l2norm_embed):
+    from contrastive_rl_pytorch import ContrastiveLearning, SigmoidContrastiveLearning
+    cls = SigmoidContrastiveLearning if use_sigmoid else ContrastiveLearning
+    cl = cls(use_euclidean = True, l2norm_embed = l2norm_embed)
+
+    embeds1 = torch.randn(10, 32)
+    embeds2 = torch.randn(10, 32)
+
+    loss = cl(embeds1, embeds2)
+    assert loss.numel() == 1 and not loss.isnan()
+
+    scores = cl(embeds1, embeds2, return_contrastive_score = True)
+    assert scores.shape == (10,) and not scores.isnan().any()
+
+    # batched score (e.g. discrete actions)
+    e1 = torch.randn(10, 4, 32)
+    e2 = torch.randn(10, 4, 32)
+    scores_batched = cl(e1, e2, return_contrastive_score = True)
+    assert scores_batched.shape == (10, 4) and not scores_batched.isnan().any()
+
+@param('use_sigmoid', (False, True))
+def test_euclidean_discrete_actor_trainer(use_sigmoid):
+    from contrastive_rl_pytorch import ActorTrainer, ContrastiveLearning, SigmoidContrastiveLearning
+    from x_mlps_pytorch import MLP
+
+    dim_state = 8
+    dim_goal = 8
+    dim_action = 4
+    dim_embed = 32
+
+    actor = MLP(dim_state + dim_goal, 32, dim_action)
+    encoder = MLP(dim_state + dim_action, 32, dim_embed)
+    goal_encoder = MLP(dim_goal, 32, dim_embed)
+
+    cls = SigmoidContrastiveLearning if use_sigmoid else ContrastiveLearning
+    cl = cls(use_euclidean = True)
+
+    actor_trainer = ActorTrainer(
+        actor,
+        encoder,
+        goal_encoder,
+        num_discrete_actions = dim_action,
+        cpu = True,
+        contrastive_learn = cl
+    )
+
+    trajectories = torch.randn(16, 32, dim_state)
+    target_goals = torch.randn(dim_goal)
+
+    loss = actor_trainer(trajectories, 2, target_goals = target_goals, pbar = False)
+    assert isinstance(loss, float) and not torch.tensor(loss).isnan()
+
+@param('discount', (0.9, 0.99, 1.0))
+@param('as_tensor', (False, True))
+def test_sample_truncated_geometric(discount, as_tensor):
+    from contrastive_rl_pytorch import sample_truncated_geometric, sample_truncated_geometric_time
+    assert sample_truncated_geometric is sample_truncated_geometric_time
+
+    max_steps = torch.tensor([5, 10, 50, 100]) if as_tensor else 20
+    delta = sample_truncated_geometric(max_steps, discount)
+
+    if as_tensor:
+        assert (delta >= 1).all()
+        assert (delta <= max_steps).all()
+    else:
+        assert 1 <= delta.item() <= max_steps
+
+    # test boundary behavior with rand_uniform=0 and rand_uniform=1
+
+    rem = torch.tensor([5, 10, 25, 50])
+    rand_0 = torch.zeros_like(rem, dtype = torch.float32)
+    rand_1 = torch.ones_like(rem, dtype = torch.float32) * (1. - 1e-7)
+
+    assert (sample_truncated_geometric(rem, discount, rand_uniform = rand_0) == 1).all()
+    assert (sample_truncated_geometric(rem, discount, rand_uniform = rand_1) == rem).all()
+
+    # test tensor / batched discount
+
+    tensor_discount = torch.full_like(rem, discount, dtype = torch.float32)
+    delta_tensor = sample_truncated_geometric(rem, tensor_discount)
+    assert (delta_tensor >= 1).all() and (delta_tensor <= rem).all()

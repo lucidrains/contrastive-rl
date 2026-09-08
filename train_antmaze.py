@@ -137,7 +137,7 @@ def main(
     reward_norm = 1.0,
     reward_fourier_encode = False,
     reward_fourier_dim = 16,
-    use_hl_gauss_critic_actions = True,
+    use_hl_gauss_critic_actions = False,
     hl_gauss_num_bins = 16,
     hl_gauss_sigma = None,
     sigreg_loss_weight = 0.1,
@@ -163,7 +163,8 @@ def main(
 
     # env - antmaze provides dict obs with 'observation', 'achieved_goal', 'desired_goal'
 
-    env = gym.make_vec(env_name, num_envs = num_envs, vectorization_mode = 'async')
+    vectorization_mode = 'sync' if num_envs == 1 else 'async'
+    env = gym.make_vec(env_name, num_envs = num_envs, vectorization_mode = vectorization_mode)
 
     # dims - using single spaces since it's a vector env
 
@@ -272,12 +273,7 @@ def main(
         repetition_factor = repetition_factor,
         cpu = cpu,
         contrastive_learn = contrastive_learn,
-        state_to_goal_fn = lambda t: t[..., -dim_goal:],
-        reward_part_of_goal = reward_part_of_goal,
-        reward_norm = reward_norm,
-        reward_fourier_encode = reward_fourier_encode,
-        reward_fourier_dim = reward_fourier_dim,
-        sigreg_loss_weight = sigreg_loss_weight
+        state_to_goal_fn = lambda t: t[..., -dim_goal:]
     )
 
     assert num_episodes_before_learn >= cl_batch_size, "num_episodes_before_learn must be >= cl_batch_size"
@@ -300,11 +296,7 @@ def main(
         cpu = cpu,
         contrastive_learn = contrastive_learn,
         action_entropy_loss_weight = 5e-2,
-        state_to_goal_fn = lambda t: t[..., -dim_goal:],
-        reward_part_of_goal = reward_part_of_goal,
-        reward_norm = reward_norm,
-        reward_fourier_encode = reward_fourier_encode,
-        reward_fourier_dim = reward_fourier_dim
+        state_to_goal_fn = lambda t: t[..., -dim_goal:]
     )
 
     # goal sampling for exploration
@@ -479,7 +471,7 @@ def main(
             cum_reward += reward
             eps_steps += 1
 
-            done = truncated | terminated
+            done = (truncated | terminated) | (eps_steps >= max_timesteps)
 
             for i in range(num_envs):
                 if not done[i]:
@@ -499,9 +491,9 @@ def main(
 
                 if len(states[i]) >= 2:
                     replay_buffer.store_episode(
-                        state = states[i],
-                        action = actions[i],
-                        reward = np.array(rewards[i], dtype = np.float32)
+                        state = states[i][:max_timesteps],
+                        action = actions[i][:max_timesteps],
+                        reward = np.array(rewards[i][:max_timesteps], dtype = np.float32)
                     )
 
                 if not is_exploring[i]:
@@ -532,12 +524,11 @@ def main(
                 actions_for_critic = data['action']
                 rewards_for_trainers = data['reward']
 
-                cl_loss, critic_sigreg_loss = critic_trainer(
+                cl_loss = critic_trainer(
                     trajectories,
                     cl_train_steps,
                     lens = episode_lens,
                     actions = actions_for_critic,
-                    rewards = rewards_for_trainers,
                     pbar = dashboard.critic_pbar
                 )
 
@@ -545,7 +536,6 @@ def main(
                     trajectories,
                     actor_num_train_steps,
                     lens = episode_lens,
-                    rewards = rewards_for_trainers,
                     pbar = dashboard.actor_pbar,
                     sample_fn = lambda logits: sample_fn(logits, differentiable = True),
                     entropy_fn = actor_readout.entropy
@@ -553,7 +543,6 @@ def main(
 
                 dashboard.update_metrics(
                     critic_loss = f'{cl_loss:.4f}',
-                    critic_sigreg_loss = f'{critic_sigreg_loss:.4f}',
                     actor_loss = f'{actor_loss:.4f}'
                 )
 

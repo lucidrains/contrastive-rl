@@ -1,26 +1,23 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import partial
+from typing import Callable
 
 import torch
-from torch import cat, arange, tensor, from_numpy, is_tensor
+from torch import cat, arange, tensor, from_numpy, is_tensor, Tensor
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
-
-from accelerate import Accelerator
-
 from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
-from typing import Callable, Any
 
-import einx
 from einops import einsum, rearrange, repeat
+from torch_einops_utils import z_score, lens_to_mask
 
-from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
+from accelerate import Accelerator
+from tqdm import tqdm
 
 from contrastive_rl_pytorch.distributed import is_distributed, AllGather
-
-from tqdm import tqdm
 
 # ein
 
@@ -35,24 +32,23 @@ from tqdm import tqdm
 def exists(v):
     return v is not None
 
-def compact(arr):
-    return [*filter(exists, arr)]
-
-def compact_with_inverse(arr):
-    indices = [i for i, el in enumerate(arr) if exists(el)]
-
-    def inverse(out):
-        nones = [None] * len(arr)
-
-        for i, out_el in zip(indices, out):
-            nones[i] = out_el
-
-        return nones
-
-    return compact(arr), inverse
-
 def default(v, d):
     return v if exists(v) else d
+
+def compact(arr):
+    return [v for v in arr if exists(v)]
+
+def compact_with_inverse(arr):
+    indices = [i for i, v in enumerate(arr) if exists(v)]
+    compacted = [arr[i] for i in indices]
+
+    def inverse(values):
+        out = [None] * len(arr)
+        for i, val in zip(indices, values):
+            out[i] = val
+        return out
+
+    return compacted, inverse
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -60,21 +56,22 @@ def divisible_by(num, den):
 def identity(t):
     return t
 
+def log(t, eps = 1e-20):
+    return t.clamp(min = eps).log()
+
 def l2norm(t):
     return F.normalize(t, dim = -1)
 
-def arange_from_tensor_dim(t, dim):
-    device = t.device
-    return torch.arange(t.shape[dim], device = device)
-
 def cycle(dl):
-    assert len(dl) > 0
-
     while True:
         for batch in dl:
             yield batch
 
-# tensor functions
+def arange_from_tensor_dim(t, dim = 0):
+    length = t.shape[dim]
+    return arange(length, device = t.device)
+
+# sample random state
 
 def sample_random_state(
     replay_buffer,
@@ -99,61 +96,43 @@ def sample_random_state(
     state = env.observation_space.sample()
     return from_numpy(state).float()
 
+# truncated geometric time sampling
 
-def sigreg_loss(
-    x,
-    num_slices = 1024,
-    domain = (-5, 5),
-    num_knots = 17
-):
-    # Randall Balestriero - https://arxiv.org/abs/2511.08544
+def sample_truncated_geometric(
+    max_steps: Tensor | int,
+    discount: float | Tensor,
+    *,
+    rand_uniform: Tensor | None = None,
+    eps = 1e-20,
+    device: torch.device | None = None
+) -> Tensor:
+    # truncated geometric in [1, max_steps]
 
-    dim, device = x.shape[-1], x.device
+    if not is_tensor(max_steps):
+        max_steps = tensor(max_steps, device = device)
 
-    # slice sampling
+    if not is_tensor(discount):
+        discount = tensor(discount, device = max_steps.device, dtype = torch.float32)
+    else:
+        discount = discount.to(device = max_steps.device, dtype = torch.float32)
 
-    rand_projs = torch.randn((num_slices, dim), device = device)
-    rand_projs = l2norm(rand_projs)
+    if not exists(rand_uniform):
+        rand_uniform = torch.rand_like(max_steps, dtype = torch.float32)
 
-    # integration points
+    is_undiscounted = discount >= (1. - eps)
 
-    t = torch.linspace(*domain, num_knots, device = device)
+    safe_discount = torch.where(is_undiscounted, tensor(0.5, device = discount.device), discount)
+    prob_reach = 1. - safe_discount ** max_steps
 
-    # theoretical CF for N(0, 1) and Gauss. window
+    delta_undiscounted = rand_uniform * max_steps
+    delta_discounted = log(1. - rand_uniform * prob_reach, eps = eps) / log(safe_discount, eps = eps)
 
-    exp_f = (-0.5 * t.square()).exp()
+    delta = torch.where(is_undiscounted, delta_undiscounted, delta_discounted)
+    delta = delta.floor().long() + 1
 
-    # empirical CF
+    return delta.clamp(min = 1).minimum(max_steps)
 
-    x_t = einsum(x, rand_projs, '... d, m d -> ... m')
-    x_t = rearrange(x_t, '... m -> (...) m')
-
-    x_t = rearrange(x_t, 'n m -> n m 1') * t
-    ecf = (1j * x_t).exp().mean(dim = 0)
-
-    # weighted L2 distance
-
-    err = ecf.sub(exp_f).abs().square().mul(exp_f)
-
-    return torch.trapz(err, t, dim = -1).mean()
-
-# fourier encode
-
-class FourierEncode(Module):
-    def __init__(
-        self,
-        dim
-    ):
-        super().__init__()
-        assert divisible_by(dim, 2)
-        self.dim = dim
-        self.register_buffer('weight', torch.randn(1, dim // 2))
-
-    def forward(self, x):
-        if x.ndim == 1:
-            x = rearrange(x, '... -> ... 1')
-        x = x @ self.weight
-        return cat((x.sin(), x.cos()), dim = -1)
+sample_truncated_geometric_time = sample_truncated_geometric
 
 # contrastive wrapper module
 
@@ -161,10 +140,12 @@ class ContrastiveLearning(Module):
     def __init__(
         self,
         l2norm_embed = True,
-        learned_temp = True
+        learned_temp = True,
+        use_euclidean = False
     ):
         super().__init__()
         self.l2norm_embed = l2norm_embed
+        self.use_euclidean = use_euclidean
 
         self.learned_log_temp = None
         if learned_temp:
@@ -184,9 +165,15 @@ class ContrastiveLearning(Module):
             embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
         if return_contrastive_score:
-            sim = (embeds1 * embeds2).sum(dim = -1)
+            if self.use_euclidean:
+                sim = -(embeds1 - embeds2).norm(dim = -1)
+            else:
+                sim = einsum(embeds1, embeds2, '... d, ... d -> ...')
         else:
-            sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
+            if self.use_euclidean:
+                sim = -torch.cdist(embeds1, embeds2)
+            else:
+                sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
 
         sim = sim * self.scale
 
@@ -211,13 +198,15 @@ class ContrastiveLearning(Module):
 class SigmoidContrastiveLearning(Module):
     def __init__(
         self,
-        bias = -10.,
-        l2norm_embed = True,
-        learned_scale = True
+        bias = 0.,
+        l2norm_embed = False,
+        learned_scale = False,
+        use_euclidean = False
     ):
         super().__init__()
         self.bias = bias
         self.l2norm_embed = l2norm_embed
+        self.use_euclidean = use_euclidean
 
         self.learned_log_scale = None
         if learned_scale:
@@ -237,9 +226,15 @@ class SigmoidContrastiveLearning(Module):
             embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
         if return_contrastive_score:
-            sim = (embeds1 * embeds2).sum(dim = -1)
+            if self.use_euclidean:
+                sim = -(embeds1 - embeds2).norm(dim = -1)
+            else:
+                sim = einsum(embeds1, embeds2, '... d, ... d -> ...')
         else:
-            sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
+            if self.use_euclidean:
+                sim = -torch.cdist(embeds1, embeds2)
+            else:
+                sim = einsum(embeds1, embeds2, 'i d, j d -> i j')
 
         sim = sim * self.scale + self.bias
 
@@ -263,8 +258,7 @@ class ContrastiveWrapper(Module):
         self,
         encoder: Module,
         contrastive_learn: Module,
-        future_encoder: Module | None = None,
-        sigreg_loss_weight = 0.
+        future_encoder: Module | None = None
     ):
         super().__init__()
 
@@ -274,17 +268,12 @@ class ContrastiveWrapper(Module):
         self.contrastive_learn = contrastive_learn
         self.all_gather = AllGather()
 
-        self.sigreg_loss_weight = sigreg_loss_weight
-
-        self.register_buffer('zero', tensor(0.), persistent = False)
-
     def forward(
         self,
         past,     # (b d)
         future,   # (b d)
         past_action = None # (b na)
     ):
-
         if exists(past_action):
             past = cat((past, past_action), dim = -1)
 
@@ -295,14 +284,7 @@ class ContrastiveWrapper(Module):
             encoded_past, _ = self.all_gather(encoded_past)
             encoded_future, _ = self.all_gather(encoded_future)
 
-        loss = self.contrastive_learn(encoded_past, encoded_future)
-
-        sigreg_loss_val = self.zero
-        if self.sigreg_loss_weight > 0.:
-            sigreg_loss_val = (sigreg_loss(encoded_past) + sigreg_loss(encoded_future)) * 0.5
-            loss = loss + sigreg_loss_val * self.sigreg_loss_weight
-
-        return loss, sigreg_loss_val
+        return self.contrastive_learn(encoded_past, encoded_future)
 
 # contrastive RL trainer
 
@@ -317,15 +299,10 @@ class ContrastiveRLTrainer(Module):
         weight_decay = 0.,
         max_grad_norm = 0.5,
         discount = 0.99,
-        reward_part_of_goal = False,
-        reward_norm = 1.0,
-        reward_fourier_encode = False,
-        reward_fourier_dim = 16,
         contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         cpu = False,
-        sigreg_loss_weight = 0.,
         state_to_goal_fn: Callable = identity,
         state_to_critic_state_fn: Callable = identity
     ):
@@ -342,8 +319,7 @@ class ContrastiveRLTrainer(Module):
         contrast_wrapper = ContrastiveWrapper(
             encoder = encoder,
             future_encoder = future_encoder,
-            contrastive_learn = contrastive_learn,
-            sigreg_loss_weight = sigreg_loss_weight
+            contrastive_learn = contrastive_learn
         )
 
         assert divisible_by(batch_size, repetition_factor)
@@ -351,13 +327,6 @@ class ContrastiveRLTrainer(Module):
         self.repetition_factor = repetition_factor          # the in-trajectory repetition factor - basically having the network learn to distinguish negative features from within the same trajectory
         self.max_grad_norm = max_grad_norm
         self.discount = discount
-
-        self.reward_part_of_goal = reward_part_of_goal
-        self.reward_norm = reward_norm
-        self.reward_fourier_encode = None
-
-        if reward_part_of_goal and reward_fourier_encode:
-            self.reward_fourier_encode = FourierEncode(reward_fourier_dim)
 
         optimizer = AdamW(contrast_wrapper.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
 
@@ -396,8 +365,7 @@ class ContrastiveRLTrainer(Module):
         *,
         lens = None,        # (n)
         actions = None,     # (n na)
-        rewards = None,     # (n t)
-        goal_state = None,   # (n t dg)
+        goal_state = None,  # (n t dg)
         pbar = None
     ):
         traj_var_lens = exists(lens)
@@ -409,7 +377,7 @@ class ContrastiveRLTrainer(Module):
 
         # dataset and dataloader
 
-        all_data = dict(states = trajectories, lens = lens, actions = actions, rewards = rewards, goal_states = goal_state)
+        all_data = dict(states = trajectories, lens = lens, actions = actions, goal_states = goal_state)
 
         keys = list(all_data.keys())
         values = list(all_data.values())
@@ -429,7 +397,9 @@ class ContrastiveRLTrainer(Module):
 
         loss_item = 0.
 
-        if not exists(pbar):
+        if pbar is False:
+            pbar = partial(tqdm, disable = True)
+        elif not exists(pbar):
             pbar = tqdm
 
         pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
@@ -470,18 +440,13 @@ class ContrastiveRLTrainer(Module):
             else:
                 past_times = torch.randint(0, max_traj_len - 1, (batch_size, 1), device = self.device)
 
-            # future times, using delta time drawn from geometric distribution
-
-            delta_times = torch.empty(past_times.shape, dtype = torch.long, device = 'cpu').geometric_(1. - self.discount).to(self.device)
-            future_times = past_times + delta_times.clamp(min = 1)
-
-            # clamping future times by max_traj_len if not variable lengths else prepare variable length
-
             clamp_traj_len = (max_traj_len - 1) if not traj_var_lens else rearrange(traj_lens - 1, 'b -> b 1')
 
-            # clamp
+            # future times drawn from geometric distribution truncated to remaining length
 
-            future_times.clamp_(max = clamp_traj_len)
+            remainder_steps = clamp_traj_len - past_times
+            delta_times = sample_truncated_geometric(remainder_steps, self.discount)
+            future_times = past_times + delta_times
 
             # pick out the past and future observations as positive pairs
 
@@ -494,23 +459,6 @@ class ContrastiveRLTrainer(Module):
 
             past_obs = self.state_to_critic_state_fn(past_obs)
             future_obs = self.state_to_goal_fn(future_obs)
-
-            if self.reward_part_of_goal:
-                rewards = data_dict['rewards']
-                assert exists(rewards), 'rewards must be passed if reward_part_of_goal is True'
-
-                rewards = repeat(rewards, 'b ... -> (b r) ...', r = self.repetition_factor)
-                picked_rewards = rearrange(rewards[batch_arange, future_times], 'b 1 ... -> b ...')
-
-                future_obs_rewards = picked_rewards / self.reward_norm
-
-                if exists(self.reward_fourier_encode):
-                    self.reward_fourier_encode = self.reward_fourier_encode.to(self.device)
-                    future_obs_rewards = self.reward_fourier_encode(future_obs_rewards)
-                elif future_obs_rewards.ndim == 1:
-                    future_obs_rewards = rearrange(future_obs_rewards, '... -> ... 1')
-
-                future_obs = cat((future_obs, future_obs_rewards), dim = -1)
 
             # handle maybe action
 
@@ -525,17 +473,11 @@ class ContrastiveRLTrainer(Module):
 
             # contrastive learning
 
-            loss, sigreg_loss_val = self.contrast_wrapper(past_obs, future_obs, past_action)
+            loss = self.contrast_wrapper(past_obs, future_obs, past_action)
 
             loss_item = loss.item()
-            sigreg_loss_item = sigreg_loss_val.item() if is_tensor(sigreg_loss_val) else sigreg_loss_val
 
-            desc = f'loss: {loss_item:.3f}'
-
-            if self.contrast_wrapper.sigreg_loss_weight > 0.:
-                desc += f' | sigreg: {sigreg_loss_item:.3f}'
-
-            pbar_instance.set_description(desc)
+            pbar_instance.set_description(f'loss: {loss_item:.3f}')
 
             # backwards and optimizer step
 
@@ -547,7 +489,7 @@ class ContrastiveRLTrainer(Module):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-        return loss_item, sigreg_loss_item
+        return loss_item
 
 # training the actor
 
@@ -564,20 +506,21 @@ class ActorTrainer(Module):
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         softmax_actor_output = False,
-        reward_part_of_goal = False,
-        reward_norm = 1.0,
-        reward_fourier_encode = False,
-        reward_fourier_dim = 16,
         contrastive_learn: Module | None = None,
         cpu = False,
         action_entropy_loss_weight = 0.,
-        advantage_weighting = False,
-        advantage_temperature = 1.0,
         state_to_goal_fn: Callable = identity,
         state_to_actor_state_fn: Callable = identity,
-        state_to_critic_state_fn: Callable = identity
+        state_to_critic_state_fn: Callable = identity,
+        num_discrete_actions: int | None = None,
+        normalize_q_values = True,
+        target_goal_prob = 0.5
     ):
         super().__init__()
+
+        self.num_discrete_actions = num_discrete_actions
+        self.normalize_q_values = normalize_q_values
+        self.target_goal_prob = target_goal_prob
 
         self.state_to_goal_fn = state_to_goal_fn
         self.state_to_actor_state_fn = state_to_actor_state_fn
@@ -587,13 +530,9 @@ class ActorTrainer(Module):
 
         self.max_grad_norm = max_grad_norm
         self.action_entropy_loss_weight = action_entropy_loss_weight
-        self.advantage_weighting = advantage_weighting
-        self.advantage_temperature = advantage_temperature
 
         optimizer = AdamW(actor.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
         self.actor = actor
-
-        # in a recent CRL paper, they made the discovery that passing softmax output directly to critic (without any hard one-hot straight-through) can work
 
         self.softmax_actor_output = softmax_actor_output
 
@@ -615,13 +554,6 @@ class ActorTrainer(Module):
         self.goal_encoder = goal_encoder
         self.encoder = encoder
 
-        self.reward_part_of_goal = reward_part_of_goal
-        self.reward_norm = reward_norm
-        self.reward_fourier_encode = None
-
-        if reward_part_of_goal and reward_fourier_encode:
-            self.reward_fourier_encode = FourierEncode(reward_fourier_dim)
-
     @property
     def device(self):
         return self.accelerator.device
@@ -635,16 +567,11 @@ class ActorTrainer(Module):
         num_train_steps,
         *,
         lens = None,
-        rewards = None,
-        returns = None,
         sample_fn = None,
         entropy_fn = None,
-        q_critic = None,
-        q_loss_weight = 0.,
         pbar = None,
-        value_network = None
+        target_goals = None
     ):
-
         device = self.device
 
         # setup models
@@ -658,50 +585,31 @@ class ActorTrainer(Module):
         goal_encoder.eval()
         encoder.eval()
 
+        if exists(target_goals):
+            if not is_tensor(target_goals):
+                target_goals = tensor(target_goals, device = device, dtype = torch.float32)
+            else:
+                target_goals = target_goals.to(device)
+
+            if target_goals.ndim == 1:
+                target_goals = rearrange(target_goals, 'd -> 1 d')
+
+            num_target_goals = target_goals.shape[0]
+
         if not is_tensor(trajectories):
             trajectories = from_numpy(trajectories)
 
         if exists(lens):
             lens = tensor(lens) if not is_tensor(lens) else lens
             traj_len = trajectories.shape[-2]
-            mask = einx.less('t, b -> b t', arange(traj_len, device = lens.device), lens)
+            mask = lens_to_mask(lens, max_len = traj_len)
             states = trajectories[mask]
         else:
             states = rearrange(trajectories, '... d -> (...) d')
 
         dataset = TensorDataset(states)
-
-        goal_data = [states]
-
-        if self.reward_part_of_goal:
-            assert exists(rewards), 'rewards must be passed to actor trainer if reward_part_of_goal is True'
-
-            if not is_tensor(rewards):
-                rewards = from_numpy(rewards)
-
-            goal_rewards = rewards[mask] if exists(lens) else rearrange(rewards, '... -> (...)')
-
-            if goal_rewards.ndim == 1:
-                goal_rewards = rearrange(goal_rewards, 'b -> b 1')
-
-            goal_data.append(goal_rewards)
-
-        if self.advantage_weighting:
-            assert exists(returns), 'returns must be passed if advantage_weighting is True'
-            if not is_tensor(returns):
-                returns = from_numpy(returns).float()
-            eval_returns = returns[mask] if exists(lens) else rearrange(returns, '... -> (...)')
-            if eval_returns.ndim == 1:
-                eval_returns = rearrange(eval_returns, 'b -> b 1')
-
-            # append Returns to dataset and goal_dataset!
-            dataset = TensorDataset(states, eval_returns)
-            goal_data.append(eval_returns)
-
-        goal_dataset = TensorDataset(*goal_data)
-
         dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
-        goal_dataloader = DataLoader(goal_dataset, batch_size = self.batch_size, shuffle = True)
+        goal_dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
 
         dataloader, goal_dataloader = self.accelerator.prepare(dataloader, goal_dataloader)
 
@@ -712,97 +620,97 @@ class ActorTrainer(Module):
 
         self.actor.train()
 
-        if not exists(pbar):
+        if pbar is False:
+            pbar = partial(tqdm, disable = True)
+        elif not exists(pbar):
             pbar = tqdm
 
         pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
 
         for _ in pbar_instance:
 
-            data = next(iter_dataloader)
-            state = data[0]
+            (state,) = next(iter_dataloader)
+            (goal,) = next(iter_goal_dataloader)
 
-            goal_data = next(iter_goal_dataloader)
-            goal = goal_data[0]
+            batch = state.shape[0]
 
-            if self.advantage_weighting:
-                if exists(value_network):
-                    value_network.eval()
-                    with torch.no_grad():
-                        state_returns = rearrange(value_network(state), '... 1 -> ...')
-                        goal_returns = rearrange(value_network(goal_data[0]), '... 1 -> ...')
-                else:
-                    state_returns = data[1]
-                    goal_returns = rearrange(goal_data[-1], '... 1 -> ...')  # empirical returns is appended last
-                advantage = goal_returns - state_returns
+            if exists(target_goals):
+                rand_indices = torch.randint(0, num_target_goals, (batch,), device = device)
+                batch_target_goals = target_goals[rand_indices]
+                mix_mask = rearrange(torch.rand(batch, device = device) < self.target_goal_prob, 'b -> b 1')
+                goal = torch.where(mix_mask, batch_target_goals, goal)
 
             # forward state and goal
 
             actor_state = self.state_to_actor_state_fn(state)
             actor_goal = self.state_to_goal_fn(goal)
 
-            if self.reward_part_of_goal:
-                goal_rewards = goal_data[1]
+            action_logits = self.actor(cat((actor_state, actor_goal), dim = -1))
 
-                goal_rewards = goal_rewards / self.reward_norm
+            if exists(self.num_discrete_actions):
+                num_actions = self.num_discrete_actions
+                action_probs = action_logits.softmax(dim = -1)
+                critic_state = self.state_to_critic_state_fn(state)
 
-                if exists(self.reward_fourier_encode):
-                    self.reward_fourier_encode = self.reward_fourier_encode.to(self.device)
-                    goal_rewards = self.reward_fourier_encode(goal_rewards)
-                elif goal_rewards.ndim == 1:
-                    goal_rewards = rearrange(goal_rewards, '... -> ... 1')
+                # evaluate all discrete action candidates at once
 
-                actor_goal = cat((actor_goal, goal_rewards), dim = -1)
+                with torch.no_grad():
+                    all_actions = torch.eye(num_actions, device = device)
+                    all_actions = repeat(all_actions, 'a na -> b a na', b = batch)
+                    repeated_states = repeat(critic_state, 'b d -> b a d', a = num_actions)
 
-            action_logits = self.actor((actor_state, actor_goal))
+                    state_actions = cat((repeated_states, all_actions), dim = -1)
+                    encoded_state_actions = encoder(rearrange(state_actions, 'b a d -> (b a) d'))
+                    encoded_state_actions = rearrange(encoded_state_actions, '(b a) d -> b a d', a = num_actions)
 
-            if self.softmax_actor_output:
-                action = action_logits.softmax(dim = -1)
-            elif exists(sample_fn):
-                action = sample_fn(action_logits)
+                    encoded_goal = goal_encoder(actor_goal)
+                    repeated_goals = repeat(encoded_goal, 'b d -> b a d', a = num_actions)
+
+                    q_values = self.contrastive_learn(
+                        encoded_state_actions,
+                        repeated_goals,
+                        return_contrastive_score = True
+                    )
+
+                    if self.normalize_q_values:
+                        q_values = z_score(q_values, dim = -1)
+
+                # closed-form policy expectation
+
+                expected_q = einsum(action_probs, q_values, 'b a, b a -> b')
+                loss = -expected_q.mean()
+
+                if self.action_entropy_loss_weight > 0.:
+                    entropy = -einsum(action_probs, log(action_probs), 'b a, b a -> b')
+                    loss = loss - entropy.mean() * self.action_entropy_loss_weight
+
             else:
-                action = action_logits
+                if self.softmax_actor_output:
+                    action = action_logits.softmax(dim = -1)
+                elif exists(sample_fn):
+                    action = sample_fn(action_logits)
+                else:
+                    action = action_logits
 
-            # encode state
+                # encode state
 
-            critic_state = self.state_to_critic_state_fn(state)
-            encoded_state_action = encoder(cat((critic_state, action), dim = -1))
+                critic_state = self.state_to_critic_state_fn(state)
+                encoded_state_action = encoder(cat((critic_state, action), dim = -1))
 
-            with torch.no_grad():
-                encoded_goal = goal_encoder(actor_goal)
+                with torch.no_grad():
+                    encoded_goal = goal_encoder(actor_goal)
 
-            sim = self.contrastive_learn(
-                encoded_state_action,
-                encoded_goal,
-                return_contrastive_score = True
-            )
+                sim = self.contrastive_learn(
+                    encoded_state_action,
+                    encoded_goal,
+                    return_contrastive_score = True
+                )
 
-            if self.advantage_weighting:
-                adv_mean = advantage.mean()
-                adv_std = advantage.std(unbiased=False).clamp(min=1e-5)
-                norm_adv = (advantage - adv_mean) / adv_std
-
-                weight = torch.sigmoid(norm_adv / self.advantage_temperature)
-
-                loss = -(sim * weight).mean()
-            else:
                 loss = -sim.mean()
 
-            if self.action_entropy_loss_weight > 0. and exists(entropy_fn):
-                entropy = entropy_fn(action_logits)
-                loss = loss - entropy.mean() * self.action_entropy_loss_weight
-
-            if q_loss_weight > 0. and exists(q_critic):
-                with torch.no_grad():
-                    q_values = q_critic(actor_state)
-
-                if self.softmax_actor_output:
-                    action_probs = action_logits.softmax(dim = -1)
-                else:
-                    action_probs = action_logits
-
-                expected_q = (action_probs * q_values).sum(dim = -1)
-                loss = loss - expected_q.mean() * q_loss_weight
+                if self.action_entropy_loss_weight > 0. and exists(entropy_fn):
+                    entropy = entropy_fn(action_logits)
+                    loss = loss - entropy.mean() * self.action_entropy_loss_weight
 
             self.accelerator.backward(loss)
 
@@ -815,204 +723,3 @@ class ActorTrainer(Module):
             self.optimizer.zero_grad()
 
         return loss.item()
-
-# TD Trainer
-
-class TDTrainer(Module):
-    def __init__(
-        self,
-        q_critic,
-        ema_q_critic,
-        batch_size = 128,
-        learning_rate = 3e-4,
-        weight_decay = 0.,
-        td_gamma = 0.9,
-        max_grad_norm = 0.5,
-        cpu = False,
-        **adam_kwargs
-    ):
-        super().__init__()
-        self.accelerator = Accelerator(cpu = cpu)
-        self.device = self.accelerator.device
-
-        self.q_critic = q_critic.to(self.device)
-        self.ema_q_critic = ema_q_critic.to(self.device)
-
-        self.batch_size = batch_size
-        self.td_gamma = td_gamma
-        self.max_grad_norm = max_grad_norm
-
-        optimizer = AdamW(self.q_critic.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
-
-        self.q_critic, self.optimizer = self.accelerator.prepare(self.q_critic, optimizer)
-
-    def forward(
-        self,
-        trajectories,
-        num_train_steps,
-        *,
-        actions,
-        rewards,
-        lens,
-        pbar = None
-    ):
-        device = self.device
-
-        if not is_tensor(trajectories): trajectories = from_numpy(trajectories)
-        if not is_tensor(actions): actions = from_numpy(actions)
-        if not is_tensor(rewards): rewards = from_numpy(rewards)
-        if not is_tensor(lens): lens = tensor(lens)
-
-        trajectories, actions, rewards, lens = trajectories.to(device), actions.to(device), rewards.to(device), lens.to(device)
-
-        batch, seq_len, _ = trajectories.shape
-
-        state = trajectories[:, :-1]
-        next_state = trajectories[:, 1:]
-        action = actions[:, :-1]
-        reward = rewards[:, :-1]
-
-        if reward.ndim == 3:
-            reward = rearrange(reward, 'b t 1 -> b t')
-
-        lens_clamped = lens.clamp(max = seq_len).long()
-        lens_clamped = rearrange(lens_clamped, 'b -> b 1')
-
-        seq = torch.arange(seq_len - 1, device = device)
-        seq = rearrange(seq, 'n -> 1 n')
-
-        is_valid = seq < (lens_clamped - 1)
-        is_done = seq == (lens_clamped - 2)
-
-        state = state[is_valid]
-        next_state = next_state[is_valid]
-        action = action[is_valid]
-        reward = reward[is_valid]
-        is_done = is_done[is_valid]
-
-        dataset = TensorDataset(state, next_state, action, reward, is_done)
-        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
-        dataloader = self.accelerator.prepare(dataloader)
-
-        td_loss_float = 0.
-
-        self.q_critic.train()
-
-        if not exists(pbar):
-            pbar = tqdm
-
-        pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
-
-        for _, (state, next_state, action, reward, is_done) in zip(pbar_instance, cycle(dataloader)):
-            q = self.q_critic(state)
-            action_for_q = rearrange(action, 'b -> b 1')
-            q = rearrange(q.gather(-1, action_for_q), '... 1 -> ...')
-
-            with torch.no_grad():
-                next_q = self.ema_q_critic(next_state).max(dim = -1).values
-                target_q = reward + self.td_gamma * next_q * (~is_done).float()
-
-            td_loss = F.mse_loss(q, target_q)
-
-            self.optimizer.zero_grad(set_to_none = True)
-            self.accelerator.backward(td_loss)
-
-            if self.max_grad_norm > 0.:
-                self.accelerator.clip_grad_norm_(self.q_critic.parameters(), self.max_grad_norm)
-
-            self.optimizer.step()
-            self.ema_q_critic.update()
-
-            td_loss_float = td_loss.item()
-
-            pbar_instance.set_description(f'td loss: {td_loss_float:.3f}')
-
-        return td_loss_float
-
-# target value trainer
-
-class ValueTrainer(Module):
-    def __init__(
-        self,
-        value_network,
-        batch_size = 128,
-        learning_rate = 3e-4,
-        weight_decay = 0.,
-        max_grad_norm = 0.5,
-        cpu = False,
-        **adam_kwargs
-    ):
-        super().__init__()
-        self.accelerator = Accelerator(cpu = cpu)
-        self.device = self.accelerator.device
-
-        self.value_network = value_network
-        self.batch_size = batch_size
-        self.max_grad_norm = max_grad_norm
-
-        optimizer = AdamW(value_network.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
-
-        self.optimizer, self.value_network = self.accelerator.prepare(optimizer, self.value_network)
-
-    def forward(
-        self,
-        trajectories,
-        num_train_steps,
-        *,
-        lens = None,
-        returns = None,
-        pbar = None
-    ):
-        assert exists(returns), 'empirical returns must be provided for the Value network regression'
-
-        if not is_tensor(returns):
-            returns = from_numpy(returns).float()
-
-        target_returns = returns.to(self.device)
-
-        # Build empirical distribution batching
-        if exists(lens):
-            traj_len = trajectories.shape[-2]
-            mask = einx.less('t, b -> b t', arange(traj_len, device = target_returns.device), lens)
-            states = trajectories[mask]
-            target_returns = target_returns[mask]
-        else:
-            states = rearrange(trajectories, 'b t d -> (b t) d')
-            target_returns = rearrange(target_returns, 'b t ... -> (b t) ...')
-
-        target_returns = rearrange(target_returns, '... 1 -> ...')
-
-        dataset = TensorDataset(states, target_returns)
-        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
-        dataloader = self.accelerator.prepare(dataloader)
-        iter_dataloader = cycle(dataloader)
-
-        self.value_network.train()
-
-        if not exists(pbar):
-            pbar = tqdm
-        pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
-
-        for _ in pbar_instance:
-            data = next(iter_dataloader)
-            batch_states, batch_returns = data
-
-            # predict
-            values = rearrange(self.value_network(batch_states), '... 1 -> ...')
-
-            # MSE loss vs empirical returns
-            loss = F.mse_loss(values, batch_returns)
-
-            # update
-            self.optimizer.zero_grad()
-            self.accelerator.backward(loss)
-
-            if self.max_grad_norm > 0.:
-                self.accelerator.clip_grad_norm_(self.value_network.parameters(), self.max_grad_norm)
-
-            self.optimizer.step()
-
-            loss_float = loss.item()
-            pbar_instance.set_description(f'vf loss: {loss_float:.3f}')
-
-        return loss_float

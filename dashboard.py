@@ -62,7 +62,8 @@ class DashboardPBar:
 class Dashboard:
     def __init__(
         self,
-        num_episodes,
+        num_episodes = None,
+        num_timesteps = None,
         title = 'Contrastive RL Training',
         env_name = 'Unknown',
         hyperparams = None,
@@ -72,7 +73,7 @@ class Dashboard:
         self.live = None
         self.is_training = False
 
-        # episode progress
+        # progress tracking
 
         self.progress = Progress(
             TextColumn('[progress.description]{task.description}'),
@@ -83,7 +84,15 @@ class Dashboard:
             expand = True
         )
 
-        self.episode_task = self.progress.add_task('Episodes', total = num_episodes)
+        self.step_task = None
+        self.episode_task = None
+
+        if exists(num_timesteps):
+            self.step_task = self.progress.add_task('Env Steps', total = num_timesteps)
+
+        if exists(num_episodes) or not exists(num_timesteps):
+            total_eps = default(num_episodes, 1000)
+            self.episode_task = self.progress.add_task('Episodes', total = total_eps)
 
         # training progress
 
@@ -137,10 +146,15 @@ class Dashboard:
         # We now keep it visible but paused or empty
         pass
 
-    # episode progress
+    # episode & step progress
 
-    def advance_progress(self):
-        self.progress.update(self.episode_task, advance = 1)
+    def advance_progress(self, n = 1):
+        if exists(self.episode_task):
+            self.progress.update(self.episode_task, advance = n)
+
+    def advance_steps(self, n = 1):
+        if exists(self.step_task):
+            self.progress.update(self.step_task, advance = n)
 
     # metric updates
 

@@ -1,35 +1,28 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
-#   "discrete-continuous-embed-readout>=0.2.1",
+#   "discrete-continuous-embed-readout",
 #   "fire",
 #   "gymnasium[box2d]",
-#   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.10",
 #   "x-mlps-pytorch>=0.3.0",
-#   "hl-gauss-pytorch>=0.2.2",
-#   "tqdm"
+#   "einops"
 # ]
 # ///
 
 from __future__ import annotations
 
 import os
-from fire import Fire
-from shutil import rmtree
+import json
 from collections import deque
-from functools import partial
 
 import torch
-from torch import nn, from_numpy, cat, tensor
-import torch.nn.functional as F
+from torch import from_numpy, cat, tensor
 
 import numpy as np
 from einops import rearrange
-
-from tqdm import tqdm
 import gymnasium as gym
-from accelerate import Accelerator
+from fire import Fire
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -41,13 +34,8 @@ from contrastive_rl_pytorch import (
     sample_random_state
 )
 
-from einops.layers.torch import Rearrange
-from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
+from x_mlps_pytorch import MLP
 from discrete_continuous_embed_readout import Readout
-
-from hl_gauss_pytorch import HLGaussLoss
-
-from dashboard import Dashboard
 
 # functions
 
@@ -60,113 +48,66 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def module_device(m):
-    return next(m.parameters()).device
-
-# classes
-
-class CriticWrapper(nn.Module):
-    def __init__(
-        self,
-        encoder: nn.Module,
-        hl_gauss: nn.Module | None,
-        dim_action: int
-    ):
-        super().__init__()
-        self.encoder = encoder
-        self.hl_gauss = hl_gauss
-        self.dim_action = dim_action
-
-    def forward(self, state_and_action):
-        if not exists(self.hl_gauss):
-            return self.encoder(state_and_action)
-
-        dim_action = self.dim_action
-
-        state, action = state_and_action[..., :-dim_action], state_and_action[..., -dim_action:]
-
-        action_probs = self.hl_gauss.transform_to_probs(action)
-        action_probs = rearrange(action_probs, '... a bins -> ... (a bins)')
-
-        state_and_action = cat((state, action_probs), dim = -1)
-
-        return self.encoder(state_and_action)
-
 # main
 
 def main(
-    num_episodes = 50_000,
+    num_episodes = 1500,
     max_timesteps = 500,
-    num_episodes_before_learn = 128,
+    num_episodes_before_learn = 8,
+    learn_every_eps = 4,
     buffer_size = 512,
-    video_folder = './recordings',
-    render_every_eps = None,
+    video_folder = './recordings_continuous',
+    render_every_eps = 150,
     dim_contrastive_embed = 64,
-    cl_train_steps = 2_500,
+    cl_train_steps = 100,
     cl_batch_size = 64,
-    actor_batch_size = 128,
-    actor_num_train_steps = 1000,
+    actor_num_train_steps = 50,
+    actor_batch_size = 64,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
-    actor_dim = 64,
-    actor_depth = 4,
-    critic_dim = 64,
-    critic_depth = 8,
-    goal_dim = 64,
-    goal_depth = 8,
+    actor_dim = 256,
+    critic_dim = 256,
+    goal_dim = 256,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
-    repetition_factor = 2,
-    use_sigmoid_contrastive_learning = True,
-    sigmoid_bias = -5.,
-    cl_l2norm_embed = True,
-    exploration_random_goal_prob = 0.025,
+    repetition_factor = 1,
+    use_sigmoid = True,
+    sigmoid_bias = 0.,
+    use_euclidean = False,
+    discount = 0.99,
+    exploration_random_goal_prob = 0.05,
     exploration_sample_from_buffer_prob = 0.5,
-    reward_part_of_goal = False,
-    reward_norm = 100.,
-    use_hl_gauss_critic_actions = True,
-    hl_gauss_num_bins = 16,
-    hl_gauss_sigma = None,
-    use_attn_residual_mlp = True,
-    use_wandb = False,
-    cpu = False
+    action_entropy_loss_weight = 0.005,
+    save_checkpoint_every = 200,
+    checkpoint_folder = './checkpoints-lunar-continuous',
+    reward_json_path = './lunar_continuous_rewards.json',
+    cpu = False,
+    seed = 0
 ):
-    # clear video folder
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    rmtree(video_folder, ignore_errors = True)
+    # folders
+
     os.makedirs(video_folder, exist_ok = True)
-
-    # accelerator
-
-    accelerator = Accelerator(
-        log_with = 'wandb' if use_wandb else None,
-        cpu = cpu
-    )
-
-    if use_wandb:
-        accelerator.init_trackers(
-            project_name = 'contrastive-rl',
-            config = locals()
-        )
+    os.makedirs(checkpoint_folder, exist_ok = True)
 
     # env
 
-    env = gym.make('LunarLander-v3', continuous = True, render_mode = 'rgb_array')
+    render_mode = 'rgb_array' if exists(render_every_eps) else None
 
-    # recording
+    env = gym.make('LunarLander-v3', continuous = True, render_mode = render_mode)
 
-    render_every_eps = default(render_every_eps, num_episodes_before_learn)
-
-    env = gym.wrappers.RecordVideo(
-        env = env,
-        video_folder = video_folder,
-        name_prefix = 'lunar',
-        episode_trigger = lambda eps_num: divisible_by(eps_num, render_every_eps),
-        disable_logger = True
-    )
+    if exists(render_every_eps):
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder = video_folder,
+            episode_trigger = lambda ep: divisible_by(ep, render_every_eps),
+            name_prefix = 'lunar-cont'
+        )
 
     dim_state = 8
-    dim_goal = 8 + (1 if reward_part_of_goal else 0)
+    dim_goal = 8
     dim_action = 2
 
     # replay buffer
@@ -177,31 +118,14 @@ def main(
         max_timesteps = max_timesteps + 1,
         fields = dict(
             state = ('float', dim_state),
-            action = ('float', dim_action),
             reward = ('float', 1),
+            action = ('float', dim_action)
         ),
         circular = True,
         overwrite = True
     )
 
-    # model
-
-    device = accelerator.device
-
-    if use_attn_residual_mlp:
-        MLP = AttnResidualNormedMLP
-    else:
-        MLP = partial(ResidualNormedMLP, residual_every = 4, keel_post_ln = True)
-
-    actor_encoder = nn.Sequential(
-        MLP(
-            dim_in = dim_state + dim_goal, # state and goal
-            dim = actor_dim,
-            depth = actor_depth,
-            dim_out = dim_action * 2 # for squashed gaussian mu and logvar
-        ),
-        Rearrange('... (action mu_logvar) -> ... action mu_logvar', mu_logvar = 2)
-    ).to(device)
+    # models
 
     actor_readout = Readout(
         num_continuous = dim_action,
@@ -210,41 +134,44 @@ def main(
         dim = 0
     )
 
-    hl_gauss = None
-    critic_dim_action = dim_action
-
-    if use_hl_gauss_critic_actions:
-        hl_gauss = HLGaussLoss(
-            min_value = -1.,
-            max_value = 1.,
-            num_bins = hl_gauss_num_bins,
-            sigma = hl_gauss_sigma,
-            clamp_to_range = True
-        ).to(device)
-        critic_dim_action = dim_action * hl_gauss_num_bins
+    actor_encoder = MLP(
+        dim_state + dim_goal,
+        actor_dim,
+        actor_dim,
+        dim_action * 2 # mu and log_var
+    )
 
     critic_encoder = MLP(
-        dim_in = dim_state + critic_dim_action,
-        dim = critic_dim,
-        dim_out = dim_contrastive_embed,
-        depth = critic_depth
-    ).to(device)
-
-    critic_encoder = CriticWrapper(critic_encoder, hl_gauss, dim_action)
+        dim_state + dim_action,
+        critic_dim,
+        critic_dim,
+        dim_contrastive_embed
+    )
 
     goal_encoder = MLP(
-        dim_in = dim_goal,
-        dim = goal_dim,
-        dim_out = dim_contrastive_embed,
-        depth = goal_depth
-    ).to(device)
+        dim_goal,
+        goal_dim,
+        goal_dim,
+        dim_contrastive_embed
+    )
 
     # contrastive learning module
 
-    if use_sigmoid_contrastive_learning:
-        contrastive_learn = SigmoidContrastiveLearning(bias = sigmoid_bias, l2norm_embed = cl_l2norm_embed)
+    if use_sigmoid:
+        contrastive_learn = SigmoidContrastiveLearning(
+            bias = sigmoid_bias,
+            l2norm_embed = False,
+            learned_scale = False,
+            use_euclidean = use_euclidean
+        )
     else:
-        contrastive_learn = ContrastiveLearning(l2norm_embed = True, learned_temp = True)
+        contrastive_learn = ContrastiveLearning(
+            l2norm_embed = False,
+            learned_temp = False,
+            use_euclidean = use_euclidean
+        )
+
+    # trainers
 
     critic_trainer = ContrastiveRLTrainer(
         critic_encoder,
@@ -254,18 +181,10 @@ def main(
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
-        reward_part_of_goal = reward_part_of_goal,
-        reward_norm = reward_norm,
+        discount = discount,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
-
-    # assertions
-
-    assert num_episodes_before_learn > cl_batch_size
-
-    def sample_fn(logits, differentiable = False):
-        return actor_readout.sample(logits, differentiable = differentiable, rescale_range = (-1., 1.))
 
     actor_trainer = ActorTrainer(
         actor_encoder,
@@ -275,188 +194,145 @@ def main(
         learning_rate = actor_learning_rate,
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
-        softmax_actor_output = False,
-        reward_part_of_goal = reward_part_of_goal,
-        reward_norm = reward_norm,
         cpu = cpu,
-        contrastive_learn = contrastive_learn
+        contrastive_learn = contrastive_learn,
+        action_entropy_loss_weight = action_entropy_loss_weight,
+        normalize_q_values = True,
+        target_goal_prob = 0.5
     )
 
-    actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
+    device = actor_trainer.device
 
-    if reward_part_of_goal:
-        max_reward = tensor([1.], device = device, dtype = torch.float32)
-        actor_goal = cat((actor_goal, max_reward), dim = -1)
+    # landing pad target goal: at coordinates (0, 0), zero velocity/angle, and legs touching (1, 1)
 
-    # episodes
+    base_actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
+
+    # action distribution helpers
+
+    def to_dist_params(logits):
+        return rearrange(logits, '... (a d) -> ... a d', d = 2)
+
+    def sample_fn(logits, differentiable = False):
+        return actor_readout.sample(to_dist_params(logits), differentiable = differentiable)
+
+    def entropy_fn(logits):
+        return actor_readout.entropy(to_dist_params(logits))
+
+    # tracking
 
     rolling_reward = deque(maxlen = 100)
-    rolling_steps = deque(maxlen = 100)
+    all_rewards = []
+    all_lengths = []
 
-    dashboard = Dashboard(
-        num_episodes,
-        title = "Contrastive RL - Lunar Lander (Continuous)",
-        env_name = "LunarLanderContinuous-v3",
-        hyperparams = dict(
-            critic_learning_rate = critic_learning_rate,
-            actor_learning_rate = actor_learning_rate,
-            cl_batch_size = cl_batch_size,
-            actor_batch_size = actor_batch_size,
-            buffer_size = f"{buffer_size}",
-            max_timesteps = f"{max_timesteps}",
-            weight_decay = f"{weight_decay}",
-            max_grad_norm = f"{max_grad_norm}",
-            repetition_factor = f"{repetition_factor}",
-            use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
-            exploration_random_goal_prob = exploration_random_goal_prob,
-            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob,
-            use_hl_gauss_critic_actions = use_hl_gauss_critic_actions,
-            hl_gauss_num_bins = hl_gauss_num_bins,
-            hl_gauss_sigma = f"{hl_gauss_sigma}" if hl_gauss_sigma else "None",
-            use_attn_residual_mlp = use_attn_residual_mlp
-        )
-    )
+    for eps in range(num_episodes):
 
-    with dashboard.create_renderable() as live:
-        for eps in range(num_episodes):
+        state, _ = env.reset()
 
-            state, *_ = env.reset()
+        cum_reward = 0.
+        eps_steps = 0
 
-            cum_reward = 0.
-            eps_steps = 0
-            cl_loss = 0.
-            actor_loss = 0.
+        is_exploring = torch.rand((), device = device) < exploration_random_goal_prob
 
-            # decide on goal for the episode
+        eps_goal = base_actor_goal
 
-            is_exploring = torch.rand(()) < exploration_random_goal_prob
+        if is_exploring:
+            eps_goal = sample_random_state(
+                replay_buffer,
+                env,
+                exploration_sample_from_buffer_prob
+            ).to(device)
 
-            eps_goal = actor_goal
+        states = []
+        actions = []
 
-            if is_exploring:
-                eps_goal = sample_random_state(
-                    replay_buffer,
-                    env,
-                    exploration_sample_from_buffer_prob
-                ).to(device)
+        for _ in range(max_timesteps):
 
-                if reward_part_of_goal and eps_goal.shape[-1] == dim_state:
-                    rand_reward = torch.rand((1,), device = device, dtype = torch.float32)
-                    eps_goal = cat((eps_goal, rand_reward), dim = -1)
+            actor_encoder.eval()
 
-            states = []
-            actions = []
-            rewards = []
+            curr_state = from_numpy(state).to(device)
 
-            for _ in range(max_timesteps):
+            action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
 
-                actor_encoder.eval()
+            action = sample_fn(action_logits)
 
-                curr_state = from_numpy(state).to(device)
+            next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
 
-                action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
+            states.append(state)
+            actions.append(action.cpu().numpy())
 
-                action = sample_fn(action_logits)
+            cum_reward += reward
+            eps_steps += 1
 
-                next_state, reward, terminated, truncated, *_ = env.step(action.detach().cpu().numpy())
+            done = truncated or terminated
 
-                # store transition data
+            if done:
+                break
 
-                states.append(state)
-                actions.append(action.detach().cpu())
-                rewards.append(reward)
+            state = next_state
 
-                cum_reward += reward
-                eps_steps += 1
+        # store episode
 
-                done = truncated or terminated
+        if len(states) >= 2:
+            replay_buffer.store_episode(
+                state = states,
+                reward = [1.] * len(states),
+                action = actions
+            )
 
-                if done:
-                    break
+        rolling_reward.append(cum_reward)
+        all_rewards.append(cum_reward)
+        all_lengths.append(eps_steps)
 
-                state = next_state
+        # train the critic and actor
 
-            # store episode if length >= 2
+        if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, learn_every_eps):
 
-            if len(states) >= 2:
-                replay_buffer.store_episode(
-                    state = states,
-                    action = actions,
-                    reward = rewards
-                )
+            data = replay_buffer.get_all_data(
+                fields = ['state', 'action'],
+                meta_fields = ['episode_lens']
+            )
 
-            if not is_exploring:
-                rolling_reward.append(cum_reward)
-                rolling_steps.append(eps_steps)
+            trajectories = data['state']
+            episode_lens = data['episode_lens']
 
-                dashboard.update_metrics(
-                    last_eps_reward = f"{cum_reward:.2f}",
-                    last_eps_steps = eps_steps
-                )
+            cl_loss = critic_trainer(
+                trajectories,
+                cl_train_steps,
+                lens = episode_lens,
+                actions = data['action'],
+                pbar = False
+            )
 
-            live.update(dashboard.render())
+            actor_loss = actor_trainer(
+                trajectories,
+                actor_num_train_steps,
+                lens = episode_lens,
+                sample_fn = lambda logits: sample_fn(logits, differentiable = True),
+                entropy_fn = entropy_fn,
+                target_goals = base_actor_goal,
+                pbar = False
+            )
 
-            # train the critic and actor
+        avg_reward = sum(rolling_reward) / len(rolling_reward)
 
-            if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, num_episodes_before_learn):
+        if divisible_by(eps + 1, 10) or (eps + 1) == 1:
+            print(f'episode {eps + 1:4d} | reward: {cum_reward:6.1f} | avg reward (last 100): {avg_reward:6.1f} | steps: {eps_steps}')
 
-                data = replay_buffer.get_all_data(
-                    fields = ['state', 'action', 'reward'],
-                    meta_fields = ['episode_lens']
-                )
+        if divisible_by(eps + 1, 50):
+            with open(reward_json_path, 'w') as f:
+                json.dump(dict(rewards = all_rewards, lengths = all_lengths), f)
 
-                trajectories = data['state']
-                episode_lens = data['episode_lens']
-                actions_for_critic = data['action']
-                rewards_for_critic = data['reward']
+        if divisible_by(eps + 1, save_checkpoint_every):
+            torch.save(actor_encoder.state_dict(), f'{checkpoint_folder}/actor-{eps + 1}.pt')
 
-                cl_loss = critic_trainer(
-                    trajectories,
-                    cl_train_steps,
-                    lens = episode_lens,
-                    actions = actions_for_critic,
-                    rewards = rewards_for_critic,
-                    pbar = dashboard.critic_pbar
-                )
+    # save final
 
-                actor_loss = actor_trainer(
-                    trajectories,
-                    actor_num_train_steps,
-                    lens = episode_lens,
-                    rewards = rewards_for_critic,
-                    pbar = dashboard.actor_pbar,
-                    sample_fn = lambda logits: sample_fn(logits, differentiable = True)
-                )
+    torch.save(actor_encoder.state_dict(), f'{checkpoint_folder}/actor-final.pt')
 
-                dashboard.update_metrics(
-                    critic_loss = f"{cl_loss:.4f}",
-                    actor_loss = f"{actor_loss:.4f}"
-                )
+    with open(reward_json_path, 'w') as f:
+        json.dump(dict(rewards = all_rewards, lengths = all_lengths), f)
 
-            dashboard.advance_progress()
-
-            if not is_exploring:
-                avg_reward = sum(rolling_reward) / len(rolling_reward) if len(rolling_reward) > 0 else 0.
-                avg_steps = sum(rolling_steps) / len(rolling_steps) if len(rolling_steps) > 0 else 0.
-
-                dashboard.update_metrics(
-                    avg_cum_reward_100 = f"{avg_reward:.2f}",
-                    avg_steps_100 = f"{avg_steps:.1f}"
-                )
-
-                if use_wandb:
-                    accelerator.log({
-                        "avg_cum_reward_100": avg_reward,
-                        "avg_steps_100": avg_steps,
-                        "last_eps_reward": cum_reward,
-                        "critic_loss": cl_loss,
-                        "actor_loss": actor_loss
-                    })
-
-            live.update(dashboard.render())
-
-    if use_wandb:
-        accelerator.end_training()
+    env.close()
 
 # fire
 

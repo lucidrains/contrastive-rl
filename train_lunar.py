@@ -2,75 +2,44 @@
 # dependencies = [
 #   "contrastive-rl-pytorch",
 #   "discrete-continuous-embed-readout",
-#   "ema-pytorch",
 #   "fire",
 #   "gymnasium[box2d]",
-#   "gymnasium[other]",
 #   "memmap-replay-buffer>=0.0.10",
 #   "x-mlps-pytorch>=0.3.0",
 #   "tqdm",
-#   "assoc-scan",
-#   "einops",
-#   "wandb"
+#   "einops"
 # ]
 # ///
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
-import wandb
-
-from fire import Fire
-from shutil import rmtree
+import json
 from collections import deque
-from functools import partial
+from pathlib import Path
+from shutil import rmtree
 
 import torch
-from torch import from_numpy, cat, tensor, arange
+from torch import from_numpy, cat, tensor
 import torch.nn.functional as F
 
 import numpy as np
-import einx
-from einops import rearrange
-
 from tqdm import tqdm
 import gymnasium as gym
-from accelerate import Accelerator
+from fire import Fire
 
 from memmap_replay_buffer import ReplayBuffer
 
 from contrastive_rl_pytorch import (
     ContrastiveRLTrainer,
     ActorTrainer,
-    TDTrainer,
-    ValueTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
     sample_random_state
 )
 
-from assoc_scan import AssocScan
-
-def calc_returns(
-    rewards,
-    masks,
-    gamma = 0.99,
-    use_accelerated = False
-):
-    gates = gamma * masks
-    scan = AssocScan(reverse = True, use_accelerated = use_accelerated)
-    return scan(gates, rewards)
-
-
-from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
+from x_mlps_pytorch import MLP
 from discrete_continuous_embed_readout import Readout
-
-from ema_pytorch import EMA
-from torch.optim import AdamW
-
-
-from dashboard import Dashboard
 
 # functions
 
@@ -83,94 +52,66 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
-def module_device(m):
-    return next(m.parameters()).device
-
 # main
 
 def main(
-    num_episodes = 50_000,
+    num_episodes = 1500,
     max_timesteps = 500,
-    num_episodes_before_learn = 128,
+    num_episodes_before_learn = 8,
+    learn_every_eps = 4,
     buffer_size = 512,
     video_folder = './recordings',
-    render_every_eps = None,
+    render_every_eps = 150,
     dim_contrastive_embed = 64,
-    cl_train_steps = 2_000,
-    cl_batch_size = 128,
-    actor_batch_size = 128,
-    actor_num_train_steps = 1000,
+    cl_train_steps = 100,
+    cl_batch_size = 64,
+    actor_num_train_steps = 50,
+    actor_batch_size = 64,
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
-    actor_dim = 64,
-    actor_depth = 4,
-    critic_dim = 64,
-    critic_depth = 8,
-    goal_dim = 64,
-    goal_depth = 8,
+    actor_dim = 256,
+    critic_dim = 256,
+    goal_dim = 256,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
-    train_critic_soft_one_hot = False,
-    repetition_factor = 2,
-    use_sigmoid_contrastive_learning = True,
-    sigmoid_bias = -5.,
-    cl_l2norm_embed = True,
-    exploration_random_goal_prob = 0.025,
+    repetition_factor = 1,
+    use_sigmoid = True,
+    sigmoid_bias = 0.,
+    use_euclidean = False,
+    discount = 0.99,
+    exploration_random_goal_prob = 0.05,
     exploration_sample_from_buffer_prob = 0.5,
-    reward_part_of_goal = False,
-    reward_norm = 100.,
-    reward_fourier_encode = False,
-    reward_fourier_dim = 16,
-    use_attn_residual_mlp = True,
-    use_wandb = False,
+    action_entropy_loss_weight = 0.01,
+    save_checkpoint_every = 200,
+    checkpoint_folder = './checkpoints-lunar',
+    reward_json_path = './lunar_rewards.json',
     cpu = False,
-    sigreg_loss_weight = 0.,
-    use_td_learning = False,
-    td_gamma = 0.95,
-    td_loss_weight = 1e-2,
-    td_learning_rate = 3e-4,
-    action_entropy_loss_weight = 1e-2,
-    use_advantage_weighting = True,
-    rollout_cpu = True
+    seed = 0
 ):
-    # clear video folder
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    rmtree(video_folder, ignore_errors = True)
+    # recordings folder
+
     os.makedirs(video_folder, exist_ok = True)
-
-    # accelerator
-
-    accelerator = Accelerator(
-        log_with = 'wandb' if use_wandb else None,
-        cpu = cpu
-    )
-
-    if use_wandb:
-        accelerator.init_trackers(
-            project_name = 'contrastive-rl',
-            config = locals()
-        )
+    os.makedirs(checkpoint_folder, exist_ok = True)
 
     # env
 
-    env = gym.make('LunarLander-v3', render_mode = 'rgb_array')
+    render_mode = 'rgb_array' if exists(render_every_eps) else None
 
-    # recording
+    env = gym.make('LunarLander-v3', render_mode = render_mode)
 
-    render_every_eps = default(render_every_eps, num_episodes_before_learn)
-
-    env = gym.wrappers.RecordVideo(
-        env = env,
-        video_folder = video_folder,
-        name_prefix = 'lunar',
-        episode_trigger = lambda eps_num: divisible_by(eps_num, render_every_eps),
-        disable_logger = True
-    )
+    if exists(render_every_eps):
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder = video_folder,
+            episode_trigger = lambda ep: divisible_by(ep, render_every_eps),
+            name_prefix = 'lunar'
+        )
 
     dim_state = 8
     dim_goal = 8
-    if reward_part_of_goal:
-        dim_goal += reward_fourier_dim if reward_fourier_encode else 1
     dim_action = 4
 
     # replay buffer
@@ -182,98 +123,54 @@ def main(
         fields = dict(
             state = ('float', dim_state),
             reward = ('float', 1),
-            action_hard_one_hot = ('float', dim_action),
-            action_soft_one_hot = ('float', dim_action)
+            action_hard_one_hot = ('float', dim_action)
         ),
         circular = True,
         overwrite = True
     )
 
-    # model
-
-    device = accelerator.device
-
-    if use_attn_residual_mlp:
-        MLP = AttnResidualNormedMLP
-    else:
-        MLP = partial(ResidualNormedMLP, residual_every = 4, keel_post_ln = True)
-
-    actor_dim_in = dim_state + dim_goal
+    # models
 
     actor_encoder = MLP(
-        dim_in = actor_dim_in, # state and goal
-        dim = actor_dim,
-        depth = actor_depth,
-        dim_out = dim_action
-    ).to(device)
+        dim_state + dim_goal,
+        actor_dim,
+        actor_dim,
+        dim_action
+    )
 
     actor_readout = Readout(num_discrete = dim_action, dim = 0)
 
     critic_encoder = MLP(
-        dim_in = dim_state + dim_action,
-        dim = critic_dim,
-        dim_out = dim_contrastive_embed,
-        depth = critic_depth
-    ).to(device)
+        dim_state + dim_action,
+        critic_dim,
+        critic_dim,
+        dim_contrastive_embed
+    )
 
     goal_encoder = MLP(
-        dim_in = dim_goal,
-        dim = goal_dim,
-        dim_out = dim_contrastive_embed,
-        depth = goal_depth
-    ).to(device)
-
-    td_critic = None
-    ema_td_critic = None
-    td_trainer = None
-
-    if use_td_learning:
-        td_critic = MLP(
-            dim_in = dim_state,
-            dim = critic_dim,
-            dim_out = dim_action,
-            depth = 2
-        )
-        ema_td_critic = EMA(td_critic, beta = 0.99, include_online_model = False)
-        td_trainer = TDTrainer(
-            q_critic = td_critic,
-            ema_q_critic = ema_td_critic,
-            batch_size = actor_batch_size,
-            learning_rate = td_learning_rate,
-            td_gamma = td_gamma,
-            weight_decay = weight_decay,
-            max_grad_norm = max_grad_norm,
-            cpu = cpu
-        )
-
-    # value network (if computing advantage with expected-returns baseline)
-
-    value_network = None
-    value_trainer = None
-
-    if use_advantage_weighting:
-        value_network = MLP(
-            dim_in = dim_state,
-            dim = critic_dim,
-            dim_out = 1,
-            depth = 2
-        )
-
-        value_trainer = ValueTrainer(
-            value_network,
-            batch_size = actor_batch_size,
-            learning_rate = actor_learning_rate,
-            weight_decay = weight_decay,
-            max_grad_norm = max_grad_norm,
-            cpu = cpu
-        )
+        dim_goal,
+        goal_dim,
+        goal_dim,
+        dim_contrastive_embed
+    )
 
     # contrastive learning module
 
-    if use_sigmoid_contrastive_learning:
-        contrastive_learn = SigmoidContrastiveLearning(bias = sigmoid_bias, l2norm_embed = cl_l2norm_embed)
+    if use_sigmoid:
+        contrastive_learn = SigmoidContrastiveLearning(
+            bias = sigmoid_bias,
+            l2norm_embed = False,
+            learned_scale = False,
+            use_euclidean = use_euclidean
+        )
     else:
-        contrastive_learn = ContrastiveLearning(l2norm_embed = True, learned_temp = True)
+        contrastive_learn = ContrastiveLearning(
+            l2norm_embed = False,
+            learned_temp = False,
+            use_euclidean = use_euclidean
+        )
+
+    # trainers
 
     critic_trainer = ContrastiveRLTrainer(
         critic_encoder,
@@ -283,18 +180,10 @@ def main(
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
-        reward_part_of_goal = reward_part_of_goal,
-        reward_norm = reward_norm,
-        reward_fourier_encode = reward_fourier_encode,
-        reward_fourier_dim = reward_fourier_dim,
+        discount = discount,
         cpu = cpu,
-        contrastive_learn = contrastive_learn,
-        sigreg_loss_weight = sigreg_loss_weight
+        contrastive_learn = contrastive_learn
     )
-
-    # assertions
-
-    assert num_episodes_before_learn >= cl_batch_size
 
     actor_trainer = ActorTrainer(
         actor_encoder,
@@ -304,294 +193,133 @@ def main(
         learning_rate = actor_learning_rate,
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
-        softmax_actor_output = True,
-        reward_part_of_goal = reward_part_of_goal,
-        reward_norm = reward_norm,
-        reward_fourier_encode = reward_fourier_encode,
-        reward_fourier_dim = reward_fourier_dim,
+        num_discrete_actions = dim_action,
         cpu = cpu,
         contrastive_learn = contrastive_learn,
         action_entropy_loss_weight = action_entropy_loss_weight,
-        advantage_weighting = use_advantage_weighting
+        normalize_q_values = True,
+        target_goal_prob = 0.5
     )
+
+    device = actor_trainer.device
+
+    # landing pad target goal: at coordinates (0, 0), zero velocity/angle, and legs touching (1, 1)
 
     base_actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
-    max_step_reward = 3.0
 
-    # episodes
+    # tracking
 
     rolling_reward = deque(maxlen = 100)
-    rolling_steps = deque(maxlen = 100)
+    all_rewards = []
+    all_lengths = []
 
-    dashboard = Dashboard(
-        num_episodes,
-        title = "Contrastive RL - Lunar Lander",
-        env_name = "LunarLander-v3",
-        hyperparams = dict(
-            critic_learning_rate = critic_learning_rate,
-            actor_learning_rate = actor_learning_rate,
-            cl_batch_size = cl_batch_size,
-            actor_batch_size = actor_batch_size,
-            buffer_size = f"{buffer_size}",
-            max_timesteps = f"{max_timesteps}",
-            weight_decay = f"{weight_decay}",
-            max_grad_norm = f"{max_grad_norm}",
-            train_critic_soft_one_hot = f"{train_critic_soft_one_hot}",
-            repetition_factor = repetition_factor,
-            use_sigmoid_contrastive_learning = use_sigmoid_contrastive_learning,
-            exploration_random_goal_prob = exploration_random_goal_prob,
-            exploration_sample_from_buffer_prob = exploration_sample_from_buffer_prob,
-            reward_part_of_goal = reward_part_of_goal,
-            reward_norm = reward_norm,
-            reward_fourier_encode = reward_fourier_encode,
-            reward_fourier_dim = reward_fourier_dim,
-            use_attn_residual_mlp = use_attn_residual_mlp,
-            sigreg_loss_weight = sigreg_loss_weight,
-            use_td_learning = f"{use_td_learning}",
-            td_loss_weight = td_loss_weight
-        ),
-        has_value_network = use_advantage_weighting
-    )
+    for eps in range(num_episodes):
 
-    with dashboard.create_renderable() as live:
+        state, _ = env.reset()
 
-        rollout_device = torch.device('cpu') if rollout_cpu else device
+        cum_reward = 0.
+        eps_steps = 0
 
-        for eps in range(num_episodes):
+        is_exploring = torch.rand((), device = device) < exploration_random_goal_prob
 
-            if rollout_cpu:
-                actor_encoder.cpu()
-                if exists(actor_trainer.reward_fourier_encode):
-                    actor_trainer.reward_fourier_encode.cpu()
+        eps_goal = base_actor_goal
 
-            state, *_ = env.reset()
+        if is_exploring:
+            eps_goal = sample_random_state(
+                replay_buffer,
+                env,
+                exploration_sample_from_buffer_prob
+            ).to(device)
 
-            cum_reward = 0.
-            eps_steps = 0
-            cl_loss = 0.
-            critic_sigreg_loss = 0.
-            actor_loss = 0.
-            td_loss_val = 0.
-            value_loss_val = 0.
+        states = []
+        hard_one_hots = []
 
-            # decide on goal for the episode
+        for _ in range(max_timesteps):
 
-            is_exploring = torch.rand((), device = device) < exploration_random_goal_prob
+            actor_encoder.eval()
 
-            eps_goal = base_actor_goal.to(rollout_device)
+            curr_state = from_numpy(state).to(device)
 
-            if reward_part_of_goal:
-                max_reward_tensor = tensor([max_step_reward / reward_norm], device = rollout_device, dtype = torch.float32)
-                if reward_fourier_encode:
-                    actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(rollout_device)
-                    max_reward_tensor = actor_trainer.reward_fourier_encode(max_reward_tensor)
-                    max_reward_tensor = rearrange(max_reward_tensor, '1 d -> d')
-                eps_goal = cat((eps_goal, max_reward_tensor), dim = -1)
+            action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
 
-            if is_exploring:
-                eps_goal = sample_random_state(
-                    replay_buffer,
-                    env,
-                    exploration_sample_from_buffer_prob
-                ).to(rollout_device)
+            action = actor_readout.sample(action_logits)
 
-                if reward_part_of_goal and eps_goal.shape[-1] == dim_state:
-                    rand_reward = torch.rand((1,), device = rollout_device, dtype = torch.float32) * (max_step_reward / reward_norm)
+            next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
 
-                    if reward_fourier_encode:
-                        actor_trainer.reward_fourier_encode = actor_trainer.reward_fourier_encode.to(rollout_device)
-                        rand_reward = actor_trainer.reward_fourier_encode(rand_reward)
-                        rand_reward = rearrange(rand_reward, '1 d -> d')
+            states.append(state)
+            hard_one_hots.append(F.one_hot(action.long(), num_classes = dim_action).float().detach().cpu())
 
-                    eps_goal = cat((eps_goal, rand_reward), dim = -1)
+            cum_reward += reward
+            eps_steps += 1
 
-            states = []
-            rewards = []
-            hard_one_hots = []
-            soft_one_hots = []
+            done = truncated or terminated
 
-            for _ in range(max_timesteps):
+            if done:
+                break
 
-                actor_encoder.eval()
+            state = next_state
 
-                curr_state = from_numpy(state).to(rollout_device)
+        # store episode
 
-                actor_inputs = [curr_state, eps_goal]
+        if len(states) >= 2:
+            replay_buffer.store_episode(
+                state = states,
+                reward = [1.] * len(states),
+                action_hard_one_hot = hard_one_hots
+            )
 
-                action_logits = actor_encoder(cat(actor_inputs, dim = -1))
+        rolling_reward.append(cum_reward)
+        all_rewards.append(cum_reward)
+        all_lengths.append(eps_steps)
 
-                action = actor_readout.sample(action_logits)
+        # train the critic and actor
 
-                next_state, reward, terminated, truncated, *_ = env.step(action.cpu().numpy())
+        if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, learn_every_eps):
 
-                # store transition data
+            data = replay_buffer.get_all_data(
+                fields = ['state', 'action_hard_one_hot'],
+                meta_fields = ['episode_lens']
+            )
 
-                states.append(state)
-                rewards.append(reward)
-                hard_one_hots.append(F.one_hot(action.long(), num_classes = dim_action).float().detach().cpu())
-                soft_one_hots.append(action_logits.softmax(dim = -1).detach().cpu())
+            trajectories = data['state']
+            episode_lens = data['episode_lens']
 
-                cum_reward += reward
-                eps_steps += 1
+            cl_loss = critic_trainer(
+                trajectories,
+                cl_train_steps,
+                lens = episode_lens,
+                actions = data['action_hard_one_hot'],
+                pbar = False
+            )
 
-                done = truncated or terminated
+            actor_loss = actor_trainer(
+                trajectories,
+                actor_num_train_steps,
+                lens = episode_lens,
+                target_goals = base_actor_goal,
+                pbar = False
+            )
 
-                if done:
-                    break
+        avg_reward = sum(rolling_reward) / len(rolling_reward)
 
-                state = next_state
+        if divisible_by(eps + 1, 10) or (eps + 1) == 1:
+            print(f'episode {eps + 1:4d} | reward: {cum_reward:6.1f} | avg reward (last 100): {avg_reward:6.1f} | steps: {eps_steps}')
 
-            # store episode if length >= 2
+        if divisible_by(eps + 1, 50):
+            with open(reward_json_path, 'w') as f:
+                json.dump(dict(rewards = all_rewards, lengths = all_lengths), f)
 
-            if len(states) >= 2:
-                replay_buffer.store_episode(
-                    state = states,
-                    reward = rewards,
-                    action_hard_one_hot = hard_one_hots,
-                    action_soft_one_hot = soft_one_hots
-                )
+        if divisible_by(eps + 1, save_checkpoint_every):
+            torch.save(actor_encoder.state_dict(), f'{checkpoint_folder}/actor-{eps + 1}.pt')
 
-            if not is_exploring:
-                rolling_reward.append(cum_reward)
-                rolling_steps.append(eps_steps)
+    # save final
 
-                dashboard.update_metrics(
-                    last_eps_reward = f"{cum_reward:.2f}",
-                    last_eps_steps = eps_steps
-                )
+    torch.save(actor_encoder.state_dict(), f'{checkpoint_folder}/actor-final.pt')
 
-            live.update(dashboard.render())
+    with open(reward_json_path, 'w') as f:
+        json.dump(dict(rewards = all_rewards, lengths = all_lengths), f)
 
-            # train the critic and actor
-
-            if (eps + 1) >= num_episodes_before_learn and divisible_by(eps + 1, num_episodes_before_learn):
-
-                if rollout_cpu:
-                    actor_encoder.to(device)
-                    if exists(actor_trainer.reward_fourier_encode):
-                        actor_trainer.reward_fourier_encode.to(device)
-
-                data = replay_buffer.get_all_data(
-                    fields = ['state', 'reward', 'action_hard_one_hot', 'action_soft_one_hot'],
-                    meta_fields = ['episode_lens']
-                )
-
-                trajectories = data['state']
-                rewards_for_critic = data['reward']
-                episode_lens = data['episode_lens']
-
-                if train_critic_soft_one_hot:
-                    actions_for_critic = data['action_soft_one_hot']
-                else:
-                    actions_for_critic = data['action_hard_one_hot']
-
-                td_loss_val = 0.
-                if use_td_learning:
-                    hard_actions = data['action_hard_one_hot'].argmax(dim=-1)
-
-                    td_loss_val = td_trainer(
-                        trajectories,
-                        actor_num_train_steps,
-                        actions = hard_actions,
-                        rewards = data['reward'],
-                        lens = episode_lens,
-                        pbar = dashboard.critic_pbar
-                    )
-
-                cl_loss, critic_sigreg_loss = critic_trainer(
-                    trajectories,
-                    cl_train_steps,
-                    lens = episode_lens,
-                    actions = actions_for_critic,
-                    rewards = rewards_for_critic,
-                    pbar = dashboard.critic_pbar
-                )
-
-                discounted_returns = None
-                if use_advantage_weighting:
-                    max_len = trajectories.shape[1]
-                    eps_lens_tensor = episode_lens.clone().detach().to(device) if torch.is_tensor(episode_lens) else tensor(episode_lens, device = device)
-                    masks = einx.less('t, b -> b t', arange(max_len, device = device), eps_lens_tensor).float()
-
-                    rewards_tensor = rearrange(rewards_for_critic.to(device), '... 1 -> ...')
-                    discounted_returns = calc_returns(
-                        rewards_tensor,
-                        masks,
-                        gamma = 0.99
-                    )
-                    discounted_returns = rearrange(discounted_returns, '... -> ... 1').cpu()
-
-                    value_loss_val = value_trainer(
-                        trajectories,
-                        actor_num_train_steps,
-                        lens = episode_lens,
-                        returns = discounted_returns,
-                        pbar = dashboard.value_pbar
-                    )
-
-                actor_loss = actor_trainer(
-                    trajectories,
-                    actor_num_train_steps,
-                    lens = episode_lens,
-                    rewards = rewards_for_critic,
-                    returns = discounted_returns,
-                    sample_fn = actor_readout.sample,
-                    q_critic = td_critic if use_td_learning else None,
-                    q_loss_weight = td_loss_weight if use_td_learning else 0.,
-                    entropy_fn = actor_readout.entropy,
-                    pbar = dashboard.actor_pbar,
-                    value_network = value_network
-                )
-
-                dashboard.update_metrics(
-                    critic_loss = f"{cl_loss:.4f}",
-                    critic_sigreg_loss = f"{critic_sigreg_loss:.4f}",
-                    value_loss = f"{value_loss_val:.4f}" if use_advantage_weighting else "N/A",
-                    actor_loss = f"{actor_loss:.4f}",
-                    td_loss = f"{td_loss_val:.4f}" if use_td_learning else "N/A"
-                )
-
-            dashboard.advance_progress()
-
-            if not is_exploring:
-                avg_reward = sum(rolling_reward) / len(rolling_reward) if len(rolling_reward) > 0 else 0.
-                avg_steps = sum(rolling_steps) / len(rolling_steps) if len(rolling_steps) > 0 else 0.
-
-                dashboard.update_metrics(
-                    avg_cum_reward_100 = f"{avg_reward:.2f}",
-                    avg_steps_100 = f"{avg_steps:.1f}"
-                )
-
-                if use_wandb:
-                    log_data = {
-                        "avg_cum_reward_100": avg_reward,
-                        "avg_steps_100": avg_steps,
-                        "last_eps_reward": cum_reward,
-                        "critic_loss": cl_loss,
-                        "critic_sigreg_loss": critic_sigreg_loss,
-                        "actor_loss": actor_loss
-                    }
-                    if use_advantage_weighting:
-                        log_data["value_loss"] = value_loss_val
-                    accelerator.log(log_data)
-
-                    mp4s = sorted(Path(video_folder).glob("*.mp4"))
-
-                    if len(mp4s) > 0:
-                        latest_mp4 = str(mp4s[-1])
-                        last_logged = getattr(live, 'last_logged_video', None)
-
-                        if latest_mp4 != last_logged:
-                            try:
-                                accelerator.log({"video": wandb.Video(latest_mp4)})
-                                live.last_logged_video = latest_mp4
-                            except:
-                                pass
-
-            live.update(dashboard.render())
-
-    if use_wandb:
-        accelerator.end_training()
+    env.close()
 
 # fire
 
