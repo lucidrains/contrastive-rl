@@ -140,3 +140,15 @@ wait until 3-5k steps at least
     url     = {https://arxiv.org/abs/2603.15789},
 }
 ```
+
+```bibtex
+@misc{osman2026selfsupervisedonpolicyreinforcementlearning,
+    title   = {Self-Supervised On-Policy Reinforcement Learning via Contrastive Proximal Policy Optimisation}, 
+    author  = {Asim Osman and Sasha Abramowitz and Mark Bergh and Ulrich Armel Mbou Sob and Ruan John de Kock and Omayma Mahjoub and Oussama Hidaoui and Noah De Nicola and Arnol Manuel Fokam and Felix Chalumeau and Daniel Rajaonarivonivelomanantsoa and Siddarth Singh and Refiloe Shabe and Juan Claude Formanek and Simon Verster Du Toit and Arnu Pretorius},
+    year    = {2026},
+    eprint  = {2605.13554},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2605.13554}, 
+    }
+```
