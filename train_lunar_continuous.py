@@ -191,9 +191,6 @@ def main(
     use_sigmoid = True,
     sigmoid_bias = 0.,
     use_euclidean = False,
-    use_quasimetric = False,
-    quasimetric_asym_weight = 1.,
-    quasimetric_gated = False,
     discount = 0.99,
     exploration_random_goal_prob = 0.05,
     exploration_sample_from_buffer_prob = 0.5,
@@ -261,7 +258,7 @@ def main(
         action_chunk_size * dim_action * 2 # raw mean and raw conc for each action in chunk
     )
 
-    contrastive_embed_dim = dim_contrastive_embed + (1 if use_quasimetric and quasimetric_gated else 0)
+    contrastive_embed_dim = dim_contrastive_embed
 
     critic_encoder = MLP(
         dim_state + action_chunk_size * dim_action,
@@ -284,19 +281,13 @@ def main(
             bias = sigmoid_bias,
             l2norm_embed = False,
             learned_scale = False,
-            use_euclidean = use_euclidean,
-            use_quasimetric = use_quasimetric,
-            quasimetric_asym_weight = quasimetric_asym_weight,
-            quasimetric_gated = quasimetric_gated
+            use_euclidean = use_euclidean
         )
     else:
         contrastive_learn = ContrastiveLearning(
             l2norm_embed = False,
             learned_temp = False,
-            use_euclidean = use_euclidean,
-            use_quasimetric = use_quasimetric,
-            quasimetric_asym_weight = quasimetric_asym_weight,
-            quasimetric_gated = quasimetric_gated
+            use_euclidean = use_euclidean
         )
 
     # trainers
@@ -351,6 +342,9 @@ def main(
 
     # tracking
 
+    def state_to_actor_state(s):
+        return from_numpy(s).to(device)
+
     rolling_reward = deque(maxlen = 100)
     all_rewards = []
     all_lengths = []
@@ -379,27 +373,27 @@ def main(
 
         while eps_steps < max_timesteps:
 
-            actor_encoder.eval()
+            actor_state = state_to_actor_state(state)
 
-            curr_state = from_numpy(state).to(device)
+            with torch.no_grad():
+                action_logits = actor_encoder(torch.cat((actor_state, eps_goal), dim = -1))
+                action_chunk = sample_fn(action_logits, differentiable = False)
 
-            action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
+            action_chunk = action_chunk.cpu().numpy()
 
-            action_chunk = sample_fn(action_logits)
-            actions_to_exec = action_chunk.cpu().numpy()
+            for a in range(action_chunk_size):
+                action = action_chunk[a]
 
-            done = False
+                next_state, reward, terminated, truncated, _ = env.step(action)
 
-            for step_action in actions_to_exec:
-                next_state, reward, terminated, truncated, _ = env.step(step_action)
-
-                states.append(state)
-                actions.append(step_action)
+                done = terminated or truncated
 
                 cum_reward += reward
                 eps_steps += 1
 
-                done = truncated or terminated
+                states.append(state)
+                actions.append(action)
+
                 state = next_state
 
                 if done or eps_steps >= max_timesteps:
@@ -408,13 +402,11 @@ def main(
             if done:
                 break
 
-        if record_video and hasattr(env, 'recording') and env.recording:
-            env.stop_recording()
+        # rename video if recorded
 
-        # rename recorded video to include cumulative reward in the filename
-
-        if record_video and hasattr(env, 'episode_id'):
+        if record_video and env.recording:
             old_vid = os.path.join(video_folder, f'lunar-cont-c{action_chunk_size}-episode-{env.episode_id}.mp4')
+            env.stop_recording()
             if os.path.exists(old_vid):
                 new_vid = os.path.join(video_folder, f'lunar-cont-c{action_chunk_size}-ep{eps + 1:04d}-rew{cum_reward:+.1f}.mp4')
                 os.rename(old_vid, new_vid)
@@ -465,7 +457,7 @@ def main(
         avg_reward = sum(rolling_reward) / len(rolling_reward)
 
         if divisible_by(eps + 1, 10) or (eps + 1) == 1:
-            print(f'episode {eps + 1:4d} | reward: {cum_reward:6.1f} | avg reward (last 100): {avg_reward:6.1f} | steps: {eps_steps}')
+            print(f'episode {eps + 1:4d} | reward: {cum_reward:6.1f} | avg reward (last 100): {avg_reward:6.1f} | steps: {eps_steps}', flush = True)
 
         if len(rolling_reward) >= 20 and avg_reward > best_reward:
             best_reward = avg_reward

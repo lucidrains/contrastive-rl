@@ -4,7 +4,6 @@ from contrastive_rl_pytorch.contrastive_rl import (
     ContrastiveWrapper,
     ContrastiveRLTrainer,
     ActorTrainer,
-    quasimetric_distance,
     sample_random_state,
     sample_truncated_geometric,
     sample_truncated_geometric_time
@@ -16,7 +15,6 @@ __all__ = [
     'ContrastiveWrapper',
     'ContrastiveRLTrainer',
     'ActorTrainer',
-    'quasimetric_distance',
     'sample_random_state',
     'sample_truncated_geometric',
     'sample_truncated_geometric_time'

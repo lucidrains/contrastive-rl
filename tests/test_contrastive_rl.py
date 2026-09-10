@@ -3,6 +3,9 @@ param = pytest.mark.parametrize
 
 import torch
 
+def exists(v):
+    return v is not None
+
 def test_contrast_loss():
     from contrastive_rl_pytorch.contrastive_rl import ContrastiveLearning
     embeds1 = torch.randn(10, 512)
@@ -282,77 +285,3 @@ def test_sample_truncated_geometric(discount, as_tensor):
     tensor_discount = torch.full_like(rem, discount, dtype = torch.float32)
     delta_tensor = sample_truncated_geometric(rem, tensor_discount)
     assert (delta_tensor >= 1).all() and (delta_tensor <= rem).all()
-
-@param('use_sigmoid', (False, True))
-def test_quasimetric(use_sigmoid):
-    from contrastive_rl_pytorch import ContrastiveLearning, SigmoidContrastiveLearning, quasimetric_distance
-
-    x = torch.randn(8, 16, requires_grad = True)
-    y = torch.randn(8, 16, requires_grad = True)
-    z = torch.randn(8, 16)
-
-    # triangle inequality
-
-    d_xy = quasimetric_distance(x, y)
-    d_yz = quasimetric_distance(y, z)
-    d_xz = quasimetric_distance(x, z)
-    assert (d_xz <= d_xy + d_yz + 1e-5).all()
-
-    # asymmetry
-
-    assert not torch.allclose(quasimetric_distance(x, y), quasimetric_distance(y, x))
-
-    # contrastive learning with quasimetric
-
-    cls = SigmoidContrastiveLearning if use_sigmoid else ContrastiveLearning
-    cl = cls(use_quasimetric = True)
-
-    loss = cl(x, y)
-    loss.backward()
-
-    assert not torch.isnan(loss)
-    assert not torch.isnan(x.grad).any()
-    assert not torch.isnan(y.grad).any()
-
-@param('use_sigmoid', (False, True))
-def test_gated_quasimetric(use_sigmoid):
-    from contrastive_rl_pytorch import ContrastiveLearning, SigmoidContrastiveLearning, quasimetric_distance
-
-    d = 16
-    x = torch.randn(8, d)
-    y = torch.randn(8, d)
-
-    # gate -> -inf (sigmoid -> 0, pure symmetric euclidean)
-
-    gate_neg = torch.full((8, 1), -100.)
-    x_neg = torch.cat([x, gate_neg], dim = -1)
-    y_neg = torch.cat([y, gate_neg], dim = -1)
-
-    d_neg = quasimetric_distance(x_neg, y_neg, gated = True)
-    d_sym = (x - y).norm(p = 2, dim = -1)
-    assert torch.allclose(d_neg, d_sym, atol = 1e-4)
-
-    # gate -> +inf (sigmoid -> 1, full quasimetric)
-
-    gate_pos = torch.full((8, 1), 100.)
-    x_pos = torch.cat([x, gate_pos], dim = -1)
-    y_pos = torch.cat([y, gate_pos], dim = -1)
-
-    d_pos = quasimetric_distance(x_pos, y_pos, gated = True)
-    d_full = quasimetric_distance(x, y, gated = False)
-    assert torch.allclose(d_pos, d_full, atol = 1e-4)
-
-    # gradient flows through the embeddings and the gate dimension
-
-    x_var = torch.randn(8, d + 1, requires_grad = True)
-    y_var = torch.randn(8, d + 1, requires_grad = True)
-
-    cls = SigmoidContrastiveLearning if use_sigmoid else ContrastiveLearning
-    cl = cls(use_quasimetric = True, quasimetric_gated = True)
-
-    loss = cl(x_var, y_var)
-    loss.backward()
-
-    assert not torch.isnan(loss)
-    assert x_var.grad is not None and not torch.isnan(x_var.grad).any()
-    assert y_var.grad is not None and not torch.isnan(y_var.grad).any()

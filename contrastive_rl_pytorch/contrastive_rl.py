@@ -62,11 +62,6 @@ def log(t, eps = 1e-20):
 def l2norm(t):
     return F.normalize(t, dim = -1)
 
-def l2norm_keep_gate(t):
-    # l2 normalize the embedding, but leave the trailing quasimetric gate untouched
-
-    return cat((l2norm(t[..., :-1]), t[..., -1:]), dim = -1)
-
 def cycle(dl):
     while True:
         for batch in dl:
@@ -76,58 +71,15 @@ def arange_from_tensor_dim(t, dim = 0):
     length = t.shape[dim]
     return arange(length, device = t.device)
 
-# quasimetric distance
-# symmetric l2 distance plus an asymmetric positive part max, optionally scaled by a learned gate
-# Wang et al., https://arxiv.org/abs/2304.01203
-
-def quasimetric_distance(
-    embeds1,
-    embeds2,
-    all_pairs = False,
-    asym_weight = 1.,
-    gated = False
-):
-    if gated:
-        embeds1, gate1 = embeds1[..., :-1], embeds1[..., -1]
-        embeds2, gate2 = embeds2[..., :-1], embeds2[..., -1]
-
-        if all_pairs:
-            gate = (rearrange(gate1, '... i -> ... i 1') + rearrange(gate2, '... j -> ... 1 j')) / 2.
-        else:
-            gate = (gate1 + gate2) / 2.
-
-        asym_weight = asym_weight * gate.sigmoid()
-
-    if all_pairs:
-        diff = rearrange(embeds1, '... i d -> ... i 1 d') - rearrange(embeds2, '... j d -> ... 1 j d')
-    else:
-        diff = embeds1 - embeds2
-
-    sym = diff.norm(p = 2, dim = -1)
-    asym = diff.relu().amax(dim = -1)
-    return sym + asym_weight * asym
-
 # similarity helper
 
 def calc_similarity(
     embeds1,
     embeds2,
     *,
-    use_quasimetric = False,
-    quasimetric_asym_weight = 1.,
-    quasimetric_gated = False,
     use_euclidean = False,
     all_pairs = False
 ):
-    if use_quasimetric:
-        return -quasimetric_distance(
-            embeds1,
-            embeds2,
-            all_pairs = all_pairs,
-            asym_weight = quasimetric_asym_weight,
-            gated = quasimetric_gated
-        )
-
     if use_euclidean:
         if all_pairs:
             return -torch.cdist(embeds1, embeds2)
@@ -208,17 +160,11 @@ class ContrastiveLearning(Module):
         self,
         l2norm_embed = True,
         learned_temp = True,
-        use_euclidean = False,
-        use_quasimetric = False,
-        quasimetric_asym_weight = 1.,
-        quasimetric_gated = False
+        use_euclidean = False
     ):
         super().__init__()
         self.l2norm_embed = l2norm_embed
         self.use_euclidean = use_euclidean
-        self.use_quasimetric = use_quasimetric
-        self.quasimetric_asym_weight = quasimetric_asym_weight
-        self.quasimetric_gated = quasimetric_gated
 
         self.learned_log_temp = None
         if learned_temp:
@@ -235,15 +181,11 @@ class ContrastiveLearning(Module):
         return_contrastive_score = False
     ):
         if self.l2norm_embed:
-            norm_fn = l2norm_keep_gate if self.use_quasimetric and self.quasimetric_gated else l2norm
-            embeds1, embeds2 = map(norm_fn, (embeds1, embeds2))
+            embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
         sim = calc_similarity(
             embeds1,
             embeds2,
-            use_quasimetric = self.use_quasimetric,
-            quasimetric_asym_weight = self.quasimetric_asym_weight,
-            quasimetric_gated = self.quasimetric_gated,
             use_euclidean = self.use_euclidean,
             all_pairs = not return_contrastive_score
         )
@@ -274,18 +216,12 @@ class SigmoidContrastiveLearning(Module):
         bias = 0.,
         l2norm_embed = False,
         learned_scale = False,
-        use_euclidean = False,
-        use_quasimetric = False,
-        quasimetric_asym_weight = 1.,
-        quasimetric_gated = False
+        use_euclidean = False
     ):
         super().__init__()
         self.bias = bias
         self.l2norm_embed = l2norm_embed
         self.use_euclidean = use_euclidean
-        self.use_quasimetric = use_quasimetric
-        self.quasimetric_asym_weight = quasimetric_asym_weight
-        self.quasimetric_gated = quasimetric_gated
 
         self.learned_log_scale = None
         if learned_scale:
@@ -302,15 +238,11 @@ class SigmoidContrastiveLearning(Module):
         return_contrastive_score = False
     ):
         if self.l2norm_embed:
-            norm_fn = l2norm_keep_gate if self.use_quasimetric and self.quasimetric_gated else l2norm
-            embeds1, embeds2 = map(norm_fn, (embeds1, embeds2))
+            embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
         sim = calc_similarity(
             embeds1,
             embeds2,
-            use_quasimetric = self.use_quasimetric,
-            quasimetric_asym_weight = self.quasimetric_asym_weight,
-            quasimetric_gated = self.quasimetric_gated,
             use_euclidean = self.use_euclidean,
             all_pairs = not return_contrastive_score
         )
@@ -346,6 +278,10 @@ class ContrastiveWrapper(Module):
 
         self.contrastive_learn = contrastive_learn
         self.all_gather = AllGather()
+
+    @property
+    def scale(self):
+        return self.contrastive_learn.scale
 
     def forward(
         self,
@@ -423,9 +359,12 @@ class ContrastiveRLTrainer(Module):
         )
 
     @property
+    def unwrapped_contrast_wrapper(self):
+        return self.accelerator.unwrap_model(self.contrast_wrapper)
+
+    @property
     def scale(self):
-        learned_log_temp = getattr(self.contrast_wrapper.contrastive_learn, 'learned_log_temp', None)
-        return learned_log_temp.exp().item() if exists(learned_log_temp) else 1.
+        return self.unwrapped_contrast_wrapper.scale
 
     @property
     def use_sigmoid(self):
