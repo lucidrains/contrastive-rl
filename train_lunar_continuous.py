@@ -1,7 +1,6 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
-#   "discrete-continuous-embed-readout",
 #   "fire",
 #   "gymnasium[box2d]",
 #   "memmap-replay-buffer>=0.0.10",
@@ -13,16 +12,22 @@
 from __future__ import annotations
 
 import os
+os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 import json
 from collections import deque
 
+import math
 import torch
 from torch import from_numpy, cat, tensor
+from torch.nn import Module
+import torch.nn.functional as F
+from torch.distributions import Distribution, Beta as _Beta, TransformedDistribution
+from torch.distributions.transforms import AffineTransform
 
 import numpy as np
-from einops import rearrange
 import gymnasium as gym
 from fire import Fire
+from einops import rearrange
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -35,7 +40,6 @@ from contrastive_rl_pytorch import (
 )
 
 from x_mlps_pytorch import MLP
-from discrete_continuous_embed_readout import Readout
 
 # functions
 
@@ -48,10 +52,123 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
+# action distributions
+
+class ActionDistr(Module):
+    def to_dist(self, params_or_dist):
+        return params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
+
+    def entropy(
+        self,
+        params_or_dist,
+        sum_action_dim = True
+    ):
+        dist = self.to_dist(params_or_dist)
+        entropy = dist.entropy()
+        return entropy.sum(dim = -1) if sum_action_dim else entropy
+
+    def log_prob(
+        self,
+        params_or_dist,
+        action,
+        sum_action_dim = True
+    ):
+        dist = self.to_dist(params_or_dist)
+        log_prob = dist.log_prob(action)
+        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
+
+# beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1),
+# an affine shift of a unit-interval beta (y = 2x - 1)
+
+class Beta(ActionDistr):
+    def __init__(
+        self,
+        pos_fn = 'softplus',
+        init_conc = 10.,
+        min_conc = 0.,
+        max_conc = 1000.,
+        eps = 1e-5
+    ):
+        super().__init__()
+        assert pos_fn in ('exp', 'softplus')
+        assert init_conc > min_conc, 'init_conc must be greater than min_conc (the concentration floor)'
+        assert max_conc > init_conc
+
+        self.pos_fn = pos_fn
+        self.init_conc = init_conc
+        self.min_conc = min_conc
+        self.max_conc = max_conc
+        self.eps = eps
+
+        # raw offset into the positive fn so the concentration at raw_conc = 0 is exactly init_conc
+
+        self.raw_init_conc = math.log(math.expm1(init_conc - min_conc)) if pos_fn == 'softplus' else math.log(init_conc - min_conc)
+
+    def concentration(
+        self,
+        raw_conc
+    ):
+        if self.pos_fn == 'softplus':
+            return F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
+        elif self.pos_fn == 'exp':
+            return (raw_conc + self.raw_init_conc).exp() + self.min_conc
+
+    def mean(
+        self,
+        params
+    ):
+        raw_mean, _ = params.unbind(dim = -1)
+        eps = max(self.eps, 2. / self.max_conc)
+        return raw_mean.tanh().clamp(min = -1. + eps, max = 1. - eps)
+
+    def entropy(
+        self,
+        params_or_dist,
+        sum_action_dim = True
+    ):
+        # shifted beta entropy = base entropy + log(2), the affine jacobian
+
+        dist = self.to_dist(params_or_dist)
+        entropy = dist.base_dist.entropy() + math.log(2.)
+        return entropy.sum(dim = -1) if sum_action_dim else entropy
+
+    def log_prob(
+        self,
+        params_or_dist,
+        action,
+        sum_action_dim = True,
+        eps = None
+    ):
+        eps = default(eps, self.eps)
+        action = action.clamp(min = -1. + eps, max = 1. - eps)
+        dist = self.to_dist(params_or_dist)
+        log_prob = dist.log_prob(action)
+        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
+
+    def forward(self, params):
+        _, raw_conc = params.unbind(dim = -1)
+
+        # map (-1, 1) mean onto the unit interval
+
+        mean = self.mean(params)
+        m = (mean + 1.) / 2.
+
+        conc = self.concentration(raw_conc)
+
+        # keep the beta unimodal without changing its mean, detaching min_m to prevent 1/m^2 gradient explosion
+
+        min_m = torch.minimum(m, 1. - m).clamp(min = 1. / self.max_conc).detach()
+        conc = (conc + 1. / min_m).clamp(max = self.max_conc)
+
+        alpha = (m * conc).clamp(min = 1. + 1e-4)
+        beta = ((1. - m) * conc).clamp(min = 1. + 1e-4)
+
+        return TransformedDistribution(_Beta(alpha, beta), AffineTransform(loc = -1., scale = 2.))
+
 # main
 
 def main(
-    num_episodes = 1500,
+    num_episodes = 2000,
     max_timesteps = 500,
     num_episodes_before_learn = 8,
     learn_every_eps = 4,
@@ -74,18 +191,25 @@ def main(
     use_sigmoid = True,
     sigmoid_bias = 0.,
     use_euclidean = False,
+    use_quasimetric = False,
+    quasimetric_asym_weight = 1.,
+    quasimetric_gated = False,
     discount = 0.99,
     exploration_random_goal_prob = 0.05,
     exploration_sample_from_buffer_prob = 0.5,
     action_entropy_loss_weight = 0.005,
+    action_chunk_size = 1,
     save_checkpoint_every = 200,
     checkpoint_folder = './checkpoints-lunar-continuous',
     reward_json_path = './lunar_continuous_rewards.json',
+    replay_buffer_folder = None,
     cpu = False,
     seed = 0
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    replay_buffer_folder = default(replay_buffer_folder, f'./replay-lunar-continuous-chunk{action_chunk_size}')
 
     # folders
 
@@ -94,16 +218,17 @@ def main(
 
     # env
 
-    render_mode = 'rgb_array' if exists(render_every_eps) else None
+    record_video = exists(render_every_eps) and int(render_every_eps) > 0
+    render_mode = 'rgb_array' if record_video else None
 
     env = gym.make('LunarLander-v3', continuous = True, render_mode = render_mode)
 
-    if exists(render_every_eps):
+    if record_video:
         env = gym.wrappers.RecordVideo(
             env,
             video_folder = video_folder,
-            episode_trigger = lambda ep: divisible_by(ep, render_every_eps),
-            name_prefix = 'lunar-cont'
+            episode_trigger = lambda ep: divisible_by(ep, int(render_every_eps)),
+            name_prefix = f'lunar-cont-c{action_chunk_size}'
         )
 
     dim_state = 8
@@ -113,7 +238,7 @@ def main(
     # replay buffer
 
     replay_buffer = ReplayBuffer(
-        './replay-lunar-continuous',
+        replay_buffer_folder,
         max_episodes = buffer_size,
         max_timesteps = max_timesteps + 1,
         fields = dict(
@@ -127,32 +252,29 @@ def main(
 
     # models
 
-    actor_readout = Readout(
-        num_continuous = dim_action,
-        continuous_dist_type = 'gaussian',
-        continuous_squashed = True,
-        dim = 0
-    )
+    actor_distr = Beta()
 
     actor_encoder = MLP(
         dim_state + dim_goal,
         actor_dim,
         actor_dim,
-        dim_action * 2 # mu and log_var
+        action_chunk_size * dim_action * 2 # raw mean and raw conc for each action in chunk
     )
 
+    contrastive_embed_dim = dim_contrastive_embed + (1 if use_quasimetric and quasimetric_gated else 0)
+
     critic_encoder = MLP(
-        dim_state + dim_action,
+        dim_state + action_chunk_size * dim_action,
         critic_dim,
         critic_dim,
-        dim_contrastive_embed
+        contrastive_embed_dim
     )
 
     goal_encoder = MLP(
         dim_goal,
         goal_dim,
         goal_dim,
-        dim_contrastive_embed
+        contrastive_embed_dim
     )
 
     # contrastive learning module
@@ -162,13 +284,19 @@ def main(
             bias = sigmoid_bias,
             l2norm_embed = False,
             learned_scale = False,
-            use_euclidean = use_euclidean
+            use_euclidean = use_euclidean,
+            use_quasimetric = use_quasimetric,
+            quasimetric_asym_weight = quasimetric_asym_weight,
+            quasimetric_gated = quasimetric_gated
         )
     else:
         contrastive_learn = ContrastiveLearning(
             l2norm_embed = False,
             learned_temp = False,
-            use_euclidean = use_euclidean
+            use_euclidean = use_euclidean,
+            use_quasimetric = use_quasimetric,
+            quasimetric_asym_weight = quasimetric_asym_weight,
+            quasimetric_gated = quasimetric_gated
         )
 
     # trainers
@@ -182,6 +310,7 @@ def main(
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
         discount = discount,
+        action_chunk_size = action_chunk_size,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
@@ -210,19 +339,22 @@ def main(
     # action distribution helpers
 
     def to_dist_params(logits):
-        return rearrange(logits, '... (a d) -> ... a d', d = 2)
+        # rearrange and constitute the action chunk dimension - using c for chunk
+        return rearrange(logits, '... (c a d) -> ... c a d', c = action_chunk_size, a = dim_action, d = 2)
 
     def sample_fn(logits, differentiable = False):
-        return actor_readout.sample(to_dist_params(logits), differentiable = differentiable)
+        dist = actor_distr(to_dist_params(logits))
+        return dist.rsample() if differentiable else dist.sample()
 
     def entropy_fn(logits):
-        return actor_readout.entropy(to_dist_params(logits))
+        return actor_distr.entropy(to_dist_params(logits), sum_action_dim = False)
 
     # tracking
 
     rolling_reward = deque(maxlen = 100)
     all_rewards = []
     all_lengths = []
+    best_reward = float('-inf')
 
     for eps in range(num_episodes):
 
@@ -245,7 +377,7 @@ def main(
         states = []
         actions = []
 
-        for _ in range(max_timesteps):
+        while eps_steps < max_timesteps:
 
             actor_encoder.eval()
 
@@ -253,22 +385,39 @@ def main(
 
             action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
 
-            action = sample_fn(action_logits)
+            action_chunk = sample_fn(action_logits)
+            actions_to_exec = action_chunk.cpu().numpy()
 
-            next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
+            done = False
 
-            states.append(state)
-            actions.append(action.cpu().numpy())
+            for step_action in actions_to_exec:
+                next_state, reward, terminated, truncated, _ = env.step(step_action)
 
-            cum_reward += reward
-            eps_steps += 1
+                states.append(state)
+                actions.append(step_action)
 
-            done = truncated or terminated
+                cum_reward += reward
+                eps_steps += 1
+
+                done = truncated or terminated
+                state = next_state
+
+                if done or eps_steps >= max_timesteps:
+                    break
 
             if done:
                 break
 
-            state = next_state
+        if record_video and hasattr(env, 'recording') and env.recording:
+            env.stop_recording()
+
+        # rename recorded video to include cumulative reward in the filename
+
+        if record_video and hasattr(env, 'episode_id'):
+            old_vid = os.path.join(video_folder, f'lunar-cont-c{action_chunk_size}-episode-{env.episode_id}.mp4')
+            if os.path.exists(old_vid):
+                new_vid = os.path.join(video_folder, f'lunar-cont-c{action_chunk_size}-ep{eps + 1:04d}-rew{cum_reward:+.1f}.mp4')
+                os.rename(old_vid, new_vid)
 
         # store episode
 
@@ -317,6 +466,10 @@ def main(
 
         if divisible_by(eps + 1, 10) or (eps + 1) == 1:
             print(f'episode {eps + 1:4d} | reward: {cum_reward:6.1f} | avg reward (last 100): {avg_reward:6.1f} | steps: {eps_steps}')
+
+        if len(rolling_reward) >= 20 and avg_reward > best_reward:
+            best_reward = avg_reward
+            torch.save(actor_encoder.state_dict(), f'{checkpoint_folder}/actor-best.pt')
 
         if divisible_by(eps + 1, 50):
             with open(reward_json_path, 'w') as f:

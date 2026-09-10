@@ -142,13 +142,23 @@ wait until 3-5k steps at least
 ```
 
 ```bibtex
-@misc{osman2026selfsupervisedonpolicyreinforcementlearning,
-    title   = {Self-Supervised On-Policy Reinforcement Learning via Contrastive Proximal Policy Optimisation}, 
-    author  = {Asim Osman and Sasha Abramowitz and Mark Bergh and Ulrich Armel Mbou Sob and Ruan John de Kock and Omayma Mahjoub and Oussama Hidaoui and Noah De Nicola and Arnol Manuel Fokam and Felix Chalumeau and Daniel Rajaonarivonivelomanantsoa and Siddarth Singh and Refiloe Shabe and Juan Claude Formanek and Simon Verster Du Toit and Arnu Pretorius},
+@inproceedings{wang2023optimal,
+    title   = {Optimal Goal-Reaching Reinforcement Learning via Quasimetric Learning},
+    author  = {Tongzhou Wang and Antonio Torralba and Phillip Isola and Amy Zhang},
+    booktitle = {International Conference on Machine Learning (ICML)},
+    year    = {2023},
+    url     = {https://arxiv.org/abs/2304.01203}
+}
+```
+
+```bibtex
+@misc{korniak2026stepstimelearningrepresentations,
+    title   = {Three Steps at a Time: Learning Representations from Action Sequences in Contrastive RL},
+    author  = {Michal Korniak and Kamil Dybek and Benjamin Eysenbach and Marco Bagatella and Micha{\l} Bortkiewicz},
     year    = {2026},
-    eprint  = {2605.13554},
+    eprint  = {2608.30640},
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
-    url     = {https://arxiv.org/abs/2605.13554}, 
-    }
+    url     = {https://arxiv.org/abs/2608.30640}
+}
 ```
