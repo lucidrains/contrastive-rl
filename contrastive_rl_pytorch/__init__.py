@@ -6,7 +6,9 @@ from contrastive_rl_pytorch.contrastive_rl import (
     ActorTrainer,
     sample_random_state,
     sample_truncated_geometric,
-    sample_truncated_geometric_time
+    sample_truncated_geometric_time,
+    sample_discount,
+    default_discount_transform
 )
 
 __all__ = [
@@ -17,5 +19,7 @@ __all__ = [
     'ActorTrainer',
     'sample_random_state',
     'sample_truncated_geometric',
-    'sample_truncated_geometric_time'
+    'sample_truncated_geometric_time',
+    'sample_discount',
+    'default_discount_transform'
 ]

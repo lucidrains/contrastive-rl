@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from functools import partial
 from typing import Callable
@@ -12,7 +13,7 @@ from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
 
 from einops import einsum, rearrange, repeat
-from torch_einops_utils import z_score, lens_to_mask
+from torch_einops_utils import lens_to_mask, z_score
 
 from accelerate import Accelerator
 from tqdm import tqdm
@@ -58,6 +59,21 @@ def identity(t):
 
 def log(t, eps = 1e-20):
     return t.clamp(min = eps).log()
+
+def default_discount_transform(discount):
+    if not is_tensor(discount):
+        discount = tensor(discount)
+
+    if discount.ndim == 0:
+        discount = rearrange(discount, '-> 1 1')
+    elif discount.ndim == 1:
+        discount = rearrange(discount, 'b -> b 1')
+
+    return cat((
+        discount,
+        1. - discount,
+        -log(1. - discount)
+    ), dim = -1)
 
 def l2norm(t):
     return F.normalize(t, dim = -1)
@@ -152,6 +168,29 @@ def sample_truncated_geometric(
     return delta.clamp(min = 1).minimum(max_steps)
 
 sample_truncated_geometric_time = sample_truncated_geometric
+
+# sample discount
+
+def sample_discount(
+    discount: float | tuple[float, ...] | list[float] | Tensor = 0.99,
+    batch_size: int = 1,
+    *,
+    device: torch.device | None = None
+) -> Tensor:
+    if is_tensor(discount):
+        d = discount.to(device = device)
+        return rearrange(d, 'b -> b 1') if d.ndim == 1 else d
+
+    if isinstance(discount, (int, float)):
+        return torch.full((batch_size, 1), float(discount), device = device)
+
+    if len(discount) == 2 and isinstance(discount, tuple):
+        min_discount, max_discount = discount
+        return torch.empty((batch_size, 1), device = device).uniform_(min_discount, max_discount)
+
+    discount_tensor = tensor(discount, device = device, dtype = torch.float32)
+    indices = torch.randint(0, len(discount), (batch_size,), device = device)
+    return rearrange(discount_tensor[indices], 'b -> b 1')
 
 # contrastive wrapper module
 
@@ -249,12 +288,14 @@ class SigmoidContrastiveLearning(Module):
 
         sim = sim * self.scale + self.bias
 
+        batch, *_ = sim.shape
+
         if return_contrastive_score:
             return sim
 
         # labels
 
-        labels = torch.eye(sim.shape[0], device = sim.device)
+        labels = torch.eye(batch, device = sim.device)
 
         # binary cross entropy
 
@@ -287,13 +328,17 @@ class ContrastiveWrapper(Module):
         self,
         past,     # (b d)
         future,   # (b d)
-        past_action = None # (b na)
+        past_action = None, # (b na)
+        discount = None     # (b 1)
     ):
         if exists(past_action):
             if past_action.ndim > 2:
                 past_action = rearrange(past_action, 'b c ... -> b (c ...)')
 
             past = cat((past, past_action), dim = -1)
+
+        if exists(discount):
+            past = cat((past, discount), dim = -1)
 
         encoded_past = self.encode(past)
         encoded_future = self.encode_future(future)
@@ -316,7 +361,10 @@ class ContrastiveRLTrainer(Module):
         learning_rate = 3e-4,
         weight_decay = 0.,
         max_grad_norm = 0.5,
-        discount = 0.99,
+        discount: float | tuple[float, ...] | list[float] = 0.99,
+        discount_condition = False,
+        discount_transform: Callable = identity,
+        condition_on_discount = None,
         action_chunk_size = 1,
         contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
@@ -346,6 +394,8 @@ class ContrastiveRLTrainer(Module):
         self.repetition_factor = repetition_factor          # the in-trajectory repetition factor - basically having the network learn to distinguish negative features from within the same trajectory
         self.max_grad_norm = max_grad_norm
         self.discount = discount
+        self.discount_condition = default(condition_on_discount, discount_condition)
+        self.discount_transform = discount_transform
         self.action_chunk_size = action_chunk_size
 
         optimizer = AdamW(contrast_wrapper.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
@@ -459,7 +509,7 @@ class ContrastiveRLTrainer(Module):
             # get past times
 
             if traj_var_lens:
-                past_times = torch.rand((batch_size, 1), device = self.device).mul(traj_lens[:, None] - 1).floor().long()
+                past_times = torch.rand((batch_size, 1), device = self.device).mul(rearrange(traj_lens - 1, 'b -> b 1')).floor().long()
             else:
                 past_times = torch.randint(0, max_traj_len - 1, (batch_size, 1), device = self.device)
 
@@ -468,7 +518,14 @@ class ContrastiveRLTrainer(Module):
             # future times drawn from geometric distribution truncated to remaining length
 
             remainder_steps = clamp_traj_len - past_times
-            delta_times = sample_truncated_geometric(remainder_steps, self.discount)
+
+            discount = sample_discount(
+                self.discount,
+                batch_size,
+                device = self.device
+            )
+
+            delta_times = sample_truncated_geometric(remainder_steps, discount)
             future_times = past_times + delta_times
 
             # pick out the past and future observations as positive pairs
@@ -504,7 +561,9 @@ class ContrastiveRLTrainer(Module):
 
             # contrastive learning
 
-            loss = self.contrast_wrapper(past_obs, future_obs, past_action)
+            discount_cond = self.discount_transform(discount) if self.discount_condition else None
+
+            loss = self.contrast_wrapper(past_obs, future_obs, past_action, discount = discount_cond)
 
             loss_item = loss.item()
 
@@ -534,6 +593,10 @@ class ActorTrainer(Module):
         learning_rate = 3e-4,
         weight_decay = 0.,
         max_grad_norm = 0.5,
+        discount: float | tuple[float, ...] | list[float] = 0.99,
+        discount_condition = False,
+        discount_transform: Callable = identity,
+        condition_on_discount = None,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
         softmax_actor_output = False,
@@ -552,6 +615,9 @@ class ActorTrainer(Module):
         self.num_discrete_actions = num_discrete_actions
         self.normalize_q_values = normalize_q_values
         self.target_goal_prob = target_goal_prob
+        self.discount = discount
+        self.discount_condition = default(condition_on_discount, discount_condition)
+        self.discount_transform = discount_transform
 
         self.state_to_goal_fn = state_to_goal_fn
         self.state_to_actor_state_fn = state_to_actor_state_fn
@@ -601,7 +667,8 @@ class ActorTrainer(Module):
         sample_fn = None,
         entropy_fn = None,
         pbar = None,
-        target_goals = None
+        target_goals = None,
+        discount = None
     ):
         device = self.device
 
@@ -671,12 +738,36 @@ class ActorTrainer(Module):
                 mix_mask = rearrange(torch.rand(batch, device = device) < self.target_goal_prob, 'b -> b 1')
                 goal = torch.where(mix_mask, batch_target_goals, goal)
 
+            # maybe discount conditioning
+
+            batch_discount = None
+            if self.discount_condition:
+                raw_discount = default(
+                    discount,
+                    sample_discount(self.discount, batch, device = device)
+                )
+                if not is_tensor(raw_discount):
+                    raw_discount = torch.full((batch, 1), float(raw_discount), device = device)
+                elif raw_discount.ndim == 1:
+                    raw_discount = rearrange(raw_discount, 'b -> b 1')
+
+                discount_batch, *_ = raw_discount.shape
+
+                if discount_batch != batch:
+                    raw_discount = repeat(raw_discount, '1 ... -> b ...', b = batch)
+
+                batch_discount = self.discount_transform(raw_discount)
+
             # forward state and goal
 
             actor_state = self.state_to_actor_state_fn(state)
             actor_goal = self.state_to_goal_fn(goal)
 
-            action_logits = self.actor(cat((actor_state, actor_goal), dim = -1))
+            actor_input = [actor_state, actor_goal]
+            if exists(batch_discount):
+                actor_input.append(batch_discount)
+
+            action_logits = self.actor(cat(actor_input, dim = -1))
 
             if exists(self.num_discrete_actions):
                 num_actions = self.num_discrete_actions
@@ -690,7 +781,12 @@ class ActorTrainer(Module):
                     all_actions = repeat(all_actions, 'a na -> b a na', b = batch)
                     repeated_states = repeat(critic_state, 'b d -> b a d', a = num_actions)
 
-                    state_actions = cat((repeated_states, all_actions), dim = -1)
+                    critic_input = [repeated_states, all_actions]
+                    if exists(batch_discount):
+                        repeated_discount = repeat(batch_discount, 'b d -> b a d', a = num_actions)
+                        critic_input.append(repeated_discount)
+
+                    state_actions = cat(critic_input, dim = -1)
                     encoded_state_actions = encoder(rearrange(state_actions, 'b a d -> (b a) d'))
                     encoded_state_actions = rearrange(encoded_state_actions, '(b a) d -> b a d', a = num_actions)
 
@@ -729,7 +825,12 @@ class ActorTrainer(Module):
                     action = rearrange(action, 'b c ... -> b (c ...)')
 
                 critic_state = self.state_to_critic_state_fn(state)
-                encoded_state_action = encoder(cat((critic_state, action), dim = -1))
+
+                critic_input = [critic_state, action]
+                if exists(batch_discount):
+                    critic_input.append(batch_discount)
+
+                encoded_state_action = encoder(cat(critic_input, dim = -1))
 
                 with torch.no_grad():
                     encoded_goal = goal_encoder(actor_goal)

@@ -28,6 +28,8 @@ from tqdm import tqdm
 import gymnasium as gym
 from fire import Fire
 
+from einops import rearrange
+
 from memmap_replay_buffer import ReplayBuffer
 
 from contrastive_rl_pytorch import (
@@ -35,7 +37,8 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
-    sample_random_state
+    sample_random_state,
+    default_discount_transform
 )
 
 from x_mlps_pytorch import MLP
@@ -79,6 +82,10 @@ def main(
     sigmoid_bias = 0.,
     use_euclidean = False,
     discount = 0.99,
+    discount_condition = False,
+    discount_range = (0.85, 0.999),
+    rollout_discount = 0.99,
+    num_demo_episodes = 20,
     exploration_random_goal_prob = 0.05,
     exploration_sample_from_buffer_prob = 0.5,
     action_entropy_loss_weight = 0.01,
@@ -129,10 +136,38 @@ def main(
         overwrite = True
     )
 
+    # maybe seed replay buffer with demonstrations for quick convergence
+
+    if num_demo_episodes > 0:
+        from gymnasium.envs.box2d.lunar_lander import heuristic
+
+        for ep in range(num_demo_episodes):
+            s, _ = env.reset(seed = seed + 1000 + ep)
+            demo_states, demo_actions = [], []
+            while True:
+                a = heuristic(env.unwrapped, s)
+                if np.random.rand() < 0.05:
+                    a = np.random.randint(0, dim_action)
+                next_s, r, term, trunc, _ = env.step(a)
+                demo_states.append(s)
+                demo_actions.append(F.one_hot(tensor(a), num_classes = dim_action).float())
+                s = next_s
+                if term or trunc:
+                    break
+            if len(demo_states) >= 2:
+                replay_buffer.store_episode(
+                    state = demo_states,
+                    reward = [1.] * len(demo_states),
+                    action_hard_one_hot = demo_actions
+                )
+
     # models
 
+    dim_discount = 3 if discount_condition else 0
+    effective_discount = discount_range if discount_condition else discount
+
     actor_encoder = MLP(
-        dim_state + dim_goal,
+        dim_state + dim_goal + dim_discount,
         actor_dim,
         actor_dim,
         dim_action
@@ -141,7 +176,7 @@ def main(
     actor_readout = Readout(num_discrete = dim_action, dim = 0)
 
     critic_encoder = MLP(
-        dim_state + dim_action,
+        dim_state + dim_action + dim_discount,
         critic_dim,
         critic_dim,
         dim_contrastive_embed
@@ -180,7 +215,9 @@ def main(
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
-        discount = discount,
+        discount = effective_discount,
+        discount_condition = discount_condition,
+        discount_transform = default_discount_transform if discount_condition else (lambda t: t),
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
@@ -193,6 +230,9 @@ def main(
         learning_rate = actor_learning_rate,
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
+        discount = effective_discount,
+        discount_condition = discount_condition,
+        discount_transform = default_discount_transform if discount_condition else (lambda t: t),
         num_discrete_actions = dim_action,
         cpu = cpu,
         contrastive_learn = contrastive_learn,
@@ -206,6 +246,12 @@ def main(
     # landing pad target goal: at coordinates (0, 0), zero velocity/angle, and legs touching (1, 1)
 
     base_actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
+
+    # maybe discount conditioning embedding for rollout
+
+    discount_cond = None
+    if discount_condition:
+        discount_cond = rearrange(default_discount_transform(rollout_discount), '1 d -> d').to(device)
 
     # tracking
 
@@ -240,7 +286,11 @@ def main(
 
             curr_state = from_numpy(state).to(device)
 
-            action_logits = actor_encoder(cat((curr_state, eps_goal), dim = -1))
+            actor_inputs = [curr_state, eps_goal]
+            if exists(discount_cond):
+                actor_inputs.append(discount_cond)
+
+            action_logits = actor_encoder(cat(actor_inputs, dim = -1))
 
             action = actor_readout.sample(action_logits)
 

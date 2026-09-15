@@ -35,6 +35,65 @@ trainer(trajectories, 100)
 torch.save(encoder.state_dict(), './trained.pt')
 ```
 
+## discount conditioning (multi-horizon)
+
+You can condition both the critic and actor on discount factor $\gamma$ to learn across multiple timescales simultaneously (multi-horizon conditioning / Geometric Horizon Models).
+
+Following [Farebrother et al.](https://arxiv.org/abs/2602.19634), the discount is transformed into a 3-feature embedding $(\gamma, 1 - \gamma, -\log(1 - \gamma))$, where $-\log(1 - \gamma) = \log(H)$ provides linear sensitivity to the effective timescale $H = \frac{1}{1 - \gamma}$:
+
+```python
+import torch
+from contrastive_rl_pytorch import (
+    ContrastiveRLTrainer,
+    ActorTrainer,
+    default_discount_transform
+)
+from x_mlps_pytorch import MLP
+
+# critic and actor accept discount embedding (dim = 3)
+
+critic = MLP(16 + 4 + 3, 256, 128)
+goal_encoder = MLP(16, 256, 128)
+actor = MLP(16 + 16 + 3, 256, 4)
+
+# train across a continuum of horizons via uniform discount sampling
+
+critic_trainer = ContrastiveRLTrainer(
+    critic,
+    goal_encoder,
+    discount = (0.85, 0.999),
+    discount_condition = True,
+    discount_transform = default_discount_transform
+)
+
+actor_trainer = ActorTrainer(
+    actor,
+    critic,
+    goal_encoder,
+    discount = (0.85, 0.999),
+    discount_condition = True,
+    discount_transform = default_discount_transform,
+    num_discrete_actions = 4
+)
+
+trajectories = torch.randn(32, 100, 16)
+actions = torch.randn(32, 100, 4)
+
+critic_trainer(trajectories, 100, actions = actions)
+actor_trainer(trajectories, 100)
+
+# at inference, dynamically steer the policy with any desired horizon:
+
+state = torch.randn(1, 16)
+goal = torch.randn(1, 16)
+
+# far horizon (H ~ 1000): aggressive transit towards distant goals
+action_far = actor(torch.cat((state, goal, default_discount_transform(0.999)), dim = -1)).argmax(dim = -1)
+
+# short horizon (H ~ 7): gentle terminal settling and obstacle avoidance
+action_near = actor(torch.cat((state, goal, default_discount_transform(0.85)), dim = -1)).argmax(dim = -1)
+```
+
 ## quick test
 
 make sure `uv` is installed `pip install uv`
@@ -160,5 +219,14 @@ wait until 3-5k steps at least
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2608.30640}
+}
+```
+
+```bibtex
+@article{farebrother2026compositional,
+    title   = {Compositional Planning with Jumpy World Models},
+    author  = {Jesse Farebrother and Matteo Pirotta and Andrea Tirinzoni and Marc G. Bellemare and Alessandro Lazaric and Ahmed Touati},
+    journal = {arXiv preprint arXiv:2602.19634},
+    year    = {2026}
 }
 ```

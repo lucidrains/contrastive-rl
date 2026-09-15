@@ -285,3 +285,56 @@ def test_sample_truncated_geometric(discount, as_tensor):
     tensor_discount = torch.full_like(rem, discount, dtype = torch.float32)
     delta_tensor = sample_truncated_geometric(rem, tensor_discount)
     assert (delta_tensor >= 1).all() and (delta_tensor <= rem).all()
+
+def test_discount_conditioned_e2e():
+    from contrastive_rl_pytorch import (
+        ContrastiveRLTrainer,
+        ActorTrainer,
+        default_discount_transform
+    )
+    from x_mlps_pytorch import MLP
+
+    dim_state = 8
+    dim_goal = 8
+    dim_action = 4
+    dim_discount = 3
+
+    critic = MLP(dim_state + dim_action + dim_discount, 64, 32)
+    goal_encoder = MLP(dim_goal, 64, 32)
+    actor = MLP(dim_state + dim_goal + dim_discount, 64, dim_action)
+
+    critic_trainer = ContrastiveRLTrainer(
+        critic,
+        goal_encoder,
+        discount = (0.85, 0.999),
+        discount_condition = True,
+        discount_transform = default_discount_transform,
+        cpu = True
+    )
+
+    actor_trainer = ActorTrainer(
+        actor,
+        critic,
+        goal_encoder,
+        discount = (0.85, 0.999),
+        discount_condition = True,
+        discount_transform = default_discount_transform,
+        num_discrete_actions = dim_action,
+        cpu = True
+    )
+
+    trajectories = torch.randn(16, 32, dim_state)
+    actions = torch.randn(16, 32, dim_action)
+
+    c_loss = critic_trainer(trajectories, 2, actions = actions, pbar = False)
+    a_loss = actor_trainer(trajectories, 2, target_goals = torch.randn(dim_goal), pbar = False)
+
+    assert isinstance(c_loss, float) and not torch.tensor(c_loss).isnan()
+    assert isinstance(a_loss, float) and not torch.tensor(a_loss).isnan()
+
+    state = torch.randn(1, dim_state)
+    goal = torch.randn(1, dim_goal)
+    discount = default_discount_transform(0.999)
+
+    action = actor(torch.cat((state, goal, discount), dim = -1)).argmax(dim = -1)
+    assert action.shape == (1,)
