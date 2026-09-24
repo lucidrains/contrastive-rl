@@ -3,7 +3,7 @@
 #   "contrastive-rl-pytorch",
 #   "fire",
 #   "gymnasium[box2d]",
-#   "mean-conc-beta>=0.2.0",
+#   "mean-conc-beta>=0.2.1",
 #   "memmap-replay-buffer>=0.0.10",
 #   "x-mlps-pytorch>=0.6.1",
 #   "einops"
@@ -72,6 +72,7 @@ def main(
     critic_depth = 4,
     goal_dim = 256,
     goal_depth = 4,
+    num_streams = 1,
     use_rmsnorm = True,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
@@ -84,7 +85,10 @@ def main(
     exploration_sample_from_buffer_prob = 0.5,
     action_entropy_loss_weight = 0.005,
     action_chunk_size = 1,
-    beta_max_unimodal_floor = 20.,
+    beta_pos_fn = 'softplus',
+    beta_max_unimodal_floor = 50.,
+    beta_squash_fn = 'leaky_tanh',
+    beta_detach_entropy_mean = True,
     save_checkpoint_every = 200,
     checkpoint_folder = './checkpoints-lunar-continuous',
     reward_json_path = './lunar_continuous_rewards.json',
@@ -139,7 +143,10 @@ def main(
     # models
 
     actor_distr = Beta(
-        max_unimodal_floor = beta_max_unimodal_floor
+        pos_fn = beta_pos_fn,
+        max_unimodal_floor = beta_max_unimodal_floor,
+        squash_fn = beta_squash_fn,
+        detach_entropy_mean = beta_detach_entropy_mean
     )
 
     actor_encoder = AttnResidualNormedMLP(
@@ -147,7 +154,8 @@ def main(
         dim = actor_dim,
         depth = actor_depth,
         dim_out = action_chunk_size * dim_action * 2, # raw mean and raw conc for each action in chunk
-        use_rmsnorm = use_rmsnorm
+        use_rmsnorm = use_rmsnorm,
+        num_streams = num_streams
     )
 
     contrastive_embed_dim = dim_contrastive_embed
@@ -157,7 +165,8 @@ def main(
         dim = critic_dim,
         depth = critic_depth,
         dim_out = contrastive_embed_dim,
-        use_rmsnorm = use_rmsnorm
+        use_rmsnorm = use_rmsnorm,
+        num_streams = num_streams
     )
 
     goal_encoder = AttnResidualNormedMLP(
@@ -165,7 +174,8 @@ def main(
         dim = goal_dim,
         depth = goal_depth,
         dim_out = contrastive_embed_dim,
-        use_rmsnorm = use_rmsnorm
+        use_rmsnorm = use_rmsnorm,
+        num_streams = num_streams
     )
 
     # contrastive learning module
