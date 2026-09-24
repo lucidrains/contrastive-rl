@@ -198,7 +198,7 @@ class ContrastiveLearning(Module):
     def __init__(
         self,
         l2norm_embed = True,
-        learned_temp = True,
+        learned_temp = False,
         use_euclidean = False
     ):
         super().__init__()

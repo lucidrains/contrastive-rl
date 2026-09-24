@@ -6,7 +6,7 @@
 #   "fire",
 #   "gymnasium[mujoco,other]",
 #   "memmap-replay-buffer>=0.0.10",
-#   "x-mlps-pytorch>=0.3.0",
+#   "x-mlps-pytorch>=0.6.1",
 #   "hl-gauss-pytorch"
 # ]
 # ///
@@ -124,7 +124,8 @@ def main(
     hl_gauss_sigma: float = 0.05,
     actor_dist_type: str = 'beta',
     mlp_depth: int = 4,
-    use_attn_residual_mlp: bool = False,
+    use_attn_residual_mlp: bool = True,
+    use_rmsnorm: bool = True,
     use_wandb: bool = False,
     cpu: bool = False,
     resume: bool = False,
@@ -192,7 +193,7 @@ def main(
 
     # models
 
-    MLP = AttnResidualNormedMLP if use_attn_residual_mlp else partial(ResidualNormedMLP, residual_every = 2, keel_post_ln = True)
+    MLP = partial(AttnResidualNormedMLP, use_rmsnorm = use_rmsnorm) if use_attn_residual_mlp else partial(ResidualNormedMLP, residual_every = 2, keel_post_ln = True)
 
     actor_encoder = nn.Sequential(
         MLP(

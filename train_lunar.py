@@ -5,7 +5,7 @@
 #   "fire",
 #   "gymnasium[box2d]",
 #   "memmap-replay-buffer>=0.0.10",
-#   "x-mlps-pytorch>=0.3.0",
+#   "x-mlps-pytorch>=0.6.1",
 #   "tqdm",
 #   "einops"
 # ]
@@ -41,7 +41,7 @@ from contrastive_rl_pytorch import (
     default_discount_transform
 )
 
-from x_mlps_pytorch import MLP
+from x_mlps_pytorch import AttnResidualNormedMLP
 from discrete_continuous_embed_readout import Readout
 
 # functions
@@ -73,8 +73,12 @@ def main(
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
     actor_dim = 256,
+    actor_depth = 4,
     critic_dim = 256,
+    critic_depth = 4,
     goal_dim = 256,
+    goal_depth = 4,
+    use_rmsnorm = True,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
     repetition_factor = 1,
@@ -166,27 +170,30 @@ def main(
     dim_discount = 3 if discount_condition else 0
     effective_discount = discount_range if discount_condition else discount
 
-    actor_encoder = MLP(
-        dim_state + dim_goal + dim_discount,
-        actor_dim,
-        actor_dim,
-        dim_action
+    actor_encoder = AttnResidualNormedMLP(
+        dim_in = dim_state + dim_goal + dim_discount,
+        dim = actor_dim,
+        depth = actor_depth,
+        dim_out = dim_action,
+        use_rmsnorm = use_rmsnorm
     )
 
     actor_readout = Readout(num_discrete = dim_action, dim = 0)
 
-    critic_encoder = MLP(
-        dim_state + dim_action + dim_discount,
-        critic_dim,
-        critic_dim,
-        dim_contrastive_embed
+    critic_encoder = AttnResidualNormedMLP(
+        dim_in = dim_state + dim_action + dim_discount,
+        dim = critic_dim,
+        depth = critic_depth,
+        dim_out = dim_contrastive_embed,
+        use_rmsnorm = use_rmsnorm
     )
 
-    goal_encoder = MLP(
-        dim_goal,
-        goal_dim,
-        goal_dim,
-        dim_contrastive_embed
+    goal_encoder = AttnResidualNormedMLP(
+        dim_in = dim_goal,
+        dim = goal_dim,
+        depth = goal_depth,
+        dim_out = dim_contrastive_embed,
+        use_rmsnorm = use_rmsnorm
     )
 
     # contrastive learning module

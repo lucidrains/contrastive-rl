@@ -109,9 +109,9 @@ def test_train_policy(use_sigmoid):
 def test_readme():
     import torch
     from contrastive_rl_pytorch import ContrastiveRLTrainer
-    from x_mlps_pytorch import ResidualNormedMLP
+    from x_mlps_pytorch import AttnResidualNormedMLP
 
-    encoder = ResidualNormedMLP(dim = 256, dim_in = 16, dim_out = 128, keel_post_ln = True)
+    encoder = AttnResidualNormedMLP(dim = 256, dim_in = 16, dim_out = 128, depth = 4, use_rmsnorm = True)
 
     trainer = ContrastiveRLTrainer(encoder)
 

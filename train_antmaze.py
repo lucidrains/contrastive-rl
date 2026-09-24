@@ -8,7 +8,7 @@
 #   "gymnasium[other]",
 #   "hl-gauss-pytorch>=0.1.2",
 #   "memmap-replay-buffer>=0.0.10",
-#   "x-mlps-pytorch>=0.3.0",
+#   "x-mlps-pytorch>=0.6.1",
 #   "tqdm"
 # ]
 # ///
@@ -130,6 +130,7 @@ def main(
     cl_l2norm_embed = True,
     exploration_random_goal_prob = 0.1,
     use_attn_residual_mlp = True,
+    use_rmsnorm = True,
     env_name = 'AntMaze_UMaze-v5',
     use_wandb = False,
     cpu = False,
@@ -205,7 +206,7 @@ def main(
     env_device = accelerator.device
 
     if use_attn_residual_mlp:
-        MLP = AttnResidualNormedMLP
+        MLP = partial(AttnResidualNormedMLP, use_rmsnorm = use_rmsnorm)
     else:
         MLP = partial(ResidualNormedMLP, residual_every = 4, keel_post_ln = True)
 

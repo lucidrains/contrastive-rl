@@ -3,8 +3,9 @@
 #   "contrastive-rl-pytorch",
 #   "fire",
 #   "gymnasium[box2d]",
+#   "mean-conc-beta>=0.2.0",
 #   "memmap-replay-buffer>=0.0.10",
-#   "x-mlps-pytorch>=0.3.0",
+#   "x-mlps-pytorch>=0.6.1",
 #   "einops"
 # ]
 # ///
@@ -16,13 +17,8 @@ os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 import json
 from collections import deque
 
-import math
 import torch
 from torch import from_numpy, cat, tensor
-from torch.nn import Module
-import torch.nn.functional as F
-from torch.distributions import Distribution, Beta as _Beta, TransformedDistribution
-from torch.distributions.transforms import AffineTransform
 
 import numpy as np
 import gymnasium as gym
@@ -39,7 +35,8 @@ from contrastive_rl_pytorch import (
     sample_random_state
 )
 
-from x_mlps_pytorch import MLP
+from x_mlps_pytorch import AttnResidualNormedMLP
+from mean_conc_beta import Beta
 
 # functions
 
@@ -51,119 +48,6 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
-
-# action distributions
-
-class ActionDistr(Module):
-    def to_dist(self, params_or_dist):
-        return params_or_dist if isinstance(params_or_dist, Distribution) else self(params_or_dist)
-
-    def entropy(
-        self,
-        params_or_dist,
-        sum_action_dim = True
-    ):
-        dist = self.to_dist(params_or_dist)
-        entropy = dist.entropy()
-        return entropy.sum(dim = -1) if sum_action_dim else entropy
-
-    def log_prob(
-        self,
-        params_or_dist,
-        action,
-        sum_action_dim = True
-    ):
-        dist = self.to_dist(params_or_dist)
-        log_prob = dist.log_prob(action)
-        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
-
-# beta distribution policy - unimodal mean-concentration reparameterization on (-1, 1),
-# an affine shift of a unit-interval beta (y = 2x - 1)
-
-class Beta(ActionDistr):
-    def __init__(
-        self,
-        pos_fn = 'softplus',
-        init_conc = 10.,
-        min_conc = 0.,
-        max_conc = 1000.,
-        eps = 1e-5
-    ):
-        super().__init__()
-        assert pos_fn in ('exp', 'softplus')
-        assert init_conc > min_conc, 'init_conc must be greater than min_conc (the concentration floor)'
-        assert max_conc > init_conc
-
-        self.pos_fn = pos_fn
-        self.init_conc = init_conc
-        self.min_conc = min_conc
-        self.max_conc = max_conc
-        self.eps = eps
-
-        # raw offset into the positive fn so the concentration at raw_conc = 0 is exactly init_conc
-
-        self.raw_init_conc = math.log(math.expm1(init_conc - min_conc)) if pos_fn == 'softplus' else math.log(init_conc - min_conc)
-
-    def concentration(
-        self,
-        raw_conc
-    ):
-        if self.pos_fn == 'softplus':
-            return F.softplus(raw_conc + self.raw_init_conc) + self.min_conc
-        elif self.pos_fn == 'exp':
-            return (raw_conc + self.raw_init_conc).exp() + self.min_conc
-
-    def mean(
-        self,
-        params
-    ):
-        raw_mean, _ = params.unbind(dim = -1)
-        eps = max(self.eps, 2. / self.max_conc)
-        return raw_mean.tanh().clamp(min = -1. + eps, max = 1. - eps)
-
-    def entropy(
-        self,
-        params_or_dist,
-        sum_action_dim = True
-    ):
-        # shifted beta entropy = base entropy + log(2), the affine jacobian
-
-        dist = self.to_dist(params_or_dist)
-        entropy = dist.base_dist.entropy() + math.log(2.)
-        return entropy.sum(dim = -1) if sum_action_dim else entropy
-
-    def log_prob(
-        self,
-        params_or_dist,
-        action,
-        sum_action_dim = True,
-        eps = None
-    ):
-        eps = default(eps, self.eps)
-        action = action.clamp(min = -1. + eps, max = 1. - eps)
-        dist = self.to_dist(params_or_dist)
-        log_prob = dist.log_prob(action)
-        return log_prob.sum(dim = -1) if sum_action_dim else log_prob
-
-    def forward(self, params):
-        _, raw_conc = params.unbind(dim = -1)
-
-        # map (-1, 1) mean onto the unit interval
-
-        mean = self.mean(params)
-        m = (mean + 1.) / 2.
-
-        conc = self.concentration(raw_conc)
-
-        # keep the beta unimodal without changing its mean, detaching min_m to prevent 1/m^2 gradient explosion
-
-        min_m = torch.minimum(m, 1. - m).clamp(min = 1. / self.max_conc).detach()
-        conc = (conc + 1. / min_m).clamp(max = self.max_conc)
-
-        alpha = (m * conc).clamp(min = 1. + 1e-4)
-        beta = ((1. - m) * conc).clamp(min = 1. + 1e-4)
-
-        return TransformedDistribution(_Beta(alpha, beta), AffineTransform(loc = -1., scale = 2.))
 
 # main
 
@@ -183,8 +67,12 @@ def main(
     critic_learning_rate = 3e-4,
     actor_learning_rate = 3e-4,
     actor_dim = 256,
+    actor_depth = 4,
     critic_dim = 256,
+    critic_depth = 4,
     goal_dim = 256,
+    goal_depth = 4,
+    use_rmsnorm = True,
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
     repetition_factor = 1,
@@ -196,6 +84,7 @@ def main(
     exploration_sample_from_buffer_prob = 0.5,
     action_entropy_loss_weight = 0.005,
     action_chunk_size = 1,
+    beta_max_unimodal_floor = 20.,
     save_checkpoint_every = 200,
     checkpoint_folder = './checkpoints-lunar-continuous',
     reward_json_path = './lunar_continuous_rewards.json',
@@ -249,29 +138,34 @@ def main(
 
     # models
 
-    actor_distr = Beta()
+    actor_distr = Beta(
+        max_unimodal_floor = beta_max_unimodal_floor
+    )
 
-    actor_encoder = MLP(
-        dim_state + dim_goal,
-        actor_dim,
-        actor_dim,
-        action_chunk_size * dim_action * 2 # raw mean and raw conc for each action in chunk
+    actor_encoder = AttnResidualNormedMLP(
+        dim_in = dim_state + dim_goal,
+        dim = actor_dim,
+        depth = actor_depth,
+        dim_out = action_chunk_size * dim_action * 2, # raw mean and raw conc for each action in chunk
+        use_rmsnorm = use_rmsnorm
     )
 
     contrastive_embed_dim = dim_contrastive_embed
 
-    critic_encoder = MLP(
-        dim_state + action_chunk_size * dim_action,
-        critic_dim,
-        critic_dim,
-        contrastive_embed_dim
+    critic_encoder = AttnResidualNormedMLP(
+        dim_in = dim_state + action_chunk_size * dim_action,
+        dim = critic_dim,
+        depth = critic_depth,
+        dim_out = contrastive_embed_dim,
+        use_rmsnorm = use_rmsnorm
     )
 
-    goal_encoder = MLP(
-        dim_goal,
-        goal_dim,
-        goal_dim,
-        contrastive_embed_dim
+    goal_encoder = AttnResidualNormedMLP(
+        dim_in = dim_goal,
+        dim = goal_dim,
+        depth = goal_depth,
+        dim_out = contrastive_embed_dim,
+        use_rmsnorm = use_rmsnorm
     )
 
     # contrastive learning module
