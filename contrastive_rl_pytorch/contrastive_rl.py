@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from copy import deepcopy
 from functools import partial
 from typing import Callable
@@ -114,14 +113,15 @@ def sample_random_state(
     exploration_sample_from_buffer_prob = 0.5,
 ):
     if replay_buffer.num_episodes > 0 and torch.rand(()) < exploration_sample_from_buffer_prob:
-        # sample from buffer
+        # sample from buffer, masking out the padding past each episode length
 
-        all_states = replay_buffer.get_all_data(fields = ['state'])['state']
-        states = rearrange(all_states, '... d -> (...) d')
+        data = replay_buffer.get_all_data(fields = ['state'], meta_fields = ['episode_lens'])
+        states, lens = data['state'], data['episode_lens']
 
-        num_states = states.shape[0]
-        rand_id = torch.randint(0, num_states, (1,), device = states.device)
+        mask = lens_to_mask(lens, max_len = states.shape[-2])
+        states = states[mask]
 
+        rand_id = torch.randint(states.shape[0], (1,), device = states.device)
         random_state = states[rand_id]
 
         return rearrange(random_state, '1 d -> d')
@@ -472,10 +472,10 @@ class ContrastiveRLTrainer(Module):
 
         if pbar is False:
             pbar = partial(tqdm, disable = True)
-        elif not exists(pbar):
-            pbar = tqdm
-
-        pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
+            pbar_instance = pbar(range(num_train_steps))
+        else:
+            pbar = default(pbar, tqdm)
+            pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
 
         for _ in pbar_instance:
 
@@ -608,7 +608,8 @@ class ActorTrainer(Module):
         state_to_critic_state_fn: Callable = identity,
         num_discrete_actions: int | None = None,
         normalize_q_values = True,
-        target_goal_prob = 0.5
+        target_goal_prob = 0.5,
+        action_adapter = None
     ):
         super().__init__()
 
@@ -632,6 +633,11 @@ class ActorTrainer(Module):
         self.actor = actor
 
         self.softmax_actor_output = softmax_actor_output
+
+        assert not (exists(action_adapter) and exists(num_discrete_actions)), 'action adapter is used in place of the discrete action branch'
+        assert not (exists(action_adapter) and softmax_actor_output), 'action adapter is used in place of softmax_actor_output'
+
+        self.action_adapter = action_adapter
 
         if not exists(contrastive_learn):
             contrastive_learn = ContrastiveLearning()
@@ -671,6 +677,12 @@ class ActorTrainer(Module):
         discount = None
     ):
         device = self.device
+
+        # action adapter handles the mapping from raw actor outputs to what the critic consumes
+
+        if exists(self.action_adapter):
+            sample_fn = default(sample_fn, self.action_adapter.to_critic)
+            entropy_fn = default(entropy_fn, self.action_adapter.entropy)
 
         # setup models
 
@@ -720,10 +732,10 @@ class ActorTrainer(Module):
 
         if pbar is False:
             pbar = partial(tqdm, disable = True)
-        elif not exists(pbar):
-            pbar = tqdm
-
-        pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
+            pbar_instance = pbar(range(num_train_steps))
+        else:
+            pbar = default(pbar, tqdm)
+            pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
 
         for _ in pbar_instance:
 
@@ -845,7 +857,9 @@ class ActorTrainer(Module):
 
                 if self.action_entropy_loss_weight > 0. and exists(entropy_fn):
                     entropy = entropy_fn(action_logits)
-                    loss = loss - entropy.mean() * self.action_entropy_loss_weight
+
+                    if exists(entropy):
+                        loss = loss - entropy.mean() * self.action_entropy_loss_weight
 
             self.accelerator.backward(loss)
 

@@ -82,8 +82,7 @@ def test_traditional_crl(use_sigmoid):
 
 @param('use_sigmoid', (False, True))
 def test_train_policy(use_sigmoid):
-    import torch.nn.functional as F
-    from contrastive_rl_pytorch import ContrastiveRLTrainer, ActorTrainer, ContrastiveLearning, SigmoidContrastiveLearning
+    from contrastive_rl_pytorch import ActorTrainer, ContrastiveLearning, SigmoidContrastiveLearning
 
     from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
 
@@ -255,6 +254,23 @@ def test_euclidean_discrete_actor_trainer(use_sigmoid):
 
     loss = actor_trainer(trajectories, 2, target_goals = target_goals, pbar = False)
     assert isinstance(loss, float) and not torch.tensor(loss).isnan()
+
+def test_sample_random_state_ignores_padding():
+    from contrastive_rl_pytorch.contrastive_rl import sample_random_state
+
+    class FakeBuffer:
+        num_episodes = 2
+
+        def get_all_data(self, fields = None, meta_fields = None):
+            return dict(
+                state = torch.tensor([[[1., 2.], [3., 4.]], [[5., 6.], [0., 0.]]]),
+                episode_lens = torch.tensor([2, 1])
+            )
+
+    for _ in range(64):
+        state = sample_random_state(FakeBuffer(), None, 1.)
+        assert state.shape == (2,)
+        assert not torch.allclose(state, torch.zeros(2))
 
 @param('discount', (0.9, 0.99, 1.0))
 @param('as_tensor', (False, True))

@@ -18,12 +18,11 @@ import json
 from collections import deque
 
 import torch
-from torch import from_numpy, cat, tensor
+from torch import from_numpy, tensor
 
 import numpy as np
 import gymnasium as gym
 from fire import Fire
-from einops import rearrange
 
 from memmap_replay_buffer import ReplayBuffer
 
@@ -32,6 +31,7 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
+    MeanConcBetaActionAdapter,
     sample_random_state
 )
 
@@ -80,11 +80,14 @@ def main(
     use_sigmoid = True,
     sigmoid_bias = 0.,
     use_euclidean = False,
+    action_repr = 'sampled',   # 'sampled' | 'raw_params' | 'transformed' - condition the critic on the mean-conc-beta action distribution parameters
     discount = 0.99,
     exploration_random_goal_prob = 0.05,
     exploration_sample_from_buffer_prob = 0.5,
     action_entropy_loss_weight = 0.005,
     action_chunk_size = 1,
+    action_distr = None,               # supply any callable module mapping raw params to a torch distribution, e.g. mean-conc-beta
+    action_param_dim = 2,
     beta_pos_fn = 'softplus',
     beta_max_unimodal_floor = 50.,
     beta_squash_fn = 'leaky_tanh',
@@ -125,6 +128,26 @@ def main(
     dim_goal = 8
     dim_action = 2
 
+    assert action_repr == 'sampled' or action_chunk_size == 1, 'conditioning the critic on action distribution parameters is only supported for action_chunk_size = 1'
+
+    # action adapter - maps raw actor outputs to the action representation the critic consumes
+
+    if not exists(action_distr):
+        action_distr = Beta(
+            pos_fn = beta_pos_fn,
+            max_unimodal_floor = beta_max_unimodal_floor,
+            squash_fn = beta_squash_fn,
+            detach_entropy_mean = beta_detach_entropy_mean
+        )
+
+    action_adapter = MeanConcBetaActionAdapter(
+        action_distr,
+        dim_action = dim_action,
+        action_repr = action_repr,
+        chunk_size = action_chunk_size,
+        param_dim = action_param_dim
+    )
+
     # replay buffer
 
     replay_buffer = ReplayBuffer(
@@ -134,7 +157,7 @@ def main(
         fields = dict(
             state = ('float', dim_state),
             reward = ('float', 1),
-            action = ('float', dim_action)
+            action = ('float', action_adapter.dim)
         ),
         circular = True,
         overwrite = True
@@ -142,18 +165,11 @@ def main(
 
     # models
 
-    actor_distr = Beta(
-        pos_fn = beta_pos_fn,
-        max_unimodal_floor = beta_max_unimodal_floor,
-        squash_fn = beta_squash_fn,
-        detach_entropy_mean = beta_detach_entropy_mean
-    )
-
     actor_encoder = AttnResidualNormedMLP(
         dim_in = dim_state + dim_goal,
         dim = actor_dim,
         depth = actor_depth,
-        dim_out = action_chunk_size * dim_action * 2, # raw mean and raw conc for each action in chunk
+        dim_out = action_adapter.actor_dim,
         use_rmsnorm = use_rmsnorm,
         num_streams = num_streams
     )
@@ -161,7 +177,7 @@ def main(
     contrastive_embed_dim = dim_contrastive_embed
 
     critic_encoder = AttnResidualNormedMLP(
-        dim_in = dim_state + action_chunk_size * dim_action,
+        dim_in = dim_state + action_adapter.dim,
         dim = critic_dim,
         depth = critic_depth,
         dim_out = contrastive_embed_dim,
@@ -222,7 +238,8 @@ def main(
         contrastive_learn = contrastive_learn,
         action_entropy_loss_weight = action_entropy_loss_weight,
         normalize_q_values = True,
-        target_goal_prob = 0.5
+        target_goal_prob = 0.5,
+        action_adapter = action_adapter
     )
 
     device = actor_trainer.device
@@ -230,19 +247,6 @@ def main(
     # landing pad target goal: at coordinates (0, 0), zero velocity/angle, and legs touching (1, 1)
 
     base_actor_goal = tensor([0., 0., 0., 0., 0., 0., 1., 1.], device = device)
-
-    # action distribution helpers
-
-    def to_dist_params(logits):
-        # rearrange and constitute the action chunk dimension - using c for chunk
-        return rearrange(logits, '... (c a d) -> ... c a d', c = action_chunk_size, a = dim_action, d = 2)
-
-    def sample_fn(logits, differentiable = False):
-        dist = actor_distr(to_dist_params(logits))
-        return dist.rsample() if differentiable else dist.sample()
-
-    def entropy_fn(logits):
-        return actor_distr.entropy(to_dist_params(logits), sum_action_dim = False)
 
     # tracking
 
@@ -281,7 +285,8 @@ def main(
 
             with torch.no_grad():
                 action_logits = actor_encoder(torch.cat((actor_state, eps_goal), dim = -1))
-                action_chunk = sample_fn(action_logits, differentiable = False)
+                action_chunk = action_adapter.sample(action_logits)
+                action_stored = action_adapter.to_critic(action_logits) if action_repr != 'sampled' else None
 
             action_chunk = action_chunk.cpu().numpy()
 
@@ -296,7 +301,7 @@ def main(
                 eps_steps += 1
 
                 states.append(state)
-                actions.append(action)
+                actions.append(action if action_repr == 'sampled' else action_stored.detach().cpu())
 
                 state = next_state
 
@@ -340,7 +345,7 @@ def main(
             trajectories = data['state']
             episode_lens = data['episode_lens']
 
-            cl_loss = critic_trainer(
+            critic_trainer(
                 trajectories,
                 cl_train_steps,
                 lens = episode_lens,
@@ -348,12 +353,10 @@ def main(
                 pbar = False
             )
 
-            actor_loss = actor_trainer(
+            actor_trainer(
                 trajectories,
                 actor_num_train_steps,
                 lens = episode_lens,
-                sample_fn = lambda logits: sample_fn(logits, differentiable = True),
-                entropy_fn = entropy_fn,
                 target_goals = base_actor_goal,
                 pbar = False
             )

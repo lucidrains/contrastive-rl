@@ -1,5 +1,4 @@
 import torch
-from torch import nn
 from torch.nn import Module
 import torch.nn.functional as F
 from torch.autograd import Function
@@ -7,7 +6,6 @@ from torch.autograd import Function
 import torch.distributed as dist
 
 import einx
-from einops import rearrange, pack, unpack
 
 def exists(val):
     return val is not None
@@ -42,7 +40,7 @@ def has_only_one_value(t):
     return (t == t[0]).all()
 
 def all_gather_variable_dim(t, dim = 0, sizes = None):
-    device, rank, world_size = t.device, dist.get_rank(), dist.get_world_size()
+    device = t.device
 
     if not exists(sizes):
         sizes = gather_sizes(t, dim = dim)

@@ -230,3 +230,15 @@ wait until 3-5k steps at least
     year    = {2026}
 }
 ```
+
+```bibtex
+@inproceedings{he2026distributions,
+    title   = {Distributions as Actions: A Unified Framework for Diverse Action Spaces},
+    author  = {Jiamin He and A. Rupam Mahmood and Martha White},
+    booktitle = {International Conference on Learning Representations (ICLR)},
+    year    = {2026},
+    eprint  = {2506.16608},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG}
+}
+```
