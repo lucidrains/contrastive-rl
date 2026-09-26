@@ -101,6 +101,14 @@ make sure `uv` is installed `pip install uv`
 then
 
 ```shell
+$ uv run train_cartpole.py --critic_action_repr softmax_probs
+```
+
+categorical actions, with the critic conditioned on the softmax probabilities, solve cartpole within a few dozen episodes
+
+for a harder continuous control example
+
+```shell
 $ uv run train_lunar.py --cpu
 ```
 

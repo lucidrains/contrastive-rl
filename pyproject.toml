@@ -1,6 +1,6 @@
 [project]
 name = "contrastive-rl-pytorch"
-version = "0.5.2"
+version = "0.5.3"
 description = "Contrastive RL"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -65,12 +65,20 @@ dev-dependencies = []
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["contrastive_rl"]
+packages = ["contrastive_rl_pytorch"]
+exclude = [
+    "contrastive_rl_pytorch/cqn.py",
+    "contrastive_rl_pytorch/coarse_to_fine.py",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "contrastive_rl",
+    "contrastive_rl_pytorch",
     "README.md",
     "LICENSE",
     "pyproject.toml",
+]
+exclude = [
+    "contrastive_rl_pytorch/cqn.py",
+    "contrastive_rl_pytorch/coarse_to_fine.py",
 ]
