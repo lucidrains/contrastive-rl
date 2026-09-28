@@ -365,7 +365,7 @@ class ContrastiveRLTrainer(Module):
         discount_condition = False,
         discount_transform: Callable = identity,
         condition_on_discount = None,
-        action_chunk_size = 1,
+        action_chunk_size = 1,   # action sequences as representations - https://arxiv.org/abs/2608.30640
         contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),

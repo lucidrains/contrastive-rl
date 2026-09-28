@@ -2,6 +2,7 @@
 # dependencies = [
 #   "contrastive-rl-pytorch",
 #   "discrete-continuous-embed-readout",
+#   "env-ssl-wrapper>=0.4.7",
 #   "fire",
 #   "gymnasium[classic-control]",
 #   "memmap-replay-buffer>=0.0.10",
@@ -17,16 +18,20 @@ import os
 from collections import deque
 
 import torch
-from torch import from_numpy, cat, tensor
+from torch import nn, from_numpy, cat, tensor
 import torch.nn.functional as F
 
 import numpy as np
 
 import gymnasium as gym
 
+from einops.layers.torch import Rearrange
+
 from fire import Fire
 
 from memmap_replay_buffer import ReplayBuffer
+
+from env_ssl_wrapper import ActionChunkWrapper
 
 from contrastive_rl_pytorch import (
     ContrastiveRLTrainer,
@@ -83,6 +88,7 @@ def main(
     learned_temp = False,
     use_euclidean = False,
     critic_action_repr = None,   # None | 'raw_logits' | 'softmax_probs' - condition the critic on the action distribution parameters
+    chunk_len = 1,               # number of actions executed per environment step - https://arxiv.org/abs/2608.30640
     discount = 0.99,
     target_goal_prob = 0.5,
     early_stop_reward = 475.0,
@@ -108,22 +114,30 @@ def main(
 
     # env
 
-    env = gym.make('CartPole-v1')
+    env = ActionChunkWrapper(gym.make('CartPole-v1'), chunk_len = chunk_len)
 
     dim_state = 4
     dim_goal = 4
     dim_action = 2
 
+    max_chunks = (max_timesteps + chunk_len - 1) // chunk_len
+
     # action adapter - condition the critic on the categorical distribution parameters, as proposed in
     # https://arxiv.org/abs/2506.16608 - He et al., distributions as actions
 
+    use_action_adapter = exists(critic_action_repr) or chunk_len > 1
+
     action_adapter = None
-    if exists(critic_action_repr):
-        action_adapter = CategoricalActionAdapter(dim_action, action_repr = critic_action_repr)
+    if use_action_adapter:
+        action_adapter = CategoricalActionAdapter(
+            dim_action,
+            action_repr = default(critic_action_repr, 'softmax_probs')
+        )
 
     # replay buffer
 
     action_field = 'action_repr' if exists(action_adapter) else 'action_hard_one_hot'
+    dim_action_field = dim_action * chunk_len if exists(action_adapter) else dim_action
 
     replay_buffer = ReplayBuffer(
         replay_buffer_folder,
@@ -132,8 +146,8 @@ def main(
         fields = dict(
             state = ('float', dim_state),
             reward = ('float', 1),
-            action_hard_one_hot = ('float', dim_action),
-            action_repr = ('float', dim_action)
+            action_hard_one_hot = ('float', dim_action_field),
+            action_repr = ('float', dim_action_field)
         ),
         circular = True,
         overwrite = True
@@ -141,20 +155,25 @@ def main(
 
     # models
 
-    actor_encoder = AttnResidualNormedMLP(
+    actor_net = AttnResidualNormedMLP(
         dim_in = dim_state + dim_goal,
         dim = actor_dim,
         depth = actor_depth,
-        dim_out = dim_action,
+        dim_out = dim_action_field,
         use_rmsnorm = use_rmsnorm
     )
+
+    actor_encoder = nn.Sequential(
+        actor_net,
+        Rearrange('... (c a) -> ... c a', c = chunk_len, a = dim_action)
+    ) if chunk_len > 1 else actor_net
 
     actor_readout = Readout(num_discrete = dim_action, dim = 0)
 
     contrastive_embed_dim = dim_contrastive_embed
 
     critic_encoder = AttnResidualNormedMLP(
-        dim_in = dim_state + dim_action,
+        dim_in = dim_state + dim_action_field,
         dim = critic_dim,
         depth = critic_depth,
         dim_out = contrastive_embed_dim,
@@ -195,7 +214,7 @@ def main(
         weight_decay = weight_decay,
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
-        discount = discount,
+        discount = discount ** chunk_len,
         cpu = cpu,
         contrastive_learn = contrastive_learn
     )
@@ -256,7 +275,7 @@ def main(
         states = []
         actions_stored = []
 
-        for _ in range(max_timesteps):
+        for _ in range(max_chunks):
 
             actor_encoder.eval()
 
@@ -269,12 +288,14 @@ def main(
             action_stored = action_adapter.to_critic(action_logits) if exists(action_adapter) \
                 else F.one_hot(action.long(), num_classes = dim_action).float()
 
-            next_state, reward, terminated, truncated, _ = env.step(action.cpu().numpy())
+            action_chunk = action.reshape(1, chunk_len).cpu().numpy()
+
+            next_state, reward, terminated, truncated, _ = env.step(action_chunk)
 
             states.append(state)
-            actions_stored.append(action_stored.detach().cpu())
+            actions_stored.append(action_stored.detach().cpu().flatten())
 
-            cum_reward += reward
+            cum_reward += float(np.sum(reward))
             eps_steps += 1
 
             done = truncated or terminated
@@ -332,12 +353,13 @@ def main(
             for _ in range(num_eval_episodes):
                 eval_s, _ = env.reset()
                 eval_tot = 0.0
-                for _ in range(max_timesteps):
+                for _ in range(max_chunks):
                     eval_st = from_numpy(eval_s).to(device)
                     eval_logits = actor_encoder(cat((eval_st, base_actor_goal), dim = -1))
-                    eval_act = eval_logits.argmax(dim = -1).cpu().numpy()
-                    eval_s, eval_r, eval_term, eval_trunc, _ = env.step(eval_act)
-                    eval_tot += eval_r
+                    eval_act = eval_logits.argmax(dim = -1)
+                    eval_chunk = eval_act.reshape(1, chunk_len).cpu().numpy()
+                    eval_s, eval_r, eval_term, eval_trunc, _ = env.step(eval_chunk)
+                    eval_tot += float(np.sum(eval_r))
                     if eval_term or eval_trunc:
                         break
                 eval_scores.append(eval_tot)
