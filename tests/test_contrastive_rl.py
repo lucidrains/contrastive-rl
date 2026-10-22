@@ -42,27 +42,38 @@ def test_contrast_wrapper():
 @param('var_traj_len', (False, True))
 @param('repetition_factor', (1, 2))
 @param('use_sigmoid', (False, True))
+@param('state_rotation', (False, True))
 def test_contrast_trainer(
     var_traj_len,
     repetition_factor,
-    use_sigmoid
+    use_sigmoid,
+    state_rotation
 ):
     from contrastive_rl_pytorch.contrastive_rl import ContrastiveRLTrainer, ContrastiveLearning, SigmoidContrastiveLearning
     from x_mlps_pytorch import MLP
 
     encoder = MLP(16, 256, 128)
+    goal_encoder = MLP(16, 256, 128) if state_rotation else None
 
     if use_sigmoid:
         contrastive_learn = SigmoidContrastiveLearning()
     else:
         contrastive_learn = ContrastiveLearning()
 
+    state_contrastive_learn = ContrastiveLearning(rotation_dim = 128) if state_rotation else None
+
     trainer = ContrastiveRLTrainer(
         encoder,
+        goal_encoder,
         cpu = True,
         repetition_factor = repetition_factor,
-        contrastive_learn = contrastive_learn
+        contrastive_learn = contrastive_learn,
+        state_contrastive_learn = state_contrastive_learn
     )
+
+    contrast_wrapper = trainer.unwrapped_contrast_wrapper
+    if state_rotation:
+        assert contrast_wrapper.encode_future is goal_encoder
 
     trajectories = torch.randn(256, 512, 16)
 
@@ -365,3 +376,29 @@ def test_discount_conditioned_e2e():
 
     action = actor(torch.cat((state, goal, discount), dim = -1)).argmax(dim = -1)
     assert action.shape == (1,)
+
+def test_hyperspherical_contrastive():
+    from torch_einops_utils.shape import shape
+    from x_mlps_pytorch import MLP
+
+    from contrastive_rl_pytorch import ContrastiveLearning, ContrastiveWrapper
+
+    dim, batch = 16, 10
+
+    state_learn = ContrastiveLearning(rotation_dim = dim)
+    wrapper = ContrastiveWrapper(
+        MLP(dim + 2, 64, dim),
+        ContrastiveLearning(),
+        future_encoder = MLP(dim, 64, dim),
+        state_contrastive_learn = state_learn,
+        state_loss_weight = 2.
+    )
+
+    loss = wrapper(torch.randn(batch, dim), torch.randn(batch, dim), torch.randn(batch, 2))
+    loss.backward()
+
+    rotation = state_learn.rotation.detach()  # d d
+    d, = shape(rotation, '[d] _')
+
+    assert torch.allclose(rotation.T @ rotation, torch.eye(d), atol = 1e-5)
+    assert exists(state_learn.rotation_param.grad)

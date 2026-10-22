@@ -87,6 +87,8 @@ def main(
     learned_scale = False,
     learned_temp = False,
     use_euclidean = False,
+    state_rotation = False,
+    state_loss_weight = 1.,
     critic_action_repr = None,   # None | 'raw_logits' | 'softmax_probs' - condition the critic on the action distribution parameters
     chunk_len = 1,               # number of actions executed per environment step - https://arxiv.org/abs/2608.30640
     discount = 0.99,
@@ -190,6 +192,8 @@ def main(
 
     # contrastive learning module
 
+    cl_l2norm_embed = cl_l2norm_embed or state_rotation
+
     if use_sigmoid_contrastive_learning:
         contrastive_learn = SigmoidContrastiveLearning(
             bias = sigmoid_bias,
@@ -204,6 +208,12 @@ def main(
             use_euclidean = use_euclidean
         )
 
+    state_contrastive_learn = ContrastiveLearning(
+        l2norm_embed = True,
+        scale = 10.,
+        rotation_dim = contrastive_embed_dim
+    ) if state_rotation else None
+
     # trainer
 
     critic_trainer = ContrastiveRLTrainer(
@@ -216,7 +226,9 @@ def main(
         repetition_factor = repetition_factor,
         discount = discount ** chunk_len,
         cpu = cpu,
-        contrastive_learn = contrastive_learn
+        contrastive_learn = contrastive_learn,
+        state_contrastive_learn = state_contrastive_learn,
+        state_loss_weight = state_loss_weight
     )
 
     actor_trainer = ActorTrainer(

@@ -13,6 +13,8 @@ from torch.utils.data import TensorDataset, DataLoader
 
 from einops import einsum, rearrange, repeat
 from torch_einops_utils import lens_to_mask, z_score
+from torch_einops_utils.device import fallback_from
+from torch_einops_utils.shape import shape
 
 from accelerate import Accelerator
 from tqdm import tqdm
@@ -192,6 +194,13 @@ def sample_discount(
     indices = torch.randint(0, len(discount), (batch_size,), device = device)
     return rearrange(discount_tensor[indices], 'b -> b 1')
 
+# cayley transform -> orthogonal rotation matrix, offloading to cpu when on mps
+
+@fallback_from('mps')
+def cayley_rotation(a, eye):
+    omega = a - a.T
+    return torch.linalg.solve(eye + omega, eye - omega)
+
 # contrastive wrapper module
 
 class ContrastiveLearning(Module):
@@ -201,16 +210,22 @@ class ContrastiveLearning(Module):
         learned_temp = False,
         use_euclidean = False,
         symmetric = True,
-        lse_reg_weight = 0.
+        lse_reg_weight = 0.,
+        rotation_dim: int | None = None,
+        scale = 1.
     ):
         super().__init__()
 
         assert not (symmetric and lse_reg_weight > 0.), 'lse_reg_weight requires symmetric = False'
+        assert not (exists(rotation_dim) and (use_euclidean or not l2norm_embed)), 'rotation requires l2norm and cosine similarity'
 
         self.l2norm_embed = l2norm_embed
         self.use_euclidean = use_euclidean
         self.symmetric = symmetric
         self.lse_reg_weight = lse_reg_weight
+        self.scale_value = scale
+        self.rotation_param = Parameter(torch.zeros(rotation_dim, rotation_dim)) if exists(rotation_dim) else None
+        self.register_buffer('eye', torch.eye(rotation_dim) if exists(rotation_dim) else None, persistent = False)
 
         self.learned_log_temp = None
         if learned_temp:
@@ -218,7 +233,11 @@ class ContrastiveLearning(Module):
 
     @property
     def scale(self):
-        return self.learned_log_temp.exp() if exists(self.learned_log_temp) else 1.
+        return self.learned_log_temp.exp() if exists(self.learned_log_temp) else self.scale_value
+
+    @property
+    def rotation(self):
+        return cayley_rotation(self.rotation_param, self.eye)  # cayley -> orthogonal R
 
     def forward(
         self,
@@ -228,6 +247,9 @@ class ContrastiveLearning(Module):
     ):
         if self.l2norm_embed:
             embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+
+        if exists(self.rotation_param) and not (self.use_euclidean or return_contrastive_score):
+            embeds2 = einsum(self.rotation, embeds2, 'i j, ... j -> ... i')  # psi(s)^T R psi(s+)
 
         sim = calc_similarity(
             embeds1,
@@ -316,14 +338,20 @@ class ContrastiveWrapper(Module):
         self,
         encoder: Module,
         contrastive_learn: Module,
-        future_encoder: Module | None = None
+        future_encoder: Module | None = None,
+        state_contrastive_learn: Module | None = None,
+        state_loss_weight = 1.
     ):
         super().__init__()
+
+        assert not (exists(state_contrastive_learn) and not exists(future_encoder)), 'state contrastive learning requires a state-only future encoder'
 
         self.encode = encoder
         self.encode_future = default(future_encoder, encoder)
 
         self.contrastive_learn = contrastive_learn
+        self.state_contrastive_learn = state_contrastive_learn
+        self.state_loss_weight = state_loss_weight
         self.all_gather = AllGather()
 
     @property
@@ -337,6 +365,8 @@ class ContrastiveWrapper(Module):
         past_action = None, # (b na)
         discount = None     # (b 1)
     ):
+        state = past  # raw state for psi(s), before action / discount concat
+
         if exists(past_action):
             if past_action.ndim > 2:
                 past_action = rearrange(past_action, 'b c ... -> b (c ...)')
@@ -348,12 +378,19 @@ class ContrastiveWrapper(Module):
 
         encoded_past = self.encode(past)
         encoded_future = self.encode_future(future)
+        encoded_state = self.encode_future(state) if exists(self.state_contrastive_learn) else None
 
         if is_distributed():
             encoded_past, _ = self.all_gather(encoded_past)
             encoded_future, _ = self.all_gather(encoded_future)
+            encoded_state = self.all_gather(encoded_state)[0] if exists(encoded_state) else None
 
-        return self.contrastive_learn(encoded_past, encoded_future)
+        loss = self.contrastive_learn(encoded_past, encoded_future)
+
+        if exists(self.state_contrastive_learn):
+            loss = loss + self.state_loss_weight * self.state_contrastive_learn(encoded_state, encoded_future)
+
+        return loss
 
 # contrastive RL trainer
 
@@ -377,7 +414,9 @@ class ContrastiveRLTrainer(Module):
         accelerate_kwargs: dict = dict(),
         cpu = False,
         state_to_goal_fn: Callable = identity,
-        state_to_critic_state_fn: Callable = identity
+        state_to_critic_state_fn: Callable = identity,
+        state_contrastive_learn: Module | None = None,
+        state_loss_weight = 1.
     ):
         super().__init__()
 
@@ -392,7 +431,9 @@ class ContrastiveRLTrainer(Module):
         contrast_wrapper = ContrastiveWrapper(
             encoder = encoder,
             future_encoder = future_encoder,
-            contrastive_learn = contrastive_learn
+            contrastive_learn = contrastive_learn,
+            state_contrastive_learn = state_contrastive_learn,
+            state_loss_weight = state_loss_weight
         )
 
         assert divisible_by(batch_size, repetition_factor)

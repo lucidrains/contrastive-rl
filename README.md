@@ -250,3 +250,15 @@ wait until 3-5k steps at least
     primaryClass = {cs.LG}
 }
 ```
+
+```bibtex
+@misc{park2026hyperspherical,
+    title   = {Hyperspherical Contrastive Representations Unlock Planning and Exploration},
+    author  = {Jonghae Park and Sungil Son and Jonghun Shin and Junseo Lee and H. Jin Kim and Benjamin Eysenbach},
+    year    = {2026},
+    eprint  = {2610.20409},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2610.20409}
+}
+```
