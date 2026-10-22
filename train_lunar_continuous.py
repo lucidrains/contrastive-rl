@@ -77,9 +77,11 @@ def main(
     weight_decay = 1e-4,
     max_grad_norm = 0.5,
     repetition_factor = 1,
-    use_sigmoid = True,
+    use_sigmoid = False,
     sigmoid_bias = 0.,
-    use_euclidean = False,
+    use_euclidean = True,
+    symmetric = False,
+    lse_reg_weight = 0.1,
     action_repr = 'sampled',   # 'sampled' | 'raw_params' | 'transformed' - condition the critic on the mean-conc-beta action distribution parameters
     discount = 0.99,
     exploration_random_goal_prob = 0.05,
@@ -101,6 +103,8 @@ def main(
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    assert not (use_sigmoid and lse_reg_weight > 0.), 'lse_reg_weight requires infonce'
 
     replay_buffer_folder = default(replay_buffer_folder, f'./replay-lunar-continuous-chunk{action_chunk_size}')
 
@@ -128,7 +132,8 @@ def main(
     dim_goal = 8
     dim_action = 2
 
-    assert action_repr == 'sampled' or action_chunk_size == 1, 'conditioning the critic on action distribution parameters is only supported for action_chunk_size = 1'
+    assert action_repr == 'sampled' or action_chunk_size == 1, \
+        'critic action-distribution conditioning is only supported for chunk size 1'
 
     # action adapter - maps raw actor outputs to the action representation the critic consumes
 
@@ -148,7 +153,9 @@ def main(
         param_dim = action_param_dim
     )
 
-    # replay buffer
+    # replay buffer - always stores per-step actions, the critic trainer assembles the chunk
+
+    stored_action_dim = dim_action if action_repr == 'sampled' else action_adapter.dim
 
     replay_buffer = ReplayBuffer(
         replay_buffer_folder,
@@ -157,7 +164,7 @@ def main(
         fields = dict(
             state = ('float', dim_state),
             reward = ('float', 1),
-            action = ('float', action_adapter.dim)
+            action = ('float', stored_action_dim)
         ),
         circular = True,
         overwrite = True
@@ -174,13 +181,11 @@ def main(
         num_streams = num_streams
     )
 
-    contrastive_embed_dim = dim_contrastive_embed
-
     critic_encoder = AttnResidualNormedMLP(
         dim_in = dim_state + action_adapter.dim,
         dim = critic_dim,
         depth = critic_depth,
-        dim_out = contrastive_embed_dim,
+        dim_out = dim_contrastive_embed,
         use_rmsnorm = use_rmsnorm,
         num_streams = num_streams
     )
@@ -189,7 +194,7 @@ def main(
         dim_in = dim_goal,
         dim = goal_dim,
         depth = goal_depth,
-        dim_out = contrastive_embed_dim,
+        dim_out = dim_contrastive_embed,
         use_rmsnorm = use_rmsnorm,
         num_streams = num_streams
     )
@@ -207,7 +212,9 @@ def main(
         contrastive_learn = ContrastiveLearning(
             l2norm_embed = False,
             learned_temp = False,
-            use_euclidean = use_euclidean
+            use_euclidean = use_euclidean,
+            symmetric = symmetric,
+            lse_reg_weight = lse_reg_weight
         )
 
     # trainers
@@ -285,14 +292,15 @@ def main(
 
             with torch.no_grad():
                 action_logits = actor_encoder(torch.cat((actor_state, eps_goal), dim = -1))
-                action_chunk = action_adapter.sample(action_logits)
-                action_stored = action_adapter.to_critic(action_logits) if action_repr != 'sampled' else None
+                action_chunk = action_adapter.sample(action_logits).cpu().numpy()
 
-            action_chunk = action_chunk.cpu().numpy()
+                action_stored = None
+                if action_repr != 'sampled':
+                    action_stored = action_adapter.to_critic(action_logits).detach().cpu().numpy()
 
-            for a in range(action_chunk_size):
-                action = action_chunk[a]
+            # open loop - execute the whole predicted chunk before replanning
 
+            for action in action_chunk:
                 next_state, reward, terminated, truncated, _ = env.step(action)
 
                 done = terminated or truncated
@@ -301,7 +309,7 @@ def main(
                 eps_steps += 1
 
                 states.append(state)
-                actions.append(action if action_repr == 'sampled' else action_stored.detach().cpu())
+                actions.append(action if action_repr == 'sampled' else action_stored)
 
                 state = next_state
 

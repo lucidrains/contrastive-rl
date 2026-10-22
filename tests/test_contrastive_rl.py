@@ -14,6 +14,17 @@ def test_contrast_loss():
     loss = contrastive_learn(embeds1, embeds2)
     assert loss.numel() == 1
 
+def test_contrast_loss_lse_reg():
+    from contrastive_rl_pytorch.contrastive_rl import ContrastiveLearning
+
+    with pytest.raises(AssertionError):
+        ContrastiveLearning(symmetric = True, lse_reg_weight = 0.01)
+
+    learn = ContrastiveLearning(symmetric = False, lse_reg_weight = 0.01)
+    loss = learn(torch.randn(10, 128), torch.randn(10, 128))
+
+    assert loss.numel() == 1
+
 def test_contrast_wrapper():
     from contrastive_rl_pytorch.contrastive_rl import ContrastiveWrapper, ContrastiveLearning
 

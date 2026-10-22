@@ -293,7 +293,7 @@ def main(
             next_state, reward, terminated, truncated, _ = env.step(action_chunk)
 
             states.append(state)
-            actions_stored.append(action_stored.detach().cpu().flatten())
+            actions_stored.append(action_stored.detach().cpu().flatten().numpy())
 
             cum_reward += float(np.sum(reward))
             eps_steps += 1

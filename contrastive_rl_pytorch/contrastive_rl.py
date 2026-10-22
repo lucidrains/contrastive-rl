@@ -199,11 +199,18 @@ class ContrastiveLearning(Module):
         self,
         l2norm_embed = True,
         learned_temp = False,
-        use_euclidean = False
+        use_euclidean = False,
+        symmetric = True,
+        lse_reg_weight = 0.
     ):
         super().__init__()
+
+        assert not (symmetric and lse_reg_weight > 0.), 'lse_reg_weight requires symmetric = False'
+
         self.l2norm_embed = l2norm_embed
         self.use_euclidean = use_euclidean
+        self.symmetric = symmetric
+        self.lse_reg_weight = lse_reg_weight
 
         self.learned_log_temp = None
         if learned_temp:
@@ -238,14 +245,13 @@ class ContrastiveLearning(Module):
 
         labels = arange_from_tensor_dim(embeds1, dim = 0)
 
-        # transpose
+        loss = F.cross_entropy(sim, labels)
 
-        sim_transpose = rearrange(sim, 'i j -> j i')
+        if self.symmetric:
+            loss = (loss + F.cross_entropy(rearrange(sim, 'i j -> j i'), labels)) * 0.5
 
-        loss = (
-            F.cross_entropy(sim, labels) +
-            F.cross_entropy(sim_transpose, labels)
-        ) * 0.5
+        if self.lse_reg_weight > 0.:
+            loss = loss + self.lse_reg_weight * sim.logsumexp(dim = -1).square().mean()
 
         return loss
 
