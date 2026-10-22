@@ -17,6 +17,8 @@ from contrastive_rl_pytorch.action_distr import (
     MeanConcBetaActionAdapter
 )
 
+from contrastive_rl_pytorch.temporal_distance import TemporalDistanceLearning
+
 __all__ = [
     'ContrastiveLearning',
     'SigmoidContrastiveLearning',
@@ -26,6 +28,7 @@ __all__ = [
     'ActionAdapter',
     'CategoricalActionAdapter',
     'MeanConcBetaActionAdapter',
+    'TemporalDistanceLearning',
     'sample_random_state',
     'sample_truncated_geometric',
     'sample_truncated_geometric_time',

@@ -37,6 +37,7 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
+    TemporalDistanceLearning,
     sample_random_state,
     default_discount_transform
 )
@@ -65,6 +66,7 @@ def main(
     buffer_size = 512,
     video_folder = './recordings',
     render_every_eps = 150,
+    replay_buffer_folder = './replay-lunar-discrete',
     dim_contrastive_embed = 64,
     cl_train_steps = 100,
     cl_batch_size = 64,
@@ -85,7 +87,9 @@ def main(
     use_sigmoid = True,
     sigmoid_bias = 0.,
     use_euclidean = False,
+    temporal_distance_regularization = False,
     discount = 0.99,
+    goal_discount = None,
     discount_condition = False,
     discount_range = (0.85, 0.999),
     rollout_discount = 0.99,
@@ -109,11 +113,12 @@ def main(
 
     # env
 
-    render_mode = 'rgb_array' if exists(render_every_eps) else None
+    should_render = exists(render_every_eps) and render_every_eps > 0
+    render_mode = 'rgb_array' if should_render else None
 
     env = gym.make('LunarLander-v3', render_mode = render_mode)
 
-    if exists(render_every_eps):
+    if should_render:
         env = gym.wrappers.RecordVideo(
             env,
             video_folder = video_folder,
@@ -128,7 +133,7 @@ def main(
     # replay buffer
 
     replay_buffer = ReplayBuffer(
-        './replay-lunar-discrete',
+        replay_buffer_folder,
         max_episodes = buffer_size,
         max_timesteps = max_timesteps + 1,
         fields = dict(
@@ -198,7 +203,9 @@ def main(
 
     # contrastive learning module
 
-    if use_sigmoid:
+    if temporal_distance_regularization:
+        contrastive_learn = TemporalDistanceLearning()
+    elif use_sigmoid:
         contrastive_learn = SigmoidContrastiveLearning(
             bias = sigmoid_bias,
             l2norm_embed = False,
@@ -223,6 +230,7 @@ def main(
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
         discount = effective_discount,
+        goal_discount = goal_discount,
         discount_condition = discount_condition,
         discount_transform = default_discount_transform if discount_condition else (lambda t: t),
         cpu = cpu,

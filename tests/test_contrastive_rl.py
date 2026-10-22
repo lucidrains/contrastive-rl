@@ -79,6 +79,52 @@ def test_contrast_trainer(
 
     trainer(trajectories, 2, lens = torch.randint(256, 512, (256,)) if var_traj_len else None)
 
+@param('var_traj_len', (False, True))
+@param('repetition_factor', (1, 2))
+@param('goal_discount', (None, 0.95))
+def test_temporal_distance_critic(var_traj_len, repetition_factor, goal_discount):
+    from contrastive_rl_pytorch import ActorTrainer, ContrastiveRLTrainer, TemporalDistanceLearning
+    from x_mlps_pytorch import MLP
+
+    dim_state, dim_goal, dim_action, dim_embed = 16, 16, 2, 64
+
+    encoder = MLP(dim_state + dim_action, 64, dim_embed)
+    goal_encoder = MLP(dim_goal, 64, dim_embed)
+    actor = MLP(dim_state + dim_goal, 64, dim_action)
+
+    contrastive_learn = TemporalDistanceLearning()
+
+    critic_trainer = ContrastiveRLTrainer(
+        encoder,
+        goal_encoder,
+        batch_size = 32,
+        repetition_factor = repetition_factor,
+        discount = 0.999,
+        goal_discount = goal_discount,
+        cpu = True,
+        contrastive_learn = contrastive_learn
+    )
+
+    trajectories = torch.randn(32, 64, dim_state)
+    actions = torch.nn.functional.one_hot(torch.randint(0, dim_action, (32, 64)), dim_action)
+    lens = torch.randint(32, 64, (32,)) if var_traj_len else None
+
+    critic_loss = critic_trainer(trajectories, 2, lens = lens, actions = actions, pbar = False)
+    assert torch.isfinite(torch.tensor(critic_loss))
+
+    actor_trainer = ActorTrainer(
+        actor,
+        encoder,
+        goal_encoder,
+        batch_size = 16,
+        num_discrete_actions = dim_action,
+        cpu = True,
+        contrastive_learn = contrastive_learn
+    )
+
+    actor_loss = actor_trainer(trajectories, 2, lens = lens, target_goals = torch.zeros(dim_goal), pbar = False)
+    assert torch.isfinite(torch.tensor(actor_loss))
+
 @param('use_sigmoid', (False, True))
 def test_traditional_crl(use_sigmoid):
     import torch.nn.functional as F

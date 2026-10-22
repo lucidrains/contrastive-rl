@@ -94,6 +94,10 @@ action_far = actor(torch.cat((state, goal, default_discount_transform(0.999)), d
 action_near = actor(torch.cat((state, goal, default_discount_transform(0.85)), dim = -1)).argmax(dim = -1)
 ```
 
+## temporal distance regularization
+
+`TemporalDistanceLearning` is a drop-in contrastive critic that adds `L_time` and `L_sep` from [ChronoSRL](https://arxiv.org/abs/2609.36238) to a distance-parameterized sigmoid critic. Set `goal_discount` separately from `discount` so goals are sampled on one horizon while distances are scaled by another.
+
 ## quick test
 
 make sure `uv` is installed `pip install uv`
@@ -260,5 +264,17 @@ wait until 3-5k steps at least
     archivePrefix = {arXiv},
     primaryClass = {cs.LG},
     url     = {https://arxiv.org/abs/2610.20409}
+}
+```
+
+```bibtex
+@misc{bohlinger2026chronosrl,
+    title   = {ChronoSRL: Temporal Geometry for Self-Supervised Reinforcement Learning},
+    author  = {Nico Bohlinger and Jan Peters},
+    year    = {2026},
+    eprint  = {2609.36238},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2609.36238}
 }
 ```

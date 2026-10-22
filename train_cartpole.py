@@ -38,6 +38,7 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
+    TemporalDistanceLearning,
     CategoricalActionAdapter,
     sample_random_state
 )
@@ -83,6 +84,7 @@ def main(
     repetition_factor = 1,
     use_sigmoid_contrastive_learning = True,
     sigmoid_bias = 0.,
+    temporal_distance_regularization = False,
     cl_l2norm_embed = False,
     learned_scale = False,
     learned_temp = False,
@@ -92,6 +94,7 @@ def main(
     critic_action_repr = None,   # None | 'raw_logits' | 'softmax_probs' - condition the critic on the action distribution parameters
     chunk_len = 1,               # number of actions executed per environment step - https://arxiv.org/abs/2608.30640
     discount = 0.99,
+    goal_discount = None,
     target_goal_prob = 0.5,
     early_stop_reward = 475.0,
     temperature_init = 1.0,
@@ -194,7 +197,9 @@ def main(
 
     cl_l2norm_embed = cl_l2norm_embed or state_rotation
 
-    if use_sigmoid_contrastive_learning:
+    if temporal_distance_regularization:
+        contrastive_learn = TemporalDistanceLearning()
+    elif use_sigmoid_contrastive_learning:
         contrastive_learn = SigmoidContrastiveLearning(
             bias = sigmoid_bias,
             l2norm_embed = cl_l2norm_embed,
@@ -225,6 +230,7 @@ def main(
         max_grad_norm = max_grad_norm,
         repetition_factor = repetition_factor,
         discount = discount ** chunk_len,
+        goal_discount = (goal_discount ** chunk_len) if exists(goal_discount) else None,
         cpu = cpu,
         contrastive_learn = contrastive_learn,
         state_contrastive_learn = state_contrastive_learn,

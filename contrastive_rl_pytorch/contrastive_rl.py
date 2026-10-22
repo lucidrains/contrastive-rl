@@ -363,7 +363,9 @@ class ContrastiveWrapper(Module):
         past,     # (b d)
         future,   # (b d)
         past_action = None, # (b na)
-        discount = None     # (b 1)
+        discount = None,    # (b 1)
+        delta_times = None, # (b 1)
+        raw_discount = None # (b 1)
     ):
         state = past  # raw state for psi(s), before action / discount concat
 
@@ -385,7 +387,16 @@ class ContrastiveWrapper(Module):
             encoded_future, _ = self.all_gather(encoded_future)
             encoded_state = self.all_gather(encoded_state)[0] if exists(encoded_state) else None
 
-        loss = self.contrastive_learn(encoded_past, encoded_future)
+        if getattr(self.contrastive_learn, 'accepts_temporal_targets', False):
+            loss = self.contrastive_learn(
+                encoded_past,
+                encoded_future,
+                delta_times = delta_times,
+                raw_discount = raw_discount,
+                goal_states = future
+            )
+        else:
+            loss = self.contrastive_learn(encoded_past, encoded_future)
 
         if exists(self.state_contrastive_learn):
             loss = loss + self.state_loss_weight * self.state_contrastive_learn(encoded_state, encoded_future)
@@ -405,6 +416,7 @@ class ContrastiveRLTrainer(Module):
         weight_decay = 0.,
         max_grad_norm = 0.5,
         discount: float | tuple[float, ...] | list[float] = 0.99,
+        goal_discount: float | tuple[float, ...] | list[float] | None = None,
         discount_condition = False,
         discount_transform: Callable = identity,
         condition_on_discount = None,
@@ -441,6 +453,7 @@ class ContrastiveRLTrainer(Module):
         self.repetition_factor = repetition_factor          # the in-trajectory repetition factor - basically having the network learn to distinguish negative features from within the same trajectory
         self.max_grad_norm = max_grad_norm
         self.discount = discount
+        self.goal_discount = default(goal_discount, discount)
         self.discount_condition = default(condition_on_discount, discount_condition)
         self.discount_transform = discount_transform
         self.action_chunk_size = action_chunk_size
@@ -572,7 +585,13 @@ class ContrastiveRLTrainer(Module):
                 device = self.device
             )
 
-            delta_times = sample_truncated_geometric(remainder_steps, discount)
+            goal_discount = sample_discount(
+                self.goal_discount,
+                batch_size,
+                device = self.device
+            )
+
+            delta_times = sample_truncated_geometric(remainder_steps, goal_discount)
             future_times = past_times + delta_times
 
             # pick out the past and future observations as positive pairs
@@ -610,7 +629,14 @@ class ContrastiveRLTrainer(Module):
 
             discount_cond = self.discount_transform(discount) if self.discount_condition else None
 
-            loss = self.contrast_wrapper(past_obs, future_obs, past_action, discount = discount_cond)
+            loss = self.contrast_wrapper(
+                past_obs,
+                future_obs,
+                past_action,
+                discount = discount_cond,
+                delta_times = delta_times,
+                raw_discount = discount
+            )
 
             loss_item = loss.item()
 
