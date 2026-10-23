@@ -248,7 +248,7 @@ class ContrastiveLearning(Module):
         if self.l2norm_embed:
             embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
-        if exists(self.rotation_param) and not (self.use_euclidean or return_contrastive_score):
+        if exists(self.rotation_param) and not self.use_euclidean:
             embeds2 = einsum(self.rotation, embeds2, 'i j, ... j -> ... i')  # psi(s)^T R psi(s+)
 
         sim = calc_similarity(
