@@ -1,6 +1,7 @@
 from contrastive_rl_pytorch.contrastive_rl import (
     ContrastiveLearning,
     SigmoidContrastiveLearning,
+    TemporalDistanceLearning,
     ContrastiveWrapper,
     ContrastiveRLTrainer,
     ActorTrainer,
@@ -16,8 +17,6 @@ from contrastive_rl_pytorch.action_distr import (
     CategoricalActionAdapter,
     MeanConcBetaActionAdapter
 )
-
-from contrastive_rl_pytorch.temporal_distance import TemporalDistanceLearning
 
 __all__ = [
     'ContrastiveLearning',

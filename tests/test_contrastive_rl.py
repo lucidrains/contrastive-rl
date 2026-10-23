@@ -42,38 +42,33 @@ def test_contrast_wrapper():
 @param('var_traj_len', (False, True))
 @param('repetition_factor', (1, 2))
 @param('use_sigmoid', (False, True))
-@param('state_rotation', (False, True))
+@param('orthogonal_transition', (False, True))
 def test_contrast_trainer(
     var_traj_len,
     repetition_factor,
     use_sigmoid,
-    state_rotation
+    orthogonal_transition
 ):
     from contrastive_rl_pytorch.contrastive_rl import ContrastiveRLTrainer, ContrastiveLearning, SigmoidContrastiveLearning
     from x_mlps_pytorch import MLP
 
     encoder = MLP(16, 256, 128)
-    goal_encoder = MLP(16, 256, 128) if state_rotation else None
+    goal_encoder = MLP(16, 256, 128)
 
-    if use_sigmoid:
+    if orthogonal_transition:
+        contrastive_learn = ContrastiveLearning(rotation_dim = 128)
+    elif use_sigmoid:
         contrastive_learn = SigmoidContrastiveLearning()
     else:
         contrastive_learn = ContrastiveLearning()
-
-    state_contrastive_learn = ContrastiveLearning(rotation_dim = 128) if state_rotation else None
 
     trainer = ContrastiveRLTrainer(
         encoder,
         goal_encoder,
         cpu = True,
         repetition_factor = repetition_factor,
-        contrastive_learn = contrastive_learn,
-        state_contrastive_learn = state_contrastive_learn
+        contrastive_learn = contrastive_learn
     )
-
-    contrast_wrapper = trainer.unwrapped_contrast_wrapper
-    if state_rotation:
-        assert contrast_wrapper.encode_future is goal_encoder
 
     trajectories = torch.randn(256, 512, 16)
 
@@ -431,20 +426,222 @@ def test_hyperspherical_contrastive():
 
     dim, batch = 16, 10
 
-    state_learn = ContrastiveLearning(rotation_dim = dim)
+    contrastive_learn = ContrastiveLearning(rotation_dim = dim)
     wrapper = ContrastiveWrapper(
         MLP(dim + 2, 64, dim),
-        ContrastiveLearning(),
-        future_encoder = MLP(dim, 64, dim),
-        state_contrastive_learn = state_learn,
-        state_loss_weight = 2.
+        contrastive_learn,
+        future_encoder = MLP(dim, 64, dim)
     )
 
     loss = wrapper(torch.randn(batch, dim), torch.randn(batch, dim), torch.randn(batch, 2))
     loss.backward()
 
-    rotation = state_learn.rotation.detach()  # d d
+    rotation = contrastive_learn.rotation.detach()  # d d
     d, = shape(rotation, '[d] _')
 
     assert torch.allclose(rotation.T @ rotation, torch.eye(d), atol = 1e-5)
-    assert exists(state_learn.rotation_param.grad)
+    assert exists(contrastive_learn.rotation_param.grad)
+
+def test_orthogonal_transition_matches_c_slerp():
+    import torch.nn.functional as F
+    from contrastive_rl_pytorch import ContrastiveLearning
+
+    dim, batch = 8, 7
+
+    learn = ContrastiveLearning(rotation_dim = dim, scale = 1.)
+
+    with torch.no_grad():
+        learn.rotation_param.copy_(torch.randn(dim, dim))
+
+    embeds1 = torch.randn(batch, dim)
+    embeds2 = torch.randn(batch, dim)
+
+    e1 = F.normalize(embeds1, dim = -1)
+    e2 = F.normalize(embeds2, dim = -1)
+    R = learn.rotation
+
+    # rotated pairwise logits
+    logits = e1 @ R @ e2.T
+
+    labels = torch.arange(batch)
+    expected = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels)) * 0.5
+
+    assert torch.allclose(learn(embeds1, embeds2), expected, atol = 1e-6)
+    assert torch.allclose(learn(embeds1, embeds2, return_contrastive_score = True), logits.diagonal(), atol = 1e-6)
+    assert torch.allclose(R.T @ R, torch.eye(dim), atol = 1e-5)
+
+def test_orthogonal_transition_critic():
+    from contrastive_rl_pytorch import ContrastiveLearning, ContrastiveRLTrainer
+    from x_mlps_pytorch import MLP
+
+    dim_state, dim_goal, dim_action, dim_embed = 8, 2, 2, 16
+
+    encoder = MLP(dim_state + dim_action, 64, dim_embed)
+    goal_encoder = MLP(dim_goal, 64, dim_embed)
+
+    trainer = ContrastiveRLTrainer(
+        encoder,
+        goal_encoder,
+        batch_size = 8,
+        repetition_factor = 1,
+        state_to_goal_fn = lambda t: t[..., :dim_goal],
+        contrastive_learn = ContrastiveLearning(rotation_dim = dim_embed),
+        cpu = True
+    )
+
+    trajectories = torch.randn(16, 32, dim_state)
+    actions = torch.randn(16, 32, dim_action)
+
+    loss = trainer(trajectories, 2, actions = actions, pbar = False)
+    assert torch.isfinite(torch.tensor(loss))
+
+def test_temporal_distance_valid_combinations():
+    from contrastive_rl_pytorch import SigmoidContrastiveLearning, TemporalDistanceLearning
+
+    assert issubclass(TemporalDistanceLearning, SigmoidContrastiveLearning)
+
+    with pytest.raises(AssertionError):
+        # squared-chord temporal distance needs normalized embeddings
+        SigmoidContrastiveLearning(
+            use_euclidean = False,
+            l2norm_embed = False,
+            time_weight = 1.
+        )
+
+    batch, dim = 8, 16
+    embeds1 = torch.randn(batch, dim)
+    embeds2 = torch.randn(batch, dim)
+    delta_times = torch.randint(1, 8, (batch, 1))
+    raw_discount = torch.full((batch, 1), 0.9)
+
+    for use_euclidean, l2norm_embed in ((True, False), (True, True), (False, True)):
+        learn = SigmoidContrastiveLearning(
+            use_euclidean = use_euclidean,
+            l2norm_embed = l2norm_embed,
+            time_weight = 1.,
+            sep_weight = 1.
+        )
+
+        loss = learn(
+            embeds1,
+            embeds2,
+            delta_times = delta_times,
+            raw_discount = raw_discount,
+            goal_states = embeds2
+        )
+
+        assert torch.isfinite(loss)
+
+def test_temporal_distance_changes_loss():
+    from contrastive_rl_pytorch import SigmoidContrastiveLearning
+
+    batch, dim = 8, 16
+    embeds1 = torch.randn(batch, dim)
+    embeds2 = torch.randn(batch, dim)
+    delta_times = torch.randint(1, 8, (batch, 1))
+    raw_discount = torch.full((batch, 1), 0.9)
+
+    base = SigmoidContrastiveLearning(use_euclidean = True, l2norm_embed = False)
+    temporal = SigmoidContrastiveLearning(
+        use_euclidean = True,
+        l2norm_embed = False,
+        time_weight = 1.,
+        sep_weight = 1.
+    )
+
+    base_loss = base(embeds1, embeds2)
+    temporal_loss = temporal(
+        embeds1,
+        embeds2,
+        delta_times = delta_times,
+        raw_discount = raw_discount,
+        goal_states = embeds2
+    )
+
+    assert not torch.allclose(base_loss, temporal_loss)
+
+def test_orthogonal_transition_with_temporal():
+    from contrastive_rl_pytorch import ContrastiveLearning
+
+    dim, batch = 8, 7
+    learn = ContrastiveLearning(rotation_dim = dim, time_weight = 1., sep_weight = 1.)
+
+    embeds1 = torch.randn(batch, dim)
+    embeds2 = torch.randn(batch, dim)
+    delta_times = torch.randint(1, 8, (batch, 1))
+    raw_discount = torch.full((batch, 1), 0.9)
+
+    loss = learn(
+        embeds1,
+        embeds2,
+        delta_times = delta_times,
+        raw_discount = raw_discount,
+        goal_states = embeds2
+    )
+
+    assert torch.isfinite(loss)
+
+def test_sigmoid_orthogonal_transition_with_temporal():
+    from contrastive_rl_pytorch import SigmoidContrastiveLearning
+
+    dim, batch = 8, 7
+    learn = SigmoidContrastiveLearning(
+        l2norm_embed = True,
+        rotation_dim = dim,
+        time_weight = 1.,
+        sep_weight = 1.
+    )
+
+    embeds1 = torch.randn(batch, dim)
+    embeds2 = torch.randn(batch, dim)
+    delta_times = torch.randint(1, 8, (batch, 1))
+    raw_discount = torch.full((batch, 1), 0.9)
+
+    loss = learn(
+        embeds1,
+        embeds2,
+        delta_times = delta_times,
+        raw_discount = raw_discount,
+        goal_states = embeds2
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.allclose(learn.rotation.T @ learn.rotation, torch.eye(dim), atol = 1e-5)
+
+def test_temporal_distance_types():
+    from contrastive_rl_pytorch import SigmoidContrastiveLearning
+
+    batch, dim = 8, 16
+    embeds1 = torch.randn(batch, dim)
+    embeds2 = torch.randn(batch, dim)
+    delta_times = torch.randint(1, 8, (batch, 1))
+    raw_discount = torch.full((batch, 1), 0.9)
+
+    for distance_type in ('euclidean', 'squared_chord'):
+        learn = SigmoidContrastiveLearning(
+            l2norm_embed = True,
+            time_weight = 1.,
+            sep_weight = 1.,
+            temporal_distance_type = distance_type
+        )
+
+        loss = learn(
+            embeds1,
+            embeds2,
+            delta_times = delta_times,
+            raw_discount = raw_discount,
+            goal_states = embeds2
+        )
+
+        assert torch.isfinite(loss)
+
+def test_squared_chord_distance():
+    from contrastive_rl_pytorch.contrastive_rl import calc_distance
+
+    a = torch.tensor([1., 0., 0., 0.])
+    b = torch.tensor([0., 1., 0., 0.])
+    c = -a
+
+    assert torch.allclose(calc_distance(a, a), torch.tensor(0.), atol = 1e-6)
+    assert torch.allclose(calc_distance(a, b), torch.tensor(2.), atol = 1e-6)
+    assert torch.allclose(calc_distance(a, c), torch.tensor(4.), atol = 1e-6)

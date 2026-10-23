@@ -10,6 +10,9 @@
 #   "tqdm",
 #   "einops",
 # ]
+#
+# [tool.uv.sources]
+# contrastive-rl-pytorch = { path = "." }
 # ///
 
 from __future__ import annotations
@@ -38,7 +41,6 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
-    TemporalDistanceLearning,
     CategoricalActionAdapter,
     sample_random_state
 )
@@ -85,14 +87,16 @@ def main(
     use_sigmoid_contrastive_learning = True,
     sigmoid_bias = 0.,
     temporal_distance_regularization = False,
+    temporal_time_weight = 1.,
+    temporal_sep_weight = 1.,
+    temporal_distance_type = None,
     cl_l2norm_embed = False,
     learned_scale = False,
     learned_temp = False,
     use_euclidean = False,
-    state_rotation = False,
-    state_loss_weight = 1.,
+    orthogonal_transition = False,
     critic_action_repr = None,   # None | 'raw_logits' | 'softmax_probs' - condition the critic on the action distribution parameters
-    chunk_len = 1,               # number of actions executed per environment step - https://arxiv.org/abs/2608.30640
+    chunk_len = 2,               # number of actions executed per environment step - https://arxiv.org/abs/2608.30640
     discount = 0.99,
     goal_discount = None,
     target_goal_prob = 0.5,
@@ -116,10 +120,15 @@ def main(
     np.random.seed(seed)
 
     assert critic_action_repr in (None, 'raw_logits', 'softmax_probs')
+    assert chunk_len >= 1
+    assert not (orthogonal_transition and use_euclidean), 'orthogonal_transition requires cosine similarity'
+    assert not (orthogonal_transition and temporal_distance_regularization), 'temporal distance regularization is not supported with orthogonal transition'
+    assert use_sigmoid_contrastive_learning or orthogonal_transition or not temporal_distance_regularization, 'temporal distance regularization requires the sigmoid critic or orthogonal transition'
 
     # env
 
     env = ActionChunkWrapper(gym.make('CartPole-v1'), chunk_len = chunk_len)
+    env.reset(seed = seed)
 
     dim_state = 4
     dim_goal = 4
@@ -195,10 +204,21 @@ def main(
 
     # contrastive learning module
 
-    cl_l2norm_embed = cl_l2norm_embed or state_rotation
-
-    if temporal_distance_regularization:
-        contrastive_learn = TemporalDistanceLearning()
+    if orthogonal_transition:
+        contrastive_learn = ContrastiveLearning(
+            l2norm_embed = True,
+            rotation_dim = contrastive_embed_dim
+        )
+    elif temporal_distance_regularization:
+        contrastive_learn = SigmoidContrastiveLearning(
+            bias = sigmoid_bias,
+            l2norm_embed = cl_l2norm_embed or not use_euclidean,
+            learned_scale = learned_scale,
+            use_euclidean = use_euclidean,
+            time_weight = temporal_time_weight,
+            sep_weight = temporal_sep_weight,
+            temporal_distance_type = temporal_distance_type
+        )
     elif use_sigmoid_contrastive_learning:
         contrastive_learn = SigmoidContrastiveLearning(
             bias = sigmoid_bias,
@@ -213,12 +233,6 @@ def main(
             use_euclidean = use_euclidean
         )
 
-    state_contrastive_learn = ContrastiveLearning(
-        l2norm_embed = True,
-        scale = 10.,
-        rotation_dim = contrastive_embed_dim
-    ) if state_rotation else None
-
     # trainer
 
     critic_trainer = ContrastiveRLTrainer(
@@ -232,9 +246,7 @@ def main(
         discount = discount ** chunk_len,
         goal_discount = (goal_discount ** chunk_len) if exists(goal_discount) else None,
         cpu = cpu,
-        contrastive_learn = contrastive_learn,
-        state_contrastive_learn = state_contrastive_learn,
-        state_loss_weight = state_loss_weight
+        contrastive_learn = contrastive_learn
     )
 
     actor_trainer = ActorTrainer(

@@ -12,7 +12,7 @@ from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
 
 from einops import einsum, rearrange, repeat
-from torch_einops_utils import lens_to_mask, z_score
+from torch_einops_utils import lens_to_mask, masked_mean, z_score
 from torch_einops_utils.device import fallback_from
 from torch_einops_utils.shape import shape
 
@@ -88,6 +88,44 @@ def arange_from_tensor_dim(t, dim = 0):
     length = t.shape[dim]
     return arange(length, device = t.device)
 
+# distance helper
+
+# temporal distances: euclidean for unnormalized critics, squared chord on the sphere
+# geodesic, chord, and log-cosine were dropped after squared chord converged more reliably
+
+TEMPORAL_DISTANCE_TYPES = ('euclidean', 'squared_chord')
+
+@fallback_from('mps')
+def pairwise_euclidean_distance(embeds1, embeds2):
+    return torch.cdist(embeds1, embeds2)
+
+def calc_distance(
+    embeds1,
+    embeds2,
+    *,
+    use_euclidean = False,
+    distance_type: str | None = None,
+    all_pairs = False
+):
+    distance_type = default(distance_type, 'euclidean' if use_euclidean else 'squared_chord')
+
+    if distance_type == 'euclidean':
+        if all_pairs:
+            return pairwise_euclidean_distance(embeds1, embeds2)
+
+        return (embeds1 - embeds2).norm(dim = -1)
+
+    assert distance_type == 'squared_chord', f'unknown distance type {distance_type}'
+
+    embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+
+    if all_pairs:
+        cos = einsum(embeds1, embeds2, 'i d, j d -> i j')
+    else:
+        cos = einsum(embeds1, embeds2, '... d, ... d -> ...')
+
+    return (2. - 2. * cos).clamp(min = 0.)
+
 # similarity helper
 
 def calc_similarity(
@@ -98,14 +136,93 @@ def calc_similarity(
     all_pairs = False
 ):
     if use_euclidean:
-        if all_pairs:
-            return -torch.cdist(embeds1, embeds2)
-        return -(embeds1 - embeds2).norm(dim = -1)
+        return -calc_distance(embeds1, embeds2, use_euclidean = True, all_pairs = all_pairs)
 
     if all_pairs:
         return einsum(embeds1, embeds2, 'i d, j d -> i j')
 
     return einsum(embeds1, embeds2, '... d, ... d -> ...')
+
+# temporal distance regularization
+
+def calc_temporal_distance_loss(
+    dist,
+    delta_times,
+    raw_discount,
+    *,
+    goal_states = None,
+    time_weight = 1.,
+    sep_weight = 1.,
+    goal_eps = 0.25,
+    max_distance = None,
+    eps = 1e-6
+):
+    has_time_loss = time_weight > 0.
+    has_sep_loss = sep_weight > 0.
+    has_goal_eps = goal_eps > 0.
+
+    if not (has_time_loss or has_sep_loss):
+        return dist.new_zeros(())
+
+    loss = dist.new_zeros(())
+
+    delta = rearrange(delta_times, 'b 1 -> b').float()
+    discount = rearrange(raw_discount, 'b 1 -> b').float().clamp(min = eps, max = 1. - eps)
+    kappa = -discount.log()
+
+    if has_time_loss:
+        target = kappa * delta
+        if exists(max_distance):
+            target = target.clamp(max = max_distance)
+        loss = loss + time_weight * F.smooth_l1_loss(dist.diagonal(), target)
+
+    if has_sep_loss:
+        margin = kappa / (1. - discount)
+        if exists(max_distance):
+            margin = margin.clamp(max = max_distance)
+
+        mask = ~torch.eye(dist.shape[0], dtype = torch.bool, device = dist.device)
+
+        if exists(goal_states) and has_goal_eps:
+            goal_states = rearrange(goal_states, 'b ... -> b (...)')
+            is_distinct_goal = pairwise_euclidean_distance(goal_states, goal_states) > goal_eps
+            mask = mask & is_distinct_goal
+
+        hinge = F.relu(rearrange(margin, 'b -> b 1') - dist)
+        loss = loss + sep_weight * masked_mean(hinge, mask)
+
+    return loss
+
+def calc_embedding_temporal_loss(
+    embeds1,
+    embeds2,
+    *,
+    distance_type,
+    l2norm_embed,
+    delta_times,
+    raw_discount,
+    goal_states,
+    time_weight,
+    sep_weight,
+    goal_eps
+):
+    dist = calc_distance(embeds1, embeds2, distance_type = distance_type, all_pairs = True)
+
+    max_distance = dict(
+        euclidean = 2. if l2norm_embed else None,
+        squared_chord = 4.
+    )[distance_type]
+
+    return calc_temporal_distance_loss(
+        dist,
+        delta_times,
+        raw_discount,
+        goal_states = goal_states,
+        time_weight = time_weight,
+        sep_weight = sep_weight,
+        goal_eps = goal_eps,
+        max_distance = max_distance
+    )
 
 # sample random state
 
@@ -114,7 +231,9 @@ def sample_random_state(
     env,
     exploration_sample_from_buffer_prob = 0.5,
 ):
-    if replay_buffer.num_episodes > 0 and torch.rand(()) < exploration_sample_from_buffer_prob:
+    has_episodes = replay_buffer.num_episodes > 0
+
+    if has_episodes and torch.rand(()) < exploration_sample_from_buffer_prob:
         # sample from buffer, masking out the padding past each episode length
 
         data = replay_buffer.get_all_data(fields = ['state'], meta_fields = ['episode_lens'])
@@ -194,14 +313,14 @@ def sample_discount(
     indices = torch.randint(0, len(discount), (batch_size,), device = device)
     return rearrange(discount_tensor[indices], 'b -> b 1')
 
-# cayley transform -> orthogonal rotation matrix, offloading to cpu when on mps
+# cayley transform -> orthogonal rotation matrix
 
 @fallback_from('mps')
 def cayley_rotation(a, eye):
     omega = a - a.T
     return torch.linalg.solve(eye + omega, eye - omega)
 
-# contrastive wrapper module
+# contrastive learning
 
 class ContrastiveLearning(Module):
     def __init__(
@@ -212,20 +331,46 @@ class ContrastiveLearning(Module):
         symmetric = True,
         lse_reg_weight = 0.,
         rotation_dim: int | None = None,
-        scale = 1.
+        scale = 10.,
+        time_weight = 0.,
+        sep_weight = 0.,
+        goal_eps = 0.25,
+        temporal_distance_type: str | None = None
     ):
         super().__init__()
 
-        assert not (symmetric and lse_reg_weight > 0.), 'lse_reg_weight requires symmetric = False'
-        assert not (exists(rotation_dim) and (use_euclidean or not l2norm_embed)), 'rotation requires l2norm and cosine similarity'
+        has_time_loss = time_weight > 0.
+        has_sep_loss = sep_weight > 0.
+        has_temporal = has_time_loss or has_sep_loss
+        has_lse_reg = lse_reg_weight > 0.
+        has_rotation = exists(rotation_dim)
+
+        temporal_distance_type = default(temporal_distance_type, 'euclidean' if use_euclidean else 'squared_chord')
+
+        assert learned_temp or scale > 0.
+        assert lse_reg_weight >= 0.
+        assert time_weight >= 0. and sep_weight >= 0., 'temporal weights must be non-negative'
+        assert goal_eps >= 0., 'goal_eps must be non-negative'
+        assert temporal_distance_type in TEMPORAL_DISTANCE_TYPES
+        assert not (has_temporal and temporal_distance_type in TEMPORAL_DISTANCE_TYPES[1:] and not l2norm_embed), 'hyperspherical temporal distance requires l2norm_embed'
+        assert not has_rotation or rotation_dim >= 1
+        assert not (symmetric and has_lse_reg), 'lse_reg_weight requires symmetric = False'
+        assert not (has_rotation and (use_euclidean or not l2norm_embed)), 'rotation requires l2norm and cosine similarity'
 
         self.l2norm_embed = l2norm_embed
         self.use_euclidean = use_euclidean
         self.symmetric = symmetric
+        self.has_lse_reg = has_lse_reg
         self.lse_reg_weight = lse_reg_weight
         self.scale_value = scale
-        self.rotation_param = Parameter(torch.zeros(rotation_dim, rotation_dim)) if exists(rotation_dim) else None
-        self.register_buffer('eye', torch.eye(rotation_dim) if exists(rotation_dim) else None, persistent = False)
+        self.time_weight = time_weight
+        self.sep_weight = sep_weight
+        self.goal_eps = goal_eps
+        self.temporal_distance_type = temporal_distance_type
+        self.accepts_temporal_targets = has_temporal
+        self.has_rotation = has_rotation
+        self.rotation_param = Parameter(torch.zeros(rotation_dim, rotation_dim)) if has_rotation else None
+        self.register_buffer('eye', torch.eye(rotation_dim) if has_rotation else None, persistent = False)
 
         self.learned_log_temp = None
         if learned_temp:
@@ -237,19 +382,23 @@ class ContrastiveLearning(Module):
 
     @property
     def rotation(self):
-        return cayley_rotation(self.rotation_param, self.eye)  # cayley -> orthogonal R
+        return cayley_rotation(self.rotation_param, self.eye)
 
     def forward(
         self,
         embeds1,
         embeds2,
-        return_contrastive_score = False
+        return_contrastive_score = False,
+        delta_times = None,
+        raw_discount = None,
+        goal_states = None
     ):
         if self.l2norm_embed:
             embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
-        if exists(self.rotation_param) and not self.use_euclidean:
-            embeds2 = einsum(self.rotation, embeds2, 'i j, ... j -> ... i')  # psi(s)^T R psi(s+)
+        if self.has_rotation and not self.use_euclidean:
+            assert embeds2.shape[-1] == self.rotation_param.shape[0], f'rotation dim {self.rotation_param.shape[0]} must match embed dim {embeds2.shape[-1]}'
+            embeds2 = einsum(self.rotation, embeds2, 'i j, ... j -> ... i')  # rotate goal
 
         sim = calc_similarity(
             embeds1,
@@ -272,8 +421,24 @@ class ContrastiveLearning(Module):
         if self.symmetric:
             loss = (loss + F.cross_entropy(rearrange(sim, 'i j -> j i'), labels)) * 0.5
 
-        if self.lse_reg_weight > 0.:
+        if self.has_lse_reg:
             loss = loss + self.lse_reg_weight * sim.logsumexp(dim = -1).square().mean()
+
+        if self.accepts_temporal_targets:
+            assert exists(delta_times) and exists(raw_discount)
+
+            loss = loss + calc_embedding_temporal_loss(
+                embeds1,
+                embeds2,
+                distance_type = self.temporal_distance_type,
+                l2norm_embed = self.l2norm_embed,
+                delta_times = delta_times,
+                raw_discount = raw_discount,
+                goal_states = goal_states,
+                time_weight = self.time_weight,
+                sep_weight = self.sep_weight,
+                goal_eps = self.goal_eps
+            )
 
         return loss
 
@@ -283,12 +448,40 @@ class SigmoidContrastiveLearning(Module):
         bias = 0.,
         l2norm_embed = False,
         learned_scale = False,
-        use_euclidean = False
+        use_euclidean = False,
+        rotation_dim: int | None = None,
+        time_weight = 0.,
+        sep_weight = 0.,
+        goal_eps = 0.25,
+        temporal_distance_type: str | None = None
     ):
         super().__init__()
+
+        has_time_loss = time_weight > 0.
+        has_sep_loss = sep_weight > 0.
+        has_temporal = has_time_loss or has_sep_loss
+        has_rotation = exists(rotation_dim)
+
+        temporal_distance_type = default(temporal_distance_type, 'euclidean' if use_euclidean else 'squared_chord')
+
+        assert time_weight >= 0. and sep_weight >= 0., 'temporal weights must be non-negative'
+        assert goal_eps >= 0., 'goal_eps must be non-negative'
+        assert temporal_distance_type in TEMPORAL_DISTANCE_TYPES
+        assert not (has_temporal and temporal_distance_type in TEMPORAL_DISTANCE_TYPES[1:] and not l2norm_embed), 'hyperspherical temporal distance requires l2norm_embed'
+        assert not has_rotation or rotation_dim >= 1
+        assert not (has_rotation and (use_euclidean or not l2norm_embed)), 'rotation requires l2norm and cosine similarity'
+
         self.bias = bias
         self.l2norm_embed = l2norm_embed
         self.use_euclidean = use_euclidean
+        self.time_weight = time_weight
+        self.sep_weight = sep_weight
+        self.goal_eps = goal_eps
+        self.temporal_distance_type = temporal_distance_type
+        self.accepts_temporal_targets = has_temporal
+        self.has_rotation = has_rotation
+        self.rotation_param = Parameter(torch.zeros(rotation_dim, rotation_dim)) if has_rotation else None
+        self.register_buffer('eye', torch.eye(rotation_dim) if has_rotation else None, persistent = False)
 
         self.learned_log_scale = None
         if learned_scale:
@@ -298,14 +491,25 @@ class SigmoidContrastiveLearning(Module):
     def scale(self):
         return self.learned_log_scale.exp() if exists(self.learned_log_scale) else 1.
 
+    @property
+    def rotation(self):
+        return cayley_rotation(self.rotation_param, self.eye)
+
     def forward(
         self,
         embeds1,
         embeds2,
-        return_contrastive_score = False
+        return_contrastive_score = False,
+        delta_times = None,
+        raw_discount = None,
+        goal_states = None
     ):
         if self.l2norm_embed:
             embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+
+        if self.has_rotation and not self.use_euclidean:
+            assert embeds2.shape[-1] == self.rotation_param.shape[0], f'rotation dim {self.rotation_param.shape[0]} must match embed dim {embeds2.shape[-1]}'
+            embeds2 = einsum(self.rotation, embeds2, 'i j, ... j -> ... i')  # rotate goal
 
         sim = calc_similarity(
             embeds1,
@@ -329,7 +533,43 @@ class SigmoidContrastiveLearning(Module):
 
         loss = F.binary_cross_entropy_with_logits(sim, labels)
 
+        if self.accepts_temporal_targets:
+            assert exists(delta_times) and exists(raw_discount)
+
+            loss = loss + calc_embedding_temporal_loss(
+                embeds1,
+                embeds2,
+                distance_type = self.temporal_distance_type,
+                l2norm_embed = self.l2norm_embed,
+                delta_times = delta_times,
+                raw_discount = raw_discount,
+                goal_states = goal_states,
+                time_weight = self.time_weight,
+                sep_weight = self.sep_weight,
+                goal_eps = self.goal_eps
+            )
+
         return loss
+
+# compatibility alias - temporal regularization lives on the sigmoid critic
+
+class TemporalDistanceLearning(SigmoidContrastiveLearning):
+    def __init__(
+        self,
+        time_weight = 1.,
+        sep_weight = 1.,
+        goal_eps = 0.25,
+        **kwargs
+    ):
+        kwargs.setdefault('use_euclidean', True)
+        kwargs.setdefault('l2norm_embed', False)
+
+        super().__init__(
+            time_weight = time_weight,
+            sep_weight = sep_weight,
+            goal_eps = goal_eps,
+            **kwargs
+        )
 
 # contrastive wrapper module
 
@@ -338,20 +578,14 @@ class ContrastiveWrapper(Module):
         self,
         encoder: Module,
         contrastive_learn: Module,
-        future_encoder: Module | None = None,
-        state_contrastive_learn: Module | None = None,
-        state_loss_weight = 1.
+        future_encoder: Module | None = None
     ):
         super().__init__()
-
-        assert not (exists(state_contrastive_learn) and not exists(future_encoder)), 'state contrastive learning requires a state-only future encoder'
 
         self.encode = encoder
         self.encode_future = default(future_encoder, encoder)
 
         self.contrastive_learn = contrastive_learn
-        self.state_contrastive_learn = state_contrastive_learn
-        self.state_loss_weight = state_loss_weight
         self.all_gather = AllGather()
 
     @property
@@ -367,8 +601,6 @@ class ContrastiveWrapper(Module):
         delta_times = None, # (b 1)
         raw_discount = None # (b 1)
     ):
-        state = past  # raw state for psi(s), before action / discount concat
-
         if exists(past_action):
             if past_action.ndim > 2:
                 past_action = rearrange(past_action, 'b c ... -> b (c ...)')
@@ -380,14 +612,14 @@ class ContrastiveWrapper(Module):
 
         encoded_past = self.encode(past)
         encoded_future = self.encode_future(future)
-        encoded_state = self.encode_future(state) if exists(self.state_contrastive_learn) else None
 
         if is_distributed():
             encoded_past, _ = self.all_gather(encoded_past)
             encoded_future, _ = self.all_gather(encoded_future)
-            encoded_state = self.all_gather(encoded_state)[0] if exists(encoded_state) else None
 
-        if getattr(self.contrastive_learn, 'accepts_temporal_targets', False):
+        has_temporal_targets = getattr(self.contrastive_learn, 'accepts_temporal_targets', False)
+
+        if has_temporal_targets:
             loss = self.contrastive_learn(
                 encoded_past,
                 encoded_future,
@@ -397,9 +629,6 @@ class ContrastiveWrapper(Module):
             )
         else:
             loss = self.contrastive_learn(encoded_past, encoded_future)
-
-        if exists(self.state_contrastive_learn):
-            loss = loss + self.state_loss_weight * self.state_contrastive_learn(encoded_state, encoded_future)
 
         return loss
 
@@ -426,11 +655,13 @@ class ContrastiveRLTrainer(Module):
         accelerate_kwargs: dict = dict(),
         cpu = False,
         state_to_goal_fn: Callable = identity,
-        state_to_critic_state_fn: Callable = identity,
-        state_contrastive_learn: Module | None = None,
-        state_loss_weight = 1.
+        state_to_critic_state_fn: Callable = identity
     ):
         super().__init__()
+
+        assert batch_size >= 1
+        assert repetition_factor >= 1
+        assert action_chunk_size >= 1
 
         self.state_to_goal_fn = state_to_goal_fn
         self.state_to_critic_state_fn = state_to_critic_state_fn
@@ -443,9 +674,7 @@ class ContrastiveRLTrainer(Module):
         contrast_wrapper = ContrastiveWrapper(
             encoder = encoder,
             future_encoder = future_encoder,
-            contrastive_learn = contrastive_learn,
-            state_contrastive_learn = state_contrastive_learn,
-            state_loss_weight = state_loss_weight
+            contrastive_learn = contrastive_learn
         )
 
         assert divisible_by(batch_size, repetition_factor)
@@ -686,6 +915,13 @@ class ActorTrainer(Module):
     ):
         super().__init__()
 
+        assert batch_size >= 1
+        assert not exists(num_discrete_actions) or num_discrete_actions >= 1
+        assert 0. <= target_goal_prob <= 1.
+        assert action_entropy_loss_weight >= 0.
+
+        has_action_entropy_loss = action_entropy_loss_weight > 0.
+
         self.num_discrete_actions = num_discrete_actions
         self.normalize_q_values = normalize_q_values
         self.target_goal_prob = target_goal_prob
@@ -700,6 +936,7 @@ class ActorTrainer(Module):
         self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
 
         self.max_grad_norm = max_grad_norm
+        self.has_action_entropy_loss = has_action_entropy_loss
         self.action_entropy_loss_weight = action_entropy_loss_weight
 
         optimizer = AdamW(actor.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
@@ -750,6 +987,11 @@ class ActorTrainer(Module):
         discount = None
     ):
         device = self.device
+
+        has_train_steps = num_train_steps > 0
+
+        if not has_train_steps:
+            return 0.
 
         # action adapter handles the mapping from raw actor outputs to what the critic consumes
 
@@ -892,7 +1134,7 @@ class ActorTrainer(Module):
                 expected_q = einsum(action_probs, q_values, 'b a, b a -> b')
                 loss = -expected_q.mean()
 
-                if self.action_entropy_loss_weight > 0.:
+                if self.has_action_entropy_loss:
                     entropy = -einsum(action_probs, log(action_probs), 'b a, b a -> b')
                     loss = loss - entropy.mean() * self.action_entropy_loss_weight
 
@@ -928,7 +1170,7 @@ class ActorTrainer(Module):
 
                 loss = -sim.mean()
 
-                if self.action_entropy_loss_weight > 0. and exists(entropy_fn):
+                if self.has_action_entropy_loss and exists(entropy_fn):
                     entropy = entropy_fn(action_logits)
 
                     if exists(entropy):

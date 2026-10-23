@@ -37,7 +37,6 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
-    TemporalDistanceLearning,
     sample_random_state,
     default_discount_transform
 )
@@ -88,6 +87,8 @@ def main(
     sigmoid_bias = 0.,
     use_euclidean = False,
     temporal_distance_regularization = False,
+    temporal_time_weight = 1.,
+    temporal_sep_weight = 1.,
     discount = 0.99,
     goal_discount = None,
     discount_condition = False,
@@ -105,6 +106,8 @@ def main(
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    assert use_sigmoid or not temporal_distance_regularization, 'temporal distance regularization requires the sigmoid critic'
 
     # recordings folder
 
@@ -125,6 +128,8 @@ def main(
             episode_trigger = lambda ep: divisible_by(ep, render_every_eps),
             name_prefix = 'lunar'
         )
+
+    env.reset(seed = seed)
 
     dim_state = 8
     dim_goal = 8
@@ -147,7 +152,9 @@ def main(
 
     # maybe seed replay buffer with demonstrations for quick convergence
 
-    if num_demo_episodes > 0:
+    has_demo_episodes = num_demo_episodes > 0
+
+    if has_demo_episodes:
         from gymnasium.envs.box2d.lunar_lander import heuristic
 
         for ep in range(num_demo_episodes):
@@ -204,7 +211,14 @@ def main(
     # contrastive learning module
 
     if temporal_distance_regularization:
-        contrastive_learn = TemporalDistanceLearning()
+        contrastive_learn = SigmoidContrastiveLearning(
+            bias = sigmoid_bias,
+            l2norm_embed = not use_euclidean,
+            learned_scale = False,
+            use_euclidean = use_euclidean,
+            time_weight = temporal_time_weight,
+            sep_weight = temporal_sep_weight
+        )
     elif use_sigmoid:
         contrastive_learn = SigmoidContrastiveLearning(
             bias = sigmoid_bias,
