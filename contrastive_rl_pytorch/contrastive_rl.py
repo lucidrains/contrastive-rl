@@ -12,7 +12,7 @@ from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
 
 from einops import einsum, rearrange, repeat
-from torch_einops_utils import lens_to_mask, masked_mean, z_score
+from torch_einops_utils import lens_to_mask, masked_mean, safe_cat, z_score
 from torch_einops_utils.device import fallback_from
 from torch_einops_utils.shape import shape
 
@@ -592,6 +592,17 @@ class ContrastiveWrapper(Module):
     def scale(self):
         return self.contrastive_learn.scale
 
+    def distance_pairs(self, past, future):
+        past_embeds, future_embeds = self.encode(past), self.encode_future(future)
+
+        if self.contrastive_learn.l2norm_embed:
+            past_embeds, future_embeds = map(l2norm, (past_embeds, future_embeds))
+
+        if self.contrastive_learn.has_rotation and not self.contrastive_learn.use_euclidean:
+            future_embeds = einsum(self.contrastive_learn.rotation, future_embeds, 'i j, ... j -> ... i')
+
+        return calc_distance(past_embeds, future_embeds, use_euclidean = self.contrastive_learn.use_euclidean)
+
     def forward(
         self,
         past,     # (b d)
@@ -599,8 +610,12 @@ class ContrastiveWrapper(Module):
         past_action = None, # (b na)
         discount = None,    # (b 1)
         delta_times = None, # (b 1)
-        raw_discount = None # (b 1)
+        raw_discount = None, # (b 1)
+        extra_negatives = None # (b d)
     ):
+        if exists(extra_negatives):
+            future = safe_cat((future, extra_negatives), dim = 0)
+
         if exists(past_action):
             if past_action.ndim > 2:
                 past_action = rearrange(past_action, 'b c ... -> b (c ...)')
