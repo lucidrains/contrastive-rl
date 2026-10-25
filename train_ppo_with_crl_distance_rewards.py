@@ -46,7 +46,7 @@ from fire import Fire
 import imageio.v2 as imageio
 
 from x_mlps_pytorch import MLP
-from x_ppo import calc_gae, ppo_actor_loss
+from x_ppo import calc_gae, combine_grouped_advantages, ppo_actor_loss
 from mean_conc_beta import Beta
 
 from contrastive_rl_pytorch import (
@@ -323,28 +323,76 @@ def save_json(path, obj):
 
 # four rooms
 
+def parse_room_widths(room_widths):
+    if isinstance(room_widths, str):
+        room_widths = room_widths.replace('x', ',').split(',')
+
+    return tuple(map(int, room_widths)) if exists(room_widths) else None
+
+def make_room_grid(size, room_widths):
+    if not exists(room_widths):
+        assert size >= 5 and not divisible_by(size, 2)
+
+        mid = size // 2
+        walls = np.zeros((size, size), dtype = np.int8)
+
+        walls[mid, :] = 1
+        walls[mid, 2] = 0
+        walls[mid, size - 3] = 0
+
+        walls[:, mid] = 1
+        walls[2, mid] = 0
+        walls[size - 3, mid] = 0
+
+        return size, walls, [mid]
+
+    assert len(room_widths) >= 2 and all(w >= 2 for w in room_widths)
+
+    size = sum(room_widths) + len(room_widths) - 1
+    walls = np.zeros((size, size), dtype = np.int8)
+
+    wall_positions = np.cumsum(room_widths)[:-1] + np.arange(len(room_widths) - 1)
+    starts = np.cumsum((0, *room_widths))[:-1] + np.arange(len(room_widths))
+    spans = [(start, start + width - 1) for start, width in zip(starts, room_widths)]
+
+    for position in wall_positions:
+        walls[position, :] = 1
+        walls[:, position] = 1
+
+    for position in wall_positions:
+        for start, end in spans:
+            door = (start + end) // 2
+            walls[position, door] = 0
+            walls[door, position] = 0
+
+    return size, walls, wall_positions.tolist()
+
 class FourRoomsEnv(gym.Env):
     metadata = dict(render_modes = ('rgb_array',))
 
-    def __init__(self, size = 9, max_steps = 128, seed = 0, start_radius = 100, exploration_goal_prob = 0., local_radius = 1, goal_margin = 2):
+    def __init__(
+        self,
+        size = 9,
+        max_steps = 128,
+        seed = 0,
+        start_radius = 100,
+        exploration_goal_prob = 0.,
+        local_radius = 1,
+        goal_margin = 2,
+        room_widths = None,
+        wall_penalty = 0.,
+        action_change_penalty = 0.
+    ):
         super().__init__()
 
-        assert size >= 5 and not divisible_by(size, 2)
+        room_widths = parse_room_widths(room_widths)
+        size, self.walls, self.wall_positions = make_room_grid(size, room_widths)
 
         self.size = size
         self.max_steps = max_steps
         self.rng = np.random.default_rng(seed)
-
-        self.walls = np.zeros((size, size), dtype = np.int8)
-        mid = size // 2
-
-        self.walls[mid, :] = 1
-        self.walls[mid, 2] = 0
-        self.walls[mid, size - 3] = 0
-
-        self.walls[:, mid] = 1
-        self.walls[2, mid] = 0
-        self.walls[size - 3, mid] = 0
+        self.wall_penalty = wall_penalty
+        self.action_change_penalty = action_change_penalty
 
         self.free = np.argwhere(self.walls == 0)
         self.fixed_goal = np.array([size - goal_margin, size - goal_margin])
@@ -360,6 +408,7 @@ class FourRoomsEnv(gym.Env):
         self.agent = None
         self.goal = None
         self.steps = 0
+        self.prev_action = None
 
     def _local_walls(self):
         row, col = self.agent
@@ -377,6 +426,13 @@ class FourRoomsEnv(gym.Env):
         row, col = self.agent
         pos = [row / (self.size - 1), col / (self.size - 1)]
         return np.array(pos + self._local_walls(), dtype = np.float32)
+
+    def room_of(self, cell):
+        row, col = cell
+        rooms_per_axis = len(self.wall_positions) + 1
+        row_room = sum(row > position for position in self.wall_positions)
+        col_room = sum(col > position for position in self.wall_positions)
+        return row_room * rooms_per_axis + col_room
 
     def reset(self, seed = None, options = None):
         if seed is not None:
@@ -397,22 +453,37 @@ class FourRoomsEnv(gym.Env):
         self.agent = cells[self.rng.integers(0, len(cells))].copy()
 
         self.steps = 0
+        self.prev_action = None
         return self._obs(), dict(goal = self.goal / (self.size - 1))
 
     def step(self, action):
-        dr, dc = {0: (-1, 0), 1: (1, 0), 2: (0, -1), 3: (0, 1)}[int(action)]
+        action = int(action)
+        dr, dc = {0: (-1, 0), 1: (1, 0), 2: (0, -1), 3: (0, 1)}[action]
         row, col = self.agent
         nr, nc = row + dr, col + dc
 
-        if 0 <= nr < self.size and 0 <= nc < self.size and self.walls[nr, nc] == 0:
+        wall_bump = not (0 <= nr < self.size and 0 <= nc < self.size and self.walls[nr, nc] == 0)
+
+        if not wall_bump:
             self.agent = np.array([nr, nc])
 
+        action_change = exists(self.prev_action) and action != self.prev_action
+        self.prev_action = action
         self.steps += 1
 
         success = bool(np.array_equal(self.agent, self.goal))
         truncated = self.steps >= self.max_steps
 
-        return self._obs(), float(success), success, truncated, dict(goal = self.goal / (self.size - 1), success = success)
+        reward = float(success) - self.wall_penalty * wall_bump - self.action_change_penalty * action_change
+
+        info = dict(
+            goal = self.goal / (self.size - 1),
+            success = success,
+            wall_bump = wall_bump,
+            action_change = action_change
+        )
+
+        return self._obs(), reward, success, truncated, info
 
     def render(self, cell = 32):
         img = np.ones((self.size * cell, self.size * cell, 3), dtype = np.uint8) * 255
@@ -539,6 +610,7 @@ def evaluate_fourrooms(trainer, env_fn, episodes = 20, max_steps = 128, seed = 0
     env = env_fn()
 
     successes, returns, lengths = [], [], []
+    wall_bump_rates, action_change_rates = [], []
 
     for ep in range(episodes):
         obs, info = env.reset(seed = seed + ep)
@@ -547,6 +619,8 @@ def evaluate_fourrooms(trainer, env_fn, episodes = 20, max_steps = 128, seed = 0
         ep_states, ep_actions, ep_rewards, ep_goals = [], [], [], []
         total = 0.
         steps = 0
+        wall_bumps = 0
+        action_changes = 0
 
         while steps < max_steps:
             state_t = torch.from_numpy(obs).float().to(trainer.device)
@@ -564,6 +638,8 @@ def evaluate_fourrooms(trainer, env_fn, episodes = 20, max_steps = 128, seed = 0
             ep_goals.append(goal)
 
             total += float(reward)
+            wall_bumps += info.get('wall_bump', False)
+            action_changes += info.get('action_change', False)
             steps += 1
             obs = next_obs
 
@@ -573,6 +649,8 @@ def evaluate_fourrooms(trainer, env_fn, episodes = 20, max_steps = 128, seed = 0
         successes.append(bool(info.get('success', False)))
         returns.append(total)
         lengths.append(steps)
+        wall_bump_rates.append(wall_bumps / max(steps, 1))
+        action_change_rates.append(action_changes / max(steps, 1))
 
         if replay_buffer is not None and len(ep_states) >= 2:
             store_eval_episode(
@@ -588,16 +666,14 @@ def evaluate_fourrooms(trainer, env_fn, episodes = 20, max_steps = 128, seed = 0
     return dict(
         success_rate = float(np.mean(successes)),
         return_mean = float(np.mean(returns)),
-        length_mean = float(np.mean(lengths))
+        length_mean = float(np.mean(lengths)),
+        wall_bump_rate = float(np.mean(wall_bump_rates)),
+        action_change_rate = float(np.mean(action_change_rates))
     )
 
 def record_winning_video(trainer, env_fn, path, max_steps = 128, seed = 0, episodes = 200, fps = 8, contact_sheet_frames = 6):
     env = env_fn()
     candidates = []
-
-    def room_of(cell):
-        mid = env.size // 2
-        return int(cell[0] > mid) * 2 + int(cell[1] > mid)
 
     for ep in range(episodes):
         obs, info = env.reset(seed = seed + ep)
@@ -622,7 +698,7 @@ def record_winning_video(trainer, env_fn, path, max_steps = 128, seed = 0, episo
                 break
 
         if won:
-            candidates.append(dict(frames = frames, start_room = room_of(start), goal_room = room_of(env.goal)))
+            candidates.append(dict(frames = frames, start_room = env.room_of(start), goal_room = env.room_of(env.goal)))
 
     env.close()
 
@@ -729,6 +805,9 @@ class DistanceRewardPPO(Module):
         reward_temperature = 5.,
         reward_scale = 1.,
         value: Module | None = None,
+        env_value: Module | None = None,
+        separate_env_rewards = False,
+        env_reward_weight = 0.5,
         value_lr: float | None = None,
         value_epochs = 4,
         value_minibatch_size: int | None = None,
@@ -741,10 +820,16 @@ class DistanceRewardPPO(Module):
 
         assert action_type in ('continuous', 'discrete')
 
+        if separate_env_rewards:
+            assert exists(value) and exists(env_value), 'separate_env_rewards needs a value net for both the crl and environment reward streams'
+
         self.actor = actor
         self.critic_wrapper = critic_wrapper
         self.value = value
+        self.env_value = env_value
         self.action_type = action_type
+        self.separate_env_rewards = separate_env_rewards
+        self.env_reward_weight = env_reward_weight
 
         self.discount = discount
         self.lam = lam
@@ -771,6 +856,10 @@ class DistanceRewardPPO(Module):
         self.value_opt = None
         if exists(self.value):
             self.value_opt = AdamW(self.value.parameters(), lr = default(value_lr, critic_lr), weight_decay = weight_decay)
+
+        self.env_value_opt = None
+        if exists(self.env_value):
+            self.env_value_opt = AdamW(self.env_value.parameters(), lr = default(value_lr, critic_lr), weight_decay = weight_decay)
 
         self.negative_buffer = deque(maxlen = critic_negative_buffer_size)
 
@@ -986,33 +1075,33 @@ class DistanceRewardPPO(Module):
             clip_frac = sum(clip_fracs) / len(clip_fracs)
         )
 
-    def _value_update(self, flat_states, flat_goals, flat_returns):
-        if not exists(self.value) or self.value_epochs <= 0:
+    def _value_update(self, value, opt, flat_states, flat_goals, flat_returns, epochs, minibatch_size):
+        if not exists(value) or epochs <= 0:
             return 0.
 
         batch_size = shape(flat_states, 'b ...').dims['b']
-        minibatch_size = min(self.value_minibatch_size, batch_size)
+        minibatch_size = min(minibatch_size, batch_size)
 
-        self.value.train()
+        value.train()
         losses = []
 
-        for _ in range(self.value_epochs):
+        for _ in range(epochs):
             permutation = torch.randperm(batch_size, device = self.device)
 
             for start in range(0, batch_size, minibatch_size):
                 indices = permutation[start:(start + minibatch_size)]
 
                 inputs = cat((flat_states[indices], flat_goals[indices]), dim = -1)
-                pred = self.value(inputs).squeeze(-1)
+                pred = value(inputs).squeeze(-1)
                 loss = F.mse_loss(pred, flat_returns[indices])
 
-                self.value_opt.zero_grad()
+                opt.zero_grad()
                 loss.backward()
 
                 if exists(self.max_grad_norm):
-                    torch.nn.utils.clip_grad_norm_(self.value.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(value.parameters(), self.max_grad_norm)
 
-                self.value_opt.step()
+                opt.step()
                 losses.append(loss.item())
 
         return sum(losses) / len(losses) if losses else 0.
@@ -1029,6 +1118,8 @@ class DistanceRewardPPO(Module):
         next_states = None,
         terminated = None,
         aux_rewards = None,
+        base_rewards = None,
+        env_reward_weight: float | None = None,
         critic_steps: int | None = None,
         ppo_epochs: int | None = None
     ):
@@ -1067,43 +1158,99 @@ class DistanceRewardPPO(Module):
 
         with torch.no_grad():
             distances = self.critic_wrapper.distance_pairs(flat_next_states, flat_goals)
-            rewards = torch.exp(-distances / self.reward_temperature) * self.reward_scale
+            crl_distance_rewards = torch.exp(-distances / self.reward_temperature) * self.reward_scale
 
-            rewards = rearrange(rewards, '(n t) -> n t', n = num_trajs)
+            crl_distance_rewards = rearrange(crl_distance_rewards, '(n t) -> n t', n = num_trajs)
             distances = rearrange(distances, '(n t) -> n t', n = num_trajs)
 
+            def value_predictions(value):
+                flat_values = value(cat((flat_states, flat_goals), dim = -1)).squeeze(-1)
+                flat_next_values = value(cat((flat_next_states, flat_goals), dim = -1)).squeeze(-1)
+                return (
+                    rearrange(flat_values, '(n t) -> n t', n = num_trajs),
+                    rearrange(flat_next_values, '(n t) -> n t', n = num_trajs)
+                )
+
             if exists(self.value):
-                flat_values = self.value(cat((flat_states, flat_goals), dim = -1)).squeeze(-1)
-                flat_next_values = self.value(cat((flat_next_states, flat_goals), dim = -1)).squeeze(-1)
-                values = rearrange(flat_values, '(n t) -> n t', n = num_trajs)
-                next_values = rearrange(flat_next_values, '(n t) -> n t', n = num_trajs)
+                values, next_values = value_predictions(self.value)
             else:
-                values = torch.zeros_like(rewards)
+                values = torch.zeros_like(crl_distance_rewards)
                 next_values = values
 
-        if exists(aux_rewards):
-            rewards = rewards + self._to_tensor(aux_rewards, torch.float32)
+            if self.separate_env_rewards:
+                env_values, env_next_values = value_predictions(self.env_value)
 
         masks = (~terminated).float()
+        env_reward_weight = default(env_reward_weight, self.env_reward_weight)
+        env_reward_weight = min(max(float(env_reward_weight), 0.), 1.)
+        crl_reward_weight = 1. - env_reward_weight
 
-        gae = calc_gae(
-            rewards,
-            values,
-            masks = masks,
-            gamma = self.discount,
-            lam = self.lam,
-            next_values = next_values,
-            return_advantages = True
-        )
+        # separate env reward stream: own value net / GAE, advantages blended by weight
 
-        advantages = gae.advantages
+        if self.separate_env_rewards:
+            assert exists(base_rewards), 'base_rewards must be passed when separate_env_rewards is enabled'
+            base_rewards = self._to_tensor(base_rewards, torch.float32)
+            assert base_rewards.shape == crl_distance_rewards.shape
+
+            crl_rewards = crl_distance_rewards
+            if exists(aux_rewards):
+                crl_rewards = crl_rewards + self._to_tensor(aux_rewards, torch.float32)
+
+            gae = calc_gae(
+                torch.stack((base_rewards, crl_rewards), dim = -1),
+                torch.stack((env_values, values), dim = -1),
+                masks = masks,
+                gamma = self.discount,
+                lam = self.lam,
+                next_values = torch.stack((env_next_values, next_values), dim = -1),
+                group_dim = -1,
+                return_advantages = True
+            )
+
+            advantages = combine_grouped_advantages(
+                gae.advantages,
+                weights = torch.tensor((env_reward_weight, crl_reward_weight), device = self.device),
+                normalize = True,
+                group_dim = -1,
+                mask = masks,
+                reduce = 'sum'
+            )
+
+            env_returns, crl_returns = gae.returns[..., 0], gae.returns[..., 1]
+            env_advantages, crl_advantages = gae.advantages[..., 0], gae.advantages[..., 1]
+        else:
+            rewards = crl_distance_rewards
+            if exists(aux_rewards):
+                rewards = rewards + self._to_tensor(aux_rewards, torch.float32)
+
+            gae = calc_gae(
+                rewards,
+                values,
+                masks = masks,
+                gamma = self.discount,
+                lam = self.lam,
+                next_values = next_values,
+                return_advantages = True
+            )
+
+            advantages = gae.advantages
+            crl_returns, crl_advantages = gae.returns, gae.advantages
 
         # value regression to the GAE returns
 
-        value_loss = 0.
-        if exists(self.value):
-            flat_returns = rearrange(gae.returns, 'n t -> (n t)')
-            value_loss = self._value_update(flat_states, flat_goals, flat_returns)
+        def update_value(value, opt, returns):
+            return self._value_update(
+                value,
+                opt,
+                flat_states,
+                flat_goals,
+                rearrange(returns, 'n t -> (n t)'),
+                self.value_epochs,
+                self.value_minibatch_size
+            )
+
+        value_loss = update_value(self.value, self.value_opt, crl_returns)
+        env_value_loss = update_value(self.env_value, self.env_value_opt, env_returns) if self.separate_env_rewards else 0.
 
         ppo_epochs = default(ppo_epochs, self.ppo_epochs)
 
@@ -1115,15 +1262,37 @@ class DistanceRewardPPO(Module):
             advantages
         )
 
+        def mean_std(t):
+            return t.mean().item(), t.std().item()
+
+        reward_mean = crl_rewards.mean().item() if self.separate_env_rewards else rewards.mean().item()
+        env_reward_mean = base_rewards.mean().item() if self.separate_env_rewards else 0.
+
+        value_mean, value_std = mean_std(values)
+        env_value_mean, env_value_std = mean_std(env_values) if self.separate_env_rewards else (0., 0.)
+        advantage_mean, advantage_std = mean_std(advantages)
+        env_advantage_mean, env_advantage_std = mean_std(env_advantages) if self.separate_env_rewards else (0., 0.)
+        crl_advantage_mean, crl_advantage_std = mean_std(crl_advantages)
+
         return dict(
             critic_loss = critic_loss,
             value_loss = value_loss,
+            env_value_loss = env_value_loss,
             distance_mean = distances.mean().item(),
-            value_mean = values.mean().item(),
-            value_std = values.std().item(),
-            reward_mean = rewards.mean().item(),
-            advantage_mean = advantages.mean().item(),
-            advantage_std = advantages.std().item(),
+            value_mean = value_mean,
+            value_std = value_std,
+            reward_mean = reward_mean,
+            crl_reward_mean = crl_distance_rewards.mean().item(),
+            env_reward_mean = env_reward_mean,
+            env_value_mean = env_value_mean,
+            env_value_std = env_value_std,
+            env_reward_weight = env_reward_weight,
+            advantage_mean = advantage_mean,
+            advantage_std = advantage_std,
+            env_advantage_mean = env_advantage_mean,
+            env_advantage_std = env_advantage_std,
+            crl_advantage_mean = crl_advantage_mean,
+            crl_advantage_std = crl_advantage_std,
             **ppo_metrics
         )
 
@@ -1156,7 +1325,14 @@ def main(
     reward_temperature = None,
     reward_scale = None,
     success_bonus = None,
+    separate_env_rewards = False,
+    env_reward_weight = 0.5,
+    env_reward_weight_start = None,
+    env_reward_weight_anneal_updates = None,
     exploration_goal_prob = None,
+    room_widths = None,
+    wall_penalty = 0.,
+    action_change_penalty = 0.,
     goal_buffer_size = 8192,
     init_conc = 2.,
     random_warmup_updates = 10,
@@ -1207,13 +1383,22 @@ def main(
     dim_goal = cfg['dim_goal']
     dim_action = cfg['dim_action']
     transform = cfg['transform']
+    room_widths = parse_room_widths(room_widths)
 
     if cfg['goals_from_env']:
+        env_kwargs = dict(
+            max_steps = max_steps,
+            seed = seed,
+            room_widths = room_widths,
+            wall_penalty = wall_penalty,
+            action_change_penalty = action_change_penalty
+        )
+
         def train_env_fn():
-            return FourRoomsEnv(max_steps = max_steps, seed = seed, exploration_goal_prob = exploration_goal_prob)
+            return FourRoomsEnv(**env_kwargs, exploration_goal_prob = exploration_goal_prob)
 
         def eval_env_fn():
-            return FourRoomsEnv(max_steps = max_steps, seed = seed, exploration_goal_prob = 0.)
+            return FourRoomsEnv(**env_kwargs, exploration_goal_prob = 0.)
     else:
         train_env_fn = cfg['make']
         eval_env_fn = cfg['make']
@@ -1292,12 +1477,16 @@ def main(
         future_encoder = goal_encoder
     )
 
-    value = MLP(
-        dim_state + dim_goal,
-        *((value_hidden,) * value_depth),
-        1,
-        activation = nn.SiLU()
-    )
+    def make_value():
+        return MLP(
+            dim_state + dim_goal,
+            *((value_hidden,) * value_depth),
+            1,
+            activation = nn.SiLU()
+        )
+
+    value = make_value()
+    env_value = make_value() if separate_env_rewards else None
 
     state_to_goal_fn = (lambda t: t[..., :dim_goal]) if dim_goal < dim_state else None
 
@@ -1305,6 +1494,9 @@ def main(
         actor,
         critic_wrapper,
         value = value,
+        env_value = env_value,
+        separate_env_rewards = separate_env_rewards,
+        env_reward_weight = env_reward_weight,
         action_type = cfg['action_type'],
         actor_lr = actor_lr,
         critic_lr = critic_lr,
@@ -1339,10 +1531,23 @@ def main(
     best_metric = float('-inf')
     solved_count = 0
     history = []
+    anneal_updates = default(env_reward_weight_anneal_updates, num_updates)
+
+    def current_env_reward_weight(update):
+        if not separate_env_rewards:
+            return 0.
+
+        if not exists(env_reward_weight_start):
+            return env_reward_weight
+
+        progress = min(1., update / max(anneal_updates, 1))
+        return env_reward_weight_start + (env_reward_weight - env_reward_weight_start) * progress
 
     for update in range(1, num_updates + 1):
         if cfg['goals_from_env']:
             set_curriculum(envs, update, curriculum_start_radius, curriculum_step, curriculum_max_radius)
+
+        env_weight = current_env_reward_weight(update)
 
         raw_states = np.zeros((num_envs, rollout_len, dim_state), dtype = np.float32)
         raw_next_states = np.zeros_like(raw_states)
@@ -1350,6 +1555,7 @@ def main(
         actions = np.zeros((num_envs, rollout_len, dim_action), dtype = np.float32) if cfg['action_type'] == 'continuous' else np.zeros((num_envs, rollout_len), dtype = np.int64)
         log_probs = np.zeros((num_envs, rollout_len), dtype = np.float32)
         env_rewards = np.zeros((num_envs, rollout_len), dtype = np.float32)
+        success_rewards = np.zeros((num_envs, rollout_len), dtype = np.float32)
         terminateds = np.zeros((num_envs, rollout_len), dtype = np.bool_)
         truncateds = np.zeros_like(terminateds)
 
@@ -1387,6 +1593,7 @@ def main(
             actions[:, step] = action_np
             log_probs[:, step] = log_prob.cpu().numpy()
             env_rewards[:, step] = step_rewards
+            success_rewards[:, step] = [float(info.get('success', False)) for info in infos]
             terminateds[:, step] = terminated
             truncateds[:, step] = truncated
 
@@ -1419,16 +1626,27 @@ def main(
             metrics = dict(
                 critic_loss = critic_loss,
                 value_loss = 0.,
+                env_value_loss = 0.,
                 distance_mean = 0.,
                 value_mean = 0.,
                 reward_mean = 0.,
+                crl_reward_mean = 0.,
+                env_reward_mean = 0.,
+                env_value_mean = 0.,
+                env_value_std = 0.,
+                env_reward_weight = env_weight,
                 advantage_mean = 0.,
                 advantage_std = 0.,
+                env_advantage_mean = 0.,
+                env_advantage_std = 0.,
+                crl_advantage_mean = 0.,
+                crl_advantage_std = 0.,
                 policy_loss = 0.,
                 entropy = 0.
             )
         else:
-            aux_rewards = success_bonus * env_rewards if success_bonus > 0. else None
+            success_source = success_rewards if separate_env_rewards else env_rewards
+            aux_rewards = success_bonus * success_source if success_bonus > 0. else None
 
             metrics = trainer.update(
                 states = states,
@@ -1438,13 +1656,20 @@ def main(
                 dones = dones,
                 next_states = next_states,
                 terminated = terminateds,
-                aux_rewards = aux_rewards
+                aux_rewards = aux_rewards,
+                base_rewards = env_rewards if separate_env_rewards else None,
+                env_reward_weight = env_weight
             )
 
         row = dict(
             update = update,
             env_steps = update * num_envs * rollout_len,
             **metrics
+        )
+
+        reward_log = (
+            f"crl {metrics['crl_reward_mean']:+.4f} | env {metrics['env_reward_mean']:+.4f} | w_env {metrics['env_reward_weight']:.2f}"
+            if separate_env_rewards else f"reward {metrics['reward_mean']:+.4f}"
         )
 
         if divisible_by(update, eval_every) or update == 1:
@@ -1464,7 +1689,9 @@ def main(
                 row.update(
                     eval_success = metric,
                     eval_return = result['return_mean'],
-                    eval_length = result['length_mean']
+                    eval_length = result['length_mean'],
+                    eval_wall_bump_rate = result['wall_bump_rate'],
+                    eval_action_change_rate = result['action_change_rate']
                 )
 
                 print(
@@ -1472,8 +1699,9 @@ def main(
                     f"critic {metrics['critic_loss']:7.3f} | "
                     f"vloss {metrics['value_loss']:7.3f} | "
                     f"dist {metrics['distance_mean']:6.2f} | "
-                    f"reward {metrics['reward_mean']:+.4f} | "
-                    f"success {metric:6.0%} | len {result['length_mean']:6.1f}",
+                    f"{reward_log} | "
+                    f"success {metric:6.0%} | len {result['length_mean']:6.1f} | "
+                    f"bump {result['wall_bump_rate']:.2f} | switch {result['action_change_rate']:.2f}",
                     flush = True
                 )
             else:
@@ -1508,7 +1736,7 @@ def main(
                     f"vloss {metrics['value_loss']:7.3f} | "
                     f"dist {metrics['distance_mean']:6.2f} | "
                     f"value {metrics['value_mean']:7.3f} | "
-                    f"reward {metrics['reward_mean']:+.4f} | "
+                    f"{reward_log} | "
                     f"eval {metric:7.1f} | len {result['length_mean']:6.1f} | "
                     f"success {result['success_rate']:.0%}",
                     flush = True
@@ -1519,6 +1747,9 @@ def main(
                 torch.save(actor.state_dict(), f'{checkpoint_folder}/actor-best.pt')
                 torch.save(critic_wrapper.state_dict(), f'{checkpoint_folder}/critic-best.pt')
                 torch.save(value.state_dict(), f'{checkpoint_folder}/value-best.pt')
+
+                if exists(env_value):
+                    torch.save(env_value.state_dict(), f'{checkpoint_folder}/env-value-best.pt')
 
                 if exists(rms):
                     torch.save(rms.state_dict(), f'{checkpoint_folder}/rms-best.pt')
@@ -1550,7 +1781,7 @@ def main(
                 f"critic {metrics['critic_loss']:7.3f} | "
                 f"vloss {metrics['value_loss']:7.3f} | "
                 f"dist {metrics['distance_mean']:6.2f} | "
-                f"reward {metrics['reward_mean']:+.4f}",
+                f"{reward_log}",
                 flush = True
             )
 
@@ -1560,6 +1791,9 @@ def main(
     torch.save(actor.state_dict(), f'{checkpoint_folder}/actor-final.pt')
     torch.save(critic_wrapper.state_dict(), f'{checkpoint_folder}/critic-final.pt')
     torch.save(value.state_dict(), f'{checkpoint_folder}/value-final.pt')
+
+    if exists(env_value):
+        torch.save(env_value.state_dict(), f'{checkpoint_folder}/env-value-final.pt')
 
     if exists(rms):
         torch.save(rms.state_dict(), f'{checkpoint_folder}/rms-final.pt')
