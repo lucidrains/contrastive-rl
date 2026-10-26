@@ -645,3 +645,55 @@ def test_squared_chord_distance():
     assert torch.allclose(calc_distance(a, a), torch.tensor(0.), atol = 1e-6)
     assert torch.allclose(calc_distance(a, b), torch.tensor(2.), atol = 1e-6)
     assert torch.allclose(calc_distance(a, c), torch.tensor(4.), atol = 1e-6)
+
+def test_c_slerp_plan_e2e():
+    import torch.nn.functional as F
+    from contrastive_rl_pytorch import CSlerpPlan, c_slerp_plan
+
+    dim = 8
+    state = F.normalize(torch.randn(dim), dim = -1)
+    goal = F.normalize(torch.randn(dim), dim = -1)
+
+    # orthogonal state encoder / decoder
+
+    rotation = torch.linalg.qr(torch.randn(dim, dim)).Q
+    encode = lambda x: rotation @ x
+    decode_state = lambda embed: rotation.T @ embed
+
+    state_embed, goal_embed = encode(state), encode(goal)
+
+    # deterministic plan, identity rotation
+
+    plan = c_slerp_plan(state_embed, goal_embed, num_waypoints = 2, alpha = 0.)
+    assert isinstance(plan, CSlerpPlan)
+
+    # decode plan fields
+
+    waypoints, num_waypoints, selected_index, subgoal = plan
+    assert num_waypoints == 2
+    assert waypoints.shape == (3, dim)
+    assert torch.allclose(waypoints.norm(dim = -1), torch.ones(3), atol = 1e-5)
+    assert selected_index is None and subgoal is None
+
+    # waypoints progress toward goal, last one is goal
+
+    cos = waypoints @ goal_embed
+    assert torch.all(cos[1:] > cos[:-1])
+    assert torch.allclose(waypoints[-1], goal_embed, atol = 1e-5)
+
+    # decode state from last waypoint
+
+    assert torch.allclose(decode_state(waypoints[-1]), goal, atol = 1e-5)
+
+    # furthest reachable waypoint becomes subgoal
+
+    score_fn = lambda state, waypoints: waypoints @ state
+    plan = c_slerp_plan(state_embed, goal_embed, num_waypoints = 2, alpha = 0., threshold = -1., score_fn = score_fn)
+
+    waypoints, num_waypoints, selected_index, subgoal = plan
+    assert selected_index == 2
+    assert torch.allclose(subgoal, waypoints[2], atol = 1e-5)
+
+    # decode state from subgoal
+
+    assert torch.allclose(decode_state(subgoal), goal, atol = 1e-5)

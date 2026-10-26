@@ -578,12 +578,17 @@ class ContrastiveWrapper(Module):
         self,
         encoder: Module,
         contrastive_learn: Module,
-        future_encoder: Module | None = None
+        future_encoder: Module | None = None,
+        state_decoder: Module | None = None,
+        state_decoder_weight = 1.
     ):
         super().__init__()
 
         self.encode = encoder
         self.encode_future = default(future_encoder, encoder)
+
+        self.state_decoder = state_decoder
+        self.state_decoder_weight = state_decoder_weight
 
         self.contrastive_learn = contrastive_learn
         self.all_gather = AllGather()
@@ -628,6 +633,15 @@ class ContrastiveWrapper(Module):
         encoded_past = self.encode(past)
         encoded_future = self.encode_future(future)
 
+        # auxiliary reconstruction, so waypoint embeddings can be decoded for visualization
+
+        decoder_loss = encoded_future.new_zeros(())
+
+        if exists(self.state_decoder):
+            future_embed = l2norm(encoded_future) if self.contrastive_learn.l2norm_embed else encoded_future
+            decoded_future = self.state_decoder(future_embed)
+            decoder_loss = F.mse_loss(decoded_future, future) * self.state_decoder_weight
+
         if is_distributed():
             encoded_past, _ = self.all_gather(encoded_past)
             encoded_future, _ = self.all_gather(encoded_future)
@@ -645,7 +659,7 @@ class ContrastiveWrapper(Module):
         else:
             loss = self.contrastive_learn(encoded_past, encoded_future)
 
-        return loss
+        return loss + decoder_loss
 
 # contrastive RL trainer
 
@@ -670,7 +684,9 @@ class ContrastiveRLTrainer(Module):
         accelerate_kwargs: dict = dict(),
         cpu = False,
         state_to_goal_fn: Callable = identity,
-        state_to_critic_state_fn: Callable = identity
+        state_to_critic_state_fn: Callable = identity,
+        state_decoder: Module | None = None,
+        state_decoder_weight = 1.
     ):
         super().__init__()
 
@@ -689,7 +705,9 @@ class ContrastiveRLTrainer(Module):
         contrast_wrapper = ContrastiveWrapper(
             encoder = encoder,
             future_encoder = future_encoder,
-            contrastive_learn = contrastive_learn
+            contrastive_learn = contrastive_learn,
+            state_decoder = state_decoder,
+            state_decoder_weight = state_decoder_weight
         )
 
         assert divisible_by(batch_size, repetition_factor)
