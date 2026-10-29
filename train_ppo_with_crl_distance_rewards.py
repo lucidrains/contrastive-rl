@@ -530,9 +530,8 @@ def env_config(name):
             actor_depth = 2,
             critic_hidden = 256,
             critic_depth = 2,
-            critic_distance_scale = 1.,
-            critic_lse_reg = 0.1,
-            reward_temperature = 5.,
+            critic_distance_scale = 10.,
+            reward_distance_scale = 2.,
             reward_scale = 1.,
             critic_discount = 0.9,
             entropy_coef = 0.,
@@ -561,9 +560,8 @@ def env_config(name):
             actor_depth = 3,
             critic_hidden = 256,
             critic_depth = 3,
-            critic_distance_scale = 1.,
-            critic_lse_reg = 0.1,
-            reward_temperature = 10.,
+            critic_distance_scale = 10.,
+            reward_distance_scale = 2.,
             reward_scale = 1.,
             critic_discount = 0.95,
             entropy_coef = 0.,
@@ -592,9 +590,8 @@ def env_config(name):
         actor_depth = 2,
         critic_hidden = 128,
         critic_depth = 2,
-        critic_distance_scale = 5.,
-        critic_lse_reg = 0.01,
-        reward_temperature = 5.,
+        critic_distance_scale = 10.,
+        reward_distance_scale = 2.,
         reward_scale = 0.01,
         critic_discount = 0.95,
         entropy_coef = 0.01,
@@ -780,7 +777,7 @@ class CategoricalActor(Module):
 
 class DistanceRewardPPO(Module):
     # ppo with state-goal crl distance rewards
-    # reward = exp(-||phi(s') - psi(g*)|| / tau)
+    # reward = exp(-||l2norm(phi(s')) - l2norm(psi(g*))|| * scale)
     # advantage = standard GAE with a separate value net
 
     def __init__(
@@ -802,7 +799,8 @@ class DistanceRewardPPO(Module):
         critic_batch_size = 256,
         critic_discount = 0.9,
         critic_negative_buffer_size = 8192,
-        reward_temperature = 5.,
+        distance_type = 'chord',
+        reward_distance_scale = 2.,
         reward_scale = 1.,
         value: Module | None = None,
         env_value: Module | None = None,
@@ -841,7 +839,8 @@ class DistanceRewardPPO(Module):
         self.critic_batch_size = critic_batch_size
         self.critic_discount = critic_discount
         self.critic_negative_buffer_size = critic_negative_buffer_size
-        self.reward_temperature = reward_temperature
+        self.distance_type = distance_type
+        self.reward_distance_scale = reward_distance_scale
         self.reward_scale = reward_scale
         self.value_epochs = value_epochs
         self.value_minibatch_size = default(value_minibatch_size, minibatch_size)
@@ -1157,8 +1156,8 @@ class DistanceRewardPPO(Module):
         # reward
 
         with torch.no_grad():
-            distances = self.critic_wrapper.distance_pairs(flat_next_states, flat_goals)
-            crl_distance_rewards = torch.exp(-distances / self.reward_temperature) * self.reward_scale
+            distances = self.critic_wrapper.distance_pairs(flat_next_states, flat_goals, distance_type = self.distance_type)
+            crl_distance_rewards = torch.exp(-distances * self.reward_distance_scale) * self.reward_scale
 
             crl_distance_rewards = rearrange(crl_distance_rewards, '(n t) -> n t', n = num_trajs)
             distances = rearrange(distances, '(n t) -> n t', n = num_trajs)
@@ -1322,7 +1321,8 @@ def main(
     value_depth = 2,
     value_epochs = 4,
     critic_embed_dim = 64,
-    reward_temperature = None,
+    distance_type = 'chord',
+    reward_distance_scale = None,
     reward_scale = None,
     success_bonus = None,
     separate_env_rewards = False,
@@ -1365,7 +1365,7 @@ def main(
     max_steps = default(max_steps, cfg['max_steps'])
     entropy_coef = default(entropy_coef, cfg['entropy_coef'])
     critic_discount = default(critic_discount, cfg['critic_discount'])
-    reward_temperature = default(reward_temperature, cfg['reward_temperature'])
+    reward_distance_scale = default(reward_distance_scale, cfg['reward_distance_scale'])
     reward_scale = default(reward_scale, cfg['reward_scale'])
     success_bonus = default(success_bonus, cfg['success_bonus'])
     exploration_goal_prob = default(exploration_goal_prob, cfg['exploration_goal_prob'])
@@ -1464,11 +1464,10 @@ def main(
 
     contrastive_learn = ContrastiveLearning(
         use_euclidean = True,
-        l2norm_embed = False,
+        l2norm_embed = True,
         learned_temp = False,
         scale = cfg['critic_distance_scale'],
-        symmetric = False,
-        lse_reg_weight = cfg['critic_lse_reg']
+        symmetric = False
     )
 
     critic_wrapper = ContrastiveWrapper(
@@ -1513,7 +1512,8 @@ def main(
         critic_batch_size = critic_batch_size,
         critic_discount = critic_discount,
         critic_negative_buffer_size = critic_negative_buffer_size,
-        reward_temperature = reward_temperature,
+        distance_type = distance_type,
+        reward_distance_scale = reward_distance_scale,
         reward_scale = reward_scale,
         state_to_goal_fn = state_to_goal_fn,
         device = device

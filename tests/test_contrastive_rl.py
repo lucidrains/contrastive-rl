@@ -18,9 +18,12 @@ def test_contrast_loss_lse_reg():
     from contrastive_rl_pytorch.contrastive_rl import ContrastiveLearning
 
     with pytest.raises(AssertionError):
-        ContrastiveLearning(symmetric = True, lse_reg_weight = 0.01)
+        ContrastiveLearning(symmetric = True, l2norm_embed = False, lse_reg_weight = 0.01)
 
-    learn = ContrastiveLearning(symmetric = False, lse_reg_weight = 0.01)
+    with pytest.raises(AssertionError):
+        ContrastiveLearning(symmetric = False, l2norm_embed = True, lse_reg_weight = 0.01)
+
+    learn = ContrastiveLearning(symmetric = False, l2norm_embed = False, lse_reg_weight = 0.01)
     loss = learn(torch.randn(10, 128), torch.randn(10, 128))
 
     assert loss.numel() == 1
@@ -617,7 +620,7 @@ def test_temporal_distance_types():
     delta_times = torch.randint(1, 8, (batch, 1))
     raw_discount = torch.full((batch, 1), 0.9)
 
-    for distance_type in ('euclidean', 'squared_chord'):
+    for distance_type in ('euclidean', 'chord', 'squared_chord'):
         learn = SigmoidContrastiveLearning(
             l2norm_embed = True,
             time_weight = 1.,
@@ -635,7 +638,7 @@ def test_temporal_distance_types():
 
         assert torch.isfinite(loss)
 
-def test_squared_chord_distance():
+def test_chord_and_squared_chord_distance():
     from contrastive_rl_pytorch.contrastive_rl import calc_distance
 
     a = torch.tensor([1., 0., 0., 0.])
@@ -645,6 +648,10 @@ def test_squared_chord_distance():
     assert torch.allclose(calc_distance(a, a), torch.tensor(0.), atol = 1e-6)
     assert torch.allclose(calc_distance(a, b), torch.tensor(2.), atol = 1e-6)
     assert torch.allclose(calc_distance(a, c), torch.tensor(4.), atol = 1e-6)
+
+    assert torch.allclose(calc_distance(a, a, distance_type = 'chord'), torch.tensor(0.), atol = 1e-6)
+    assert torch.allclose(calc_distance(a, b, distance_type = 'chord'), torch.tensor(2.).sqrt(), atol = 1e-6)
+    assert torch.allclose(calc_distance(a, c, distance_type = 'chord'), torch.tensor(2.), atol = 1e-6)
 
 def test_c_slerp_plan_e2e():
     import torch.nn.functional as F

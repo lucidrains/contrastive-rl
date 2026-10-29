@@ -90,10 +90,9 @@ def arange_from_tensor_dim(t, dim = 0):
 
 # distance helper
 
-# temporal distances: euclidean for unnormalized critics, squared chord on the sphere
-# geodesic, chord, and log-cosine were dropped after squared chord converged more reliably
+# temporal distances: euclidean for unnormalized critics, chord or squared chord on the sphere
 
-TEMPORAL_DISTANCE_TYPES = ('euclidean', 'squared_chord')
+TEMPORAL_DISTANCE_TYPES = ('euclidean', 'chord', 'squared_chord')
 
 @fallback_from('mps')
 def pairwise_euclidean_distance(embeds1, embeds2):
@@ -108,16 +107,16 @@ def calc_distance(
     all_pairs = False
 ):
     distance_type = default(distance_type, 'euclidean' if use_euclidean else 'squared_chord')
+    assert distance_type in TEMPORAL_DISTANCE_TYPES, f'unknown distance type {distance_type}'
 
-    if distance_type == 'euclidean':
+    if distance_type in ('chord', 'squared_chord'):
+        embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
+
+    if distance_type in ('euclidean', 'chord'):
         if all_pairs:
             return pairwise_euclidean_distance(embeds1, embeds2)
 
         return (embeds1 - embeds2).norm(dim = -1)
-
-    assert distance_type == 'squared_chord', f'unknown distance type {distance_type}'
-
-    embeds1, embeds2 = map(l2norm, (embeds1, embeds2))
 
     if all_pairs:
         cos = einsum(embeds1, embeds2, 'i d, j d -> i j')
@@ -210,6 +209,7 @@ def calc_embedding_temporal_loss(
 
     max_distance = dict(
         euclidean = 2. if l2norm_embed else None,
+        chord = 2.,
         squared_chord = 4.
     )[distance_type]
 
@@ -355,6 +355,7 @@ class ContrastiveLearning(Module):
         assert not (has_temporal and temporal_distance_type in TEMPORAL_DISTANCE_TYPES[1:] and not l2norm_embed), 'hyperspherical temporal distance requires l2norm_embed'
         assert not has_rotation or rotation_dim >= 1
         assert not (symmetric and has_lse_reg), 'lse_reg_weight requires symmetric = False'
+        assert not (l2norm_embed and has_lse_reg), 'lse_reg_weight cannot be enabled with l2norm_embed'
         assert not (has_rotation and (use_euclidean or not l2norm_embed)), 'rotation requires l2norm and cosine similarity'
 
         self.l2norm_embed = l2norm_embed
@@ -419,7 +420,7 @@ class ContrastiveLearning(Module):
         loss = F.cross_entropy(sim, labels)
 
         if self.symmetric:
-            loss = (loss + F.cross_entropy(rearrange(sim, 'i j -> j i'), labels)) * 0.5
+            loss = (loss + F.cross_entropy(rearrange(sim[:, :labels.shape[0]], 'i j -> j i'), labels)) * 0.5
 
         if self.has_lse_reg:
             loss = loss + self.lse_reg_weight * sim.logsumexp(dim = -1).square().mean()
@@ -597,16 +598,18 @@ class ContrastiveWrapper(Module):
     def scale(self):
         return self.contrastive_learn.scale
 
-    def distance_pairs(self, past, future):
+    def distance_pairs(self, past, future, distance_type: str | None = None):
+        cl = self.contrastive_learn
         past_embeds, future_embeds = self.encode(past), self.encode_future(future)
 
-        if self.contrastive_learn.l2norm_embed:
+        if cl.has_rotation and not cl.use_euclidean:
             past_embeds, future_embeds = map(l2norm, (past_embeds, future_embeds))
+            future_embeds = einsum(cl.rotation, future_embeds, 'i j, ... j -> ... i')
 
-        if self.contrastive_learn.has_rotation and not self.contrastive_learn.use_euclidean:
-            future_embeds = einsum(self.contrastive_learn.rotation, future_embeds, 'i j, ... j -> ... i')
+        default_distance_type = ('chord' if cl.l2norm_embed else 'euclidean') if cl.use_euclidean else 'squared_chord'
+        distance_type = default(distance_type, default_distance_type)
 
-        return calc_distance(past_embeds, future_embeds, use_euclidean = self.contrastive_learn.use_euclidean)
+        return calc_distance(past_embeds, future_embeds, distance_type = distance_type)
 
     def forward(
         self,
