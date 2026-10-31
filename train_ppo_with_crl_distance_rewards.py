@@ -1,6 +1,7 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
+#   "env-ssl-wrapper>=0.6.5",
 #   "fire",
 #   "gymnasium[box2d]",
 #   "gymnasium[mujoco]",
@@ -43,8 +44,8 @@ from einops import rearrange, repeat
 from torch_einops_utils.shape import divisible_by, shape
 
 from fire import Fire
-import imageio.v2 as imageio
 
+from env_ssl_wrapper import evaluate_actor, record_actor_video
 from x_mlps_pytorch import MLP
 from x_ppo import calc_gae, combine_grouped_advantages, ppo_actor_loss
 from mean_conc_beta import Beta
@@ -232,6 +233,18 @@ def store_eval_episode(replay_buffer, states, rewards, actions, goals = None):
 
     replay_buffer.store_episode(**data)
 
+def store_eval_trace(replay_buffer, ep):
+    if not exists(replay_buffer) or len(ep['states']) < 2:
+        return
+
+    store_eval_episode(
+        replay_buffer,
+        np.asarray(ep['states'], dtype = np.float32),
+        np.asarray(ep['rewards'], dtype = np.float32),
+        np.asarray(ep['actions'], dtype = np.float32).reshape(len(ep['actions']), -1),
+        np.asarray(ep['goals'], dtype = np.float32) if ep['goals'] else None
+    )
+
 # eval loops
 
 def evaluate_continuous(
@@ -249,62 +262,25 @@ def evaluate_continuous(
     success_threshold = None,
     goal_normalize = None
 ):
-    env = env_fn()
+    goal_norm = goal_normalize(rms, goal) if exists(goal_normalize) else np.asarray(goal, dtype = np.float32)
 
-    returns, lengths, successes = [], [], []
-
-    for ep in range(episodes):
-        obs, _ = env.reset(seed = seed + ep)
-
-        ep_states, ep_actions, ep_rewards = [], [], []
-        total = 0.
-        steps = 0
-
-        while steps < max_steps:
-            transformed = obs_transform(obs)
-            normed = rms.normalize(transformed) if exists(rms) else np.asarray(transformed, dtype = np.float32)
-            goal_norm = goal_normalize(rms, goal) if exists(goal_normalize) else np.asarray(goal, dtype = np.float32)
-
-            state_t = torch.from_numpy(normed).float().to(trainer.device)
-            goal_t = torch.from_numpy(goal_norm).float().to(trainer.device)
-
-            action, _ = trainer.act(state_t, goal_t, deterministic = deterministic)
-            action_np = action.detach().cpu().numpy().reshape(-1) * action_scale
-
-            next_obs, reward, terminated, truncated, _ = env.step(action_np)
-            done = terminated or truncated
-
-            ep_states.append(normed)
-            ep_actions.append(action.detach().cpu().numpy().reshape(-1))
-            ep_rewards.append(float(reward))
-
-            total += float(reward)
-            steps += 1
-            obs = next_obs
-
-            if done:
-                break
-
-        returns.append(total)
-        lengths.append(steps)
-        successes.append(bool(success_threshold is not None and total >= success_threshold))
-
-        if replay_buffer is not None and len(ep_states) >= 2:
-            goals = np.repeat(np.asarray(goal_norm, dtype = np.float32)[None], len(ep_states), axis = 0)
-            store_eval_episode(
-                replay_buffer,
-                np.asarray(ep_states, dtype = np.float32),
-                np.asarray(ep_rewards, dtype = np.float32),
-                np.asarray(ep_actions, dtype = np.float32),
-                goals
-            )
-
-    env.close()
+    stats = evaluate_actor(
+        trainer,
+        env_fn,
+        episodes = episodes,
+        max_steps = max_steps,
+        seed = seed,
+        goal = goal_norm,
+        obs_transform = lambda obs: rms.normalize(obs_transform(obs)) if exists(rms) else np.asarray(obs_transform(obs), dtype = np.float32),
+        action_scale = action_scale,
+        deterministic = deterministic,
+        on_episode = (lambda ep: store_eval_trace(replay_buffer, ep)) if exists(replay_buffer) else None
+    )
 
     return dict(
-        return_mean = float(np.mean(returns)),
-        length_mean = float(np.mean(lengths)),
-        success_rate = float(np.mean(successes)) if success_threshold is not None else None
+        return_mean = stats.mean,
+        length_mean = stats.lengths.mean().item(),
+        success_rate = stats.success_rate(success_threshold) if exists(success_threshold) else None
     )
 
 # json logging
@@ -368,7 +344,7 @@ def make_room_grid(size, room_widths):
     return size, walls, wall_positions.tolist()
 
 class FourRoomsEnv(gym.Env):
-    metadata = dict(render_modes = ('rgb_array',))
+    metadata = dict(render_modes = ('rgb_array',), render_fps = 8)
 
     def __init__(
         self,
@@ -454,7 +430,11 @@ class FourRoomsEnv(gym.Env):
 
         self.steps = 0
         self.prev_action = None
-        return self._obs(), dict(goal = self.goal / (self.size - 1))
+        return self._obs(), dict(
+            goal = self.goal / (self.size - 1),
+            start_room = self.room_of(self.agent),
+            goal_room = self.room_of(self.goal)
+        )
 
     def step(self, action):
         action = int(action)
@@ -513,7 +493,7 @@ def set_curriculum(envs, update, start_radius = 2, step = 4, max_radius = 20):
 def env_config(name):
     if name == 'inverted_pendulum':
         return dict(
-            make = lambda: gym.make('InvertedPendulum-v5'),
+            make = lambda render_mode = None: gym.make('InvertedPendulum-v5', render_mode = render_mode),
             transform = transform_pendulum,
             target_goal = np.array([0., 0., 1., 0., 0.], dtype = np.float32),
             dim_state = 5,
@@ -543,7 +523,7 @@ def env_config(name):
 
     if name == 'lunar_continuous':
         return dict(
-            make = lambda: gym.make('LunarLander-v3', continuous = True),
+            make = lambda render_mode = None: gym.make('LunarLander-v3', continuous = True, render_mode = render_mode),
             transform = transform_lunar,
             target_goal = np.array([0., 0., 0., 0., 0., 1., 0.], dtype = np.float32),
             dim_state = 9,
@@ -604,119 +584,33 @@ def env_config(name):
 # four rooms eval / video
 
 def evaluate_fourrooms(trainer, env_fn, episodes = 20, max_steps = 128, seed = 0, replay_buffer = None):
-    env = env_fn()
+    successes, wall_bump_rates, action_change_rates = [], [], []
 
-    successes, returns, lengths = [], [], []
-    wall_bump_rates, action_change_rates = [], []
+    def on_episode(ep):
+        steps = max(len(ep['infos']), 1)
+        successes.append(bool(ep['info'].get('success', False)))
+        wall_bump_rates.append(sum(info.get('wall_bump', False) for info in ep['infos']) / steps)
+        action_change_rates.append(sum(info.get('action_change', False) for info in ep['infos']) / steps)
+        store_eval_trace(replay_buffer, ep)
 
-    for ep in range(episodes):
-        obs, info = env.reset(seed = seed + ep)
-        goal = info['goal']
-
-        ep_states, ep_actions, ep_rewards, ep_goals = [], [], [], []
-        total = 0.
-        steps = 0
-        wall_bumps = 0
-        action_changes = 0
-
-        while steps < max_steps:
-            state_t = torch.from_numpy(obs).float().to(trainer.device)
-            goal_t = torch.from_numpy(goal).float().to(trainer.device)
-
-            action, _ = trainer.act(state_t, goal_t, deterministic = True)
-            action_np = int(action.item())
-
-            next_obs, reward, terminated, truncated, info = env.step(action_np)
-            done = terminated or truncated
-
-            ep_states.append(obs)
-            ep_actions.append(action_np)
-            ep_rewards.append(float(reward))
-            ep_goals.append(goal)
-
-            total += float(reward)
-            wall_bumps += info.get('wall_bump', False)
-            action_changes += info.get('action_change', False)
-            steps += 1
-            obs = next_obs
-
-            if done:
-                break
-
-        successes.append(bool(info.get('success', False)))
-        returns.append(total)
-        lengths.append(steps)
-        wall_bump_rates.append(wall_bumps / max(steps, 1))
-        action_change_rates.append(action_changes / max(steps, 1))
-
-        if replay_buffer is not None and len(ep_states) >= 2:
-            store_eval_episode(
-                replay_buffer,
-                np.asarray(ep_states, dtype = np.float32),
-                np.asarray(ep_rewards, dtype = np.float32),
-                np.asarray(ep_actions, dtype = np.float32),
-                np.asarray(ep_goals, dtype = np.float32)
-            )
-
-    env.close()
+    stats = evaluate_actor(
+        trainer,
+        env_fn,
+        episodes = episodes,
+        max_steps = max_steps,
+        seed = seed,
+        goal = 'goal',
+        deterministic = True,
+        on_episode = on_episode
+    )
 
     return dict(
         success_rate = float(np.mean(successes)),
-        return_mean = float(np.mean(returns)),
-        length_mean = float(np.mean(lengths)),
+        return_mean = stats.mean,
+        length_mean = stats.lengths.mean().item(),
         wall_bump_rate = float(np.mean(wall_bump_rates)),
         action_change_rate = float(np.mean(action_change_rates))
     )
-
-def record_winning_video(trainer, env_fn, path, max_steps = 128, seed = 0, episodes = 200, fps = 8, contact_sheet_frames = 6):
-    env = env_fn()
-    candidates = []
-
-    for ep in range(episodes):
-        obs, info = env.reset(seed = seed + ep)
-        goal = info['goal']
-        start = env.agent.copy()
-        frames = [env.render()]
-        won = False
-
-        for _ in range(max_steps):
-            state_t = torch.from_numpy(obs).float().to(trainer.device)
-            goal_t = torch.from_numpy(goal).float().to(trainer.device)
-
-            action, _ = trainer.act(state_t, goal_t, deterministic = True)
-            obs, _, terminated, truncated, _ = env.step(int(action.item()))
-            frames.append(env.render())
-
-            if terminated:
-                won = True
-                break
-
-            if truncated:
-                break
-
-        if won:
-            candidates.append(dict(frames = frames, start_room = env.room_of(start), goal_room = env.room_of(env.goal)))
-
-    env.close()
-
-    assert len(candidates) > 0, 'no winning episode found'
-
-    preferred = [c for c in candidates if c['start_room'] != c['goal_room'] and c['start_room'] == 0]
-    preferred = preferred or [c for c in candidates if c['start_room'] != c['goal_room']]
-    best = max(preferred or candidates, key = lambda c: len(c['frames']))
-    frames = best['frames']
-
-    path = Path(path)
-    path.parent.mkdir(parents = True, exist_ok = True)
-
-    imageio.mimsave(path, frames, fps = fps)
-    imageio.mimsave(path.with_suffix('.gif'), frames, fps = fps, loop = 0)
-
-    picks = np.linspace(0, len(frames) - 1, min(contact_sheet_frames, len(frames))).astype(int)
-    contact = np.concatenate([frames[i] for i in picks], axis = 1)
-    imageio.imwrite(path.with_name('winning-contact-sheet.png'), contact)
-
-    return path
 
 # actors
 
@@ -778,7 +672,7 @@ class CategoricalActor(Module):
 class DistanceRewardPPO(Module):
     # ppo with state-goal crl distance rewards
     # reward = exp(-||l2norm(phi(s')) - l2norm(psi(g*))|| * scale)
-    # advantage = standard GAE with a separate value net
+    # advantage = standard GAE, or multi-critic weighted combination with base env rewards (Mysore et al.)
 
     def __init__(
         self,
@@ -804,6 +698,7 @@ class DistanceRewardPPO(Module):
         reward_scale = 1.,
         value: Module | None = None,
         env_value: Module | None = None,
+        add_env_rewards = False,
         separate_env_rewards = False,
         env_reward_weight = 0.5,
         value_lr: float | None = None,
@@ -818,6 +713,9 @@ class DistanceRewardPPO(Module):
 
         assert action_type in ('continuous', 'discrete')
 
+        if add_env_rewards:
+            separate_env_rewards = False
+
         if separate_env_rewards:
             assert exists(value) and exists(env_value), 'separate_env_rewards needs a value net for both the crl and environment reward streams'
 
@@ -826,6 +724,7 @@ class DistanceRewardPPO(Module):
         self.value = value
         self.env_value = env_value
         self.action_type = action_type
+        self.add_env_rewards = add_env_rewards
         self.separate_env_rewards = separate_env_rewards
         self.env_reward_weight = env_reward_weight
 
@@ -1184,7 +1083,7 @@ class DistanceRewardPPO(Module):
         env_reward_weight = min(max(float(env_reward_weight), 0.), 1.)
         crl_reward_weight = 1. - env_reward_weight
 
-        # separate env reward stream: own value net / GAE, advantages blended by weight
+        # separate env reward stream: own value net / GAE, advantages blended by weight (Mysore et al.)
 
         if self.separate_env_rewards:
             assert exists(base_rewards), 'base_rewards must be passed when separate_env_rewards is enabled'
@@ -1221,6 +1120,12 @@ class DistanceRewardPPO(Module):
             rewards = crl_distance_rewards
             if exists(aux_rewards):
                 rewards = rewards + self._to_tensor(aux_rewards, torch.float32)
+
+            if self.add_env_rewards:
+                assert exists(base_rewards), 'base_rewards must be passed when add_env_rewards is enabled'
+                base_rewards = self._to_tensor(base_rewards, torch.float32)
+                assert base_rewards.shape == crl_distance_rewards.shape
+                rewards = base_rewards + rewards
 
             gae = calc_gae(
                 rewards,
@@ -1264,8 +1169,9 @@ class DistanceRewardPPO(Module):
         def mean_std(t):
             return t.mean().item(), t.std().item()
 
+        use_env_rewards = self.separate_env_rewards or self.add_env_rewards
         reward_mean = crl_rewards.mean().item() if self.separate_env_rewards else rewards.mean().item()
-        env_reward_mean = base_rewards.mean().item() if self.separate_env_rewards else 0.
+        env_reward_mean = base_rewards.mean().item() if use_env_rewards else 0.
 
         value_mean, value_std = mean_std(values)
         env_value_mean, env_value_std = mean_std(env_values) if self.separate_env_rewards else (0., 0.)
@@ -1325,7 +1231,8 @@ def main(
     reward_distance_scale = None,
     reward_scale = None,
     success_bonus = None,
-    separate_env_rewards = False,
+    add_env_rewards = False,
+    separate_env_rewards = True,
     env_reward_weight = 0.5,
     env_reward_weight_start = None,
     env_reward_weight_anneal_updates = None,
@@ -1342,7 +1249,7 @@ def main(
     eval_buffer_size = 5000,
     eval_seed_offset = 10_000,
     video_seed_offset = 20_000,
-    video_fps = 8,
+    video_fps = None,
     contact_sheet_frames = 6,
     curriculum_start_radius = 2,
     curriculum_step = 4,
@@ -1484,6 +1391,11 @@ def main(
             activation = nn.SiLU()
         )
 
+    if add_env_rewards:
+        separate_env_rewards = False
+
+    use_env_rewards = separate_env_rewards or add_env_rewards
+
     value = make_value()
     env_value = make_value() if separate_env_rewards else None
 
@@ -1494,6 +1406,7 @@ def main(
         critic_wrapper,
         value = value,
         env_value = env_value,
+        add_env_rewards = add_env_rewards,
         separate_env_rewards = separate_env_rewards,
         env_reward_weight = env_reward_weight,
         action_type = cfg['action_type'],
@@ -1645,7 +1558,7 @@ def main(
                 entropy = 0.
             )
         else:
-            success_source = success_rewards if separate_env_rewards else env_rewards
+            success_source = success_rewards if use_env_rewards else env_rewards
             aux_rewards = success_bonus * success_source if success_bonus > 0. else None
 
             metrics = trainer.update(
@@ -1657,7 +1570,7 @@ def main(
                 next_states = next_states,
                 terminated = terminateds,
                 aux_rewards = aux_rewards,
-                base_rewards = env_rewards if separate_env_rewards else None,
+                base_rewards = env_rewards if use_env_rewards else None,
                 env_reward_weight = env_weight
             )
 
@@ -1667,10 +1580,12 @@ def main(
             **metrics
         )
 
-        reward_log = (
-            f"crl {metrics['crl_reward_mean']:+.4f} | env {metrics['env_reward_mean']:+.4f} | w_env {metrics['env_reward_weight']:.2f}"
-            if separate_env_rewards else f"reward {metrics['reward_mean']:+.4f}"
-        )
+        if separate_env_rewards:
+            reward_log = f"crl {metrics['crl_reward_mean']:+.4f} | env {metrics['env_reward_mean']:+.4f} | w_env {metrics['env_reward_weight']:.2f}"
+        elif add_env_rewards:
+            reward_log = f"reward {metrics['reward_mean']:+.4f} (crl {metrics['crl_reward_mean']:+.4f} + env {metrics['env_reward_mean']:+.4f})"
+        else:
+            reward_log = f"reward {metrics['reward_mean']:+.4f}"
 
         if divisible_by(update, eval_every) or update == 1:
             if cfg['goals_from_env']:
@@ -1760,17 +1675,40 @@ def main(
                 print(f'solved at update {update}', flush = True)
 
                 if cfg['goals_from_env']:
-                    video_path = record_winning_video(
+                    video_path = record_actor_video(
                         trainer,
                         eval_env_fn,
                         Path(video_folder) / 'winning.mp4',
+                        episodes = 200,
                         max_steps = max_steps,
                         seed = video_seed_offset + seed,
+                        goal = 'goal',
                         fps = video_fps,
-                        contact_sheet_frames = contact_sheet_frames
+                        contact_sheet_frames = contact_sheet_frames,
+                        stop_on_success = False,
+                        video_select = lambda ep: (
+                            ep['reset_info']['start_room'] != ep['reset_info']['goal_room'],
+                            ep['reset_info']['start_room'] == 0,
+                            ep['length']
+                        ) if ep['terminated'] else None
+                    )
+                else:
+                    video_path = record_actor_video(
+                        trainer,
+                        eval_env_fn,
+                        Path(video_folder) / 'winning.mp4',
+                        episodes = num_eval_episodes,
+                        max_steps = max_steps,
+                        seed = video_seed_offset + seed,
+                        goal = normalize_goal(rms, cfg['target_goal'], dim_goal) if exists(rms) else cfg['target_goal'],
+                        obs_transform = lambda o: rms.normalize(transform(o)) if exists(rms) else transform(o),
+                        action_scale = cfg['action_scale'],
+                        fps = video_fps,
+                        contact_sheet_frames = contact_sheet_frames,
+                        success_threshold = cfg['success']
                     )
 
-                    print(f'video saved to {video_path}', flush = True)
+                print(f'video saved to {video_path}', flush = True)
 
                 history.append(row)
                 append_jsonl(log_path, row)

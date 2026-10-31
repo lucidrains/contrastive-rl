@@ -704,3 +704,4 @@ def test_c_slerp_plan_e2e():
     # decode state from subgoal
 
     assert torch.allclose(decode_state(subgoal), goal, atol = 1e-5)
+

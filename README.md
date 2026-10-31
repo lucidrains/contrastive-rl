@@ -306,3 +306,13 @@ wait until 3-5k steps at least
     url     = {https://arxiv.org/abs/2605.13554}
 }
 ```
+
+```bibtex
+@inproceedings{mysore2022multicritic,
+    title   = {Multi-Critic Actor Learning: Teaching RL Policies to Act with Style},
+    author  = {Siddharth Mysore and George Cheng and Yunqi Zhao and Kate Saenko and Meng Wu},
+    booktitle = {International Conference on Learning Representations},
+    year    = {2022},
+    url     = {https://openreview.net/forum?id=rJvY_5OzoI}
+}
+```
