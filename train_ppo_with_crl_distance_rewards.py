@@ -525,9 +525,10 @@ def env_config(name):
         return dict(
             make = lambda render_mode = None: gym.make('LunarLander-v3', continuous = True, render_mode = render_mode),
             transform = transform_lunar,
-            target_goal = np.array([0., 0., 0., 0., 0., 1., 0.], dtype = np.float32),
+            # transform_lunar -> [x, y, vx, vy, sin, cos, vangle, leg1, leg2]
+            target_goal = np.array([0., 0., 0., 0., 0., 1., 0., 1., 1.], dtype = np.float32),
             dim_state = 9,
-            dim_goal = 7,
+            dim_goal = 9,
             dim_action = 2,
             action_type = 'continuous',
             action_scale = 1.,
@@ -547,6 +548,7 @@ def env_config(name):
             entropy_coef = 0.,
             exploration_goal_prob = 0.25,
             success_bonus = 0.,
+            env_reward_has_success = False,
             use_rms = True,
             goals_from_env = False
         )
@@ -577,6 +579,7 @@ def env_config(name):
         entropy_coef = 0.01,
         exploration_goal_prob = 0.5,
         success_bonus = 1.,
+        env_reward_has_success = True,
         use_rms = False,
         goals_from_env = True
     )
@@ -632,17 +635,17 @@ class BetaActor(Module):
         self.net = mlp(dim_state + dim_goal, hidden_dim, dim_action * 2, depth)
         self.beta = default(beta, Beta(**beta_kwargs))
 
-    def forward(self, state, goal):
-        state, goal = broadcast_goal(state, goal)
-        params = self.net(cat((state, goal), dim = -1))
-        params = rearrange(params, '... (a d) -> ... a d', d = 2)
-        return self.beta(params)
-
     def log_prob(self, distr: Distribution, action: Tensor):
         return distr.log_prob(action).sum(dim = -1)
 
     def entropy(self, distr: Distribution):
         return distr.entropy().sum(dim = -1)
+
+    def forward(self, state, goal):
+        state, goal = broadcast_goal(state, goal)
+        params = self.net(cat((state, goal), dim = -1))
+        params = rearrange(params, '... (a d) -> ... a d', d = 2)
+        return self.beta(params)
 
 class CategoricalActor(Module):
     def __init__(
@@ -657,15 +660,15 @@ class CategoricalActor(Module):
 
         self.net = mlp(dim_state + dim_goal, hidden_dim, num_actions, depth)
 
-    def forward(self, state, goal):
-        state, goal = broadcast_goal(state, goal)
-        return Categorical(logits = self.net(cat((state, goal), dim = -1)))
-
     def log_prob(self, distr: Distribution, action: Tensor):
         return distr.log_prob(action.long())
 
     def entropy(self, distr: Distribution):
         return distr.entropy()
+
+    def forward(self, state, goal):
+        state, goal = broadcast_goal(state, goal)
+        return Categorical(logits = self.net(cat((state, goal), dim = -1)))
 
 # ppo with distance rewards
 
@@ -1201,6 +1204,11 @@ class DistanceRewardPPO(Module):
             **ppo_metrics
         )
 
+    def forward(self, state, goal):
+        state = self._to_tensor(state, torch.float32)
+        goal = self._to_tensor(goal, torch.float32)
+        return self.actor(state, goal)
+
 # train
 
 def main(
@@ -1233,6 +1241,7 @@ def main(
     success_bonus = None,
     add_env_rewards = False,
     separate_env_rewards = True,
+    # weights z-scored advantages when separate_env_rewards=True; ignored when add_env_rewards=True
     env_reward_weight = 0.5,
     env_reward_weight_start = None,
     env_reward_weight_anneal_updates = None,
@@ -1331,6 +1340,8 @@ def main(
         def sample_goal():
             if len(goal_buffer) > 0 and np.random.rand() < exploration_goal_prob:
                 state = goal_buffer[np.random.randint(len(goal_buffer))]
+                if exists(rms):
+                    state = rms.normalize(state)
                 return state[:dim_goal].copy()
 
             return normalize_goal(rms, cfg['target_goal'], dim_goal)
@@ -1392,6 +1403,9 @@ def main(
         )
 
     if add_env_rewards:
+        if separate_env_rewards:
+            print('note: --add_env_rewards disables --separate_env_rewards; env_reward_weight is ignored', flush = True)
+
         separate_env_rewards = False
 
     use_env_rewards = separate_env_rewards or add_env_rewards
@@ -1523,7 +1537,8 @@ def main(
             next_states = rms.normalize(raw_next_states)
             rms.update(raw_states.reshape(-1, dim_state))
 
-            for state in states.reshape(-1, dim_state):
+            # store raw states; normalize with the current rms when sampled
+            for state in raw_states.reshape(-1, dim_state):
                 goal_buffer.append(state.copy())
         else:
             states = raw_states
@@ -1559,7 +1574,9 @@ def main(
             )
         else:
             success_source = success_rewards if use_env_rewards else env_rewards
-            aux_rewards = success_bonus * success_source if success_bonus > 0. else None
+            env_has_success = cfg.get('env_reward_has_success', False)
+            add_success_bonus = success_bonus > 0. and not (use_env_rewards and env_has_success)
+            aux_rewards = success_bonus * success_source if add_success_bonus else None
 
             metrics = trainer.update(
                 states = states,

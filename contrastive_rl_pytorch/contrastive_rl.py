@@ -664,6 +664,78 @@ class ContrastiveWrapper(Module):
 
         return loss + decoder_loss
 
+class ActionContrastiveWrapper(ContrastiveWrapper):
+    def __init__(
+        self,
+        encoder: Module,
+        contrastive_learn: Module,
+        action_dim: int,
+        future_encoder: Module | None = None,
+        discrete_action = False,
+        action_dropout_prob = 0.,
+        **kwargs
+    ):
+        super().__init__(encoder, contrastive_learn, future_encoder = future_encoder, **kwargs)
+
+        self.action_dim = action_dim
+        self.discrete_action = discrete_action
+        self.action_dropout_prob = action_dropout_prob
+        self.register_buffer('null_action', torch.zeros(action_dim))
+
+    def action_feat(self, action):
+        if self.discrete_action:
+            return F.one_hot(action.long(), self.action_dim).float()
+
+        return action.float()
+
+    def null_feat(self, batch, feat_dim = None, device = None):
+        null = self.null_action.to(device or self.null_action.device)
+
+        if exists(feat_dim) and null.numel() != feat_dim:
+            assert feat_dim % null.numel() == 0, 'action feature size must be a multiple of the null action size'
+            null = null.repeat(feat_dim // null.numel())
+
+        return null.expand(batch, -1)
+
+    def dropout_action(self, action_feat):
+        if not self.training or self.action_dropout_prob <= 0.:
+            return action_feat
+
+        mask = torch.rand(action_feat.shape[0], device = action_feat.device) < self.action_dropout_prob
+        null = self.null_feat(action_feat.shape[0], action_feat.shape[-1], action_feat.device)
+        return torch.where(rearrange(mask, 'b -> b 1'), null, action_feat)
+
+    def null_action_feat(self, actions):
+        action_feat = self.action_feat(actions)
+        if action_feat.ndim > 2:
+            action_feat = rearrange(action_feat, 'b ... -> b (...)')
+
+        return self.null_feat(action_feat.shape[0], action_feat.shape[-1], action_feat.device)
+
+    def forward(self, past, future, past_action = None, **kwargs):
+        if exists(past_action):
+            action_feat = self.action_feat(past_action)
+            if action_feat.ndim > 2:
+                action_feat = rearrange(action_feat, 'b ... -> b (...)')
+            action_feat = self.dropout_action(action_feat)
+        else:
+            action_feat = self.null_feat(past.shape[0], device = past.device)
+
+        return super().forward(past, future, past_action = action_feat, **kwargs)
+
+    def distance_pairs(self, past, future, distance_type = None, past_action = None, past_action_feat = None):
+        if exists(past_action_feat):
+            action_feat = past_action_feat
+        elif exists(past_action):
+            action_feat = self.action_feat(past_action)
+            if action_feat.ndim > 2:
+                action_feat = rearrange(action_feat, 'b ... -> b (...)')
+        else:
+            action_feat = self.null_feat(past.shape[0], device = past.device)
+
+        past = cat((past, action_feat), dim = -1)
+        return super().distance_pairs(past, future, distance_type = distance_type)
+
 # contrastive RL trainer
 
 class ContrastiveRLTrainer(Module):
@@ -682,6 +754,9 @@ class ContrastiveRLTrainer(Module):
         discount_transform: Callable = identity,
         condition_on_discount = None,
         action_chunk_size = 1,   # action sequences as representations - https://arxiv.org/abs/2608.30640
+        action_dim: int | None = None,
+        discrete_action = False,
+        action_dropout_prob = 0.,
         contrastive_learn: Module | None = None,
         adam_kwargs: dict = dict(),
         accelerate_kwargs: dict = dict(),
@@ -705,13 +780,24 @@ class ContrastiveRLTrainer(Module):
         if not exists(contrastive_learn):
             contrastive_learn = ContrastiveLearning()
 
-        contrast_wrapper = ContrastiveWrapper(
+        wrapper_klass = ActionContrastiveWrapper if exists(action_dim) else ContrastiveWrapper
+
+        wrapper_kwargs = dict(
             encoder = encoder,
             future_encoder = future_encoder,
             contrastive_learn = contrastive_learn,
             state_decoder = state_decoder,
             state_decoder_weight = state_decoder_weight
         )
+
+        if exists(action_dim):
+            wrapper_kwargs.update(
+                action_dim = action_dim,
+                discrete_action = discrete_action,
+                action_dropout_prob = action_dropout_prob
+            )
+
+        contrast_wrapper = wrapper_klass(**wrapper_kwargs)
 
         assert divisible_by(batch_size, repetition_factor)
         self.batch_size = batch_size // repetition_factor   # effective batch size is smaller and then repeated
