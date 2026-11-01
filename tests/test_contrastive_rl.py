@@ -705,3 +705,152 @@ def test_c_slerp_plan_e2e():
 
     assert torch.allclose(decode_state(subgoal), goal, atol = 1e-5)
 
+
+def test_latent_world_model_rollout():
+    from contrastive_rl_pytorch import LatentWorldModel
+
+    dim, action_dim, batch, horizon = 8, 4, 5, 3
+    model = LatentWorldModel(dim, action_dim, dim_hidden = 32, depth = 2)
+
+    latent = torch.randn(batch, dim)
+    latent = latent / latent.norm(dim = -1, keepdim = True)
+    actions = torch.randn(batch, horizon, action_dim)
+
+    next_latent = model(latent, actions[:, 0])
+    assert next_latent.shape == (batch, dim)
+    assert torch.allclose(next_latent.norm(dim = -1), torch.ones(batch), atol = 1e-5)
+
+    latents = model.rollout(latent, actions)
+    assert latents.shape == (batch, horizon + 1, dim)
+    assert torch.allclose(latents.norm(dim = -1), torch.ones(batch, horizon + 1), atol = 1e-5)
+
+    latents.sum().backward()
+
+
+def test_contrastive_world_model_losses():
+    from contrastive_rl_pytorch import ContrastiveLearning, ContrastiveWorldModel
+
+    dim_state, action_dim, dim_embed, batch, horizon = 16, 4, 8, 6, 3
+
+    state_encoder = torch.nn.Sequential(
+        torch.nn.Linear(dim_state, 32),
+        torch.nn.SiLU(),
+        torch.nn.Linear(32, dim_embed)
+    )
+
+    model = ContrastiveWorldModel(
+        state_encoder,
+        action_dim = action_dim,
+        dim_embed = dim_embed,
+        contrastive_learn = ContrastiveLearning(l2norm_embed = True),
+        discrete_action = True,
+        dim_hidden = 32
+    )
+
+    state = torch.randn(batch, dim_state)
+    next_state = torch.randn(batch, dim_state)
+    goal = torch.randn(batch, dim_state)
+    action = torch.randint(0, action_dim, (batch,))
+
+    state_embed = model.encode_state(state)
+    goal_embed = model.encode_goal(goal)
+
+    assert torch.allclose(state_embed.norm(dim = -1), torch.ones(batch), atol = 1e-5)
+    assert torch.allclose(goal_embed.norm(dim = -1), torch.ones(batch), atol = 1e-5)
+
+    losses = model.losses(state, action, next_state, goal)
+
+    for name, loss in losses.items():
+        assert torch.isfinite(loss), name
+
+    losses['loss'].backward()
+
+    states = torch.randn(batch, horizon + 1, dim_state)
+    actions = torch.randint(0, action_dim, (batch, horizon))
+
+    sequence_loss = model.sequence_world_model_loss(states, actions)
+    assert torch.isfinite(sequence_loss)
+
+    sequence_q_loss = model.sequence_q_contrastive_loss(states, actions, goal)
+    assert torch.isfinite(sequence_q_loss)
+
+    # q(s, a) = v(s') where s' is the predicted next latent
+
+    with torch.no_grad():
+        q_value = model.q_value(state, action, goal)
+        next_embed = model.predict_next(state, action)
+        value = model.value(next_embed, model.encode_goal(goal))
+
+    assert torch.allclose(q_value, value, atol = 1e-6)
+
+
+def test_world_model_planner_cem_and_c_slerp():
+    from contrastive_rl_pytorch import (
+        ContrastiveLearning,
+        ContrastiveWorldModel,
+        WorldModelPlanner
+    )
+
+    dim_state, action_dim, dim_embed = 16, 4, 8
+
+    state_encoder = torch.nn.Sequential(
+        torch.nn.Linear(dim_state, 32),
+        torch.nn.SiLU(),
+        torch.nn.Linear(32, dim_embed)
+    )
+
+    model = ContrastiveWorldModel(
+        state_encoder,
+        action_dim = action_dim,
+        dim_embed = dim_embed,
+        contrastive_learn = ContrastiveLearning(l2norm_embed = True),
+        discrete_action = True,
+        dim_hidden = 32
+    )
+
+    planner = WorldModelPlanner(
+        model,
+        horizon = 2,
+        num_samples = 16,
+        num_elites = 4,
+        num_iters = 2,
+        discrete_action = True,
+        num_actions = action_dim,
+        c_slerp_kwargs = dict(num_waypoints = 2, alpha = 0., threshold = 0.)
+    )
+
+    state = torch.randn(dim_state)
+    goal = torch.randn(dim_state)
+
+    plan = planner.plan(state, goal)
+    assert plan.actions.shape == (2,)
+    assert plan.latents.shape == (3, dim_embed)
+    assert torch.isfinite(plan.score)
+
+    slerp_plan = planner.plan(
+        state,
+        goal,
+        use_c_slerp = True
+    )
+
+    assert slerp_plan.actions.shape == (2,)
+    assert slerp_plan.latents.shape == (3, dim_embed)
+    assert slerp_plan.waypoints.shape == (3, dim_embed)
+    assert slerp_plan.subgoal.shape == (dim_embed,)
+
+    # continuous branch also returns a valid action sequence
+
+    continuous_planner = WorldModelPlanner(
+        model,
+        horizon = 2,
+        num_samples = 16,
+        num_elites = 4,
+        num_iters = 2,
+        discrete_action = False,
+        action_low = -1.,
+        action_high = 1.
+    )
+
+    continuous_plan = continuous_planner.plan(state, goal)
+    assert continuous_plan.actions.shape == (2, action_dim)
+    assert continuous_plan.latents.shape == (3, dim_embed)

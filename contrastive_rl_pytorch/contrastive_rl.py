@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 from functools import partial
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import torch
-from torch import cat, arange, tensor, from_numpy, is_tensor, Tensor
+from torch import cat, arange, tensor, from_numpy, is_tensor, Tensor, stack
+from torch import nn
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 from torch.optim import AdamW
@@ -20,6 +21,7 @@ from accelerate import Accelerator
 from tqdm import tqdm
 
 from contrastive_rl_pytorch.distributed import is_distributed, AllGather
+from contrastive_rl_pytorch.c_slerp import c_slerp_plan
 
 # ein
 
@@ -1309,3 +1311,388 @@ class ActorTrainer(Module):
             self.optimizer.zero_grad()
 
         return loss.item()
+
+# contrastive world model
+#
+# V(s, g) is a contrastive value, and a residual latent dynamics model turns
+# it into Q(s, a, g) = V(s', g)
+
+# residual 3 layer mlp delta update - Teoh et al.
+# https://arxiv.org/abs/2511.05963
+class ResidualMLP(Module):
+    def __init__(self, dim, dim_in = None, dim_hidden = None, depth = 2):
+        super().__init__()
+        dim_in = default(dim_in, dim)
+        dim_hidden = default(dim_hidden, dim)
+
+        self.proj_in = nn.Linear(dim_in, dim) if dim_in != dim else nn.Identity()
+        self.norm = nn.LayerNorm(dim)
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, dim_hidden),
+                nn.SiLU(),
+                nn.Linear(dim_hidden, dim)
+            )
+            for _ in range(depth)
+        ])
+
+    def forward(self, x):
+        h = self.proj_in(x)
+        for block in self.blocks:
+            h = h + block(self.norm(h))
+        return h
+
+# next latent prediction - SPR / LeWM
+# https://arxiv.org/abs/2007.05929
+# https://arxiv.org/abs/2603.19312
+class LatentWorldModel(Module):
+    def __init__(self, dim, action_dim, dim_hidden = None, depth = 2, l2norm_embed = True):
+        super().__init__()
+        self.l2norm_embed = l2norm_embed
+        self.dynamics = ResidualMLP(dim, dim_in = dim + action_dim, dim_hidden = dim_hidden, depth = depth)
+
+    def forward(self, latent, action):
+        next_latent = latent + self.dynamics(cat((latent, action), dim = -1))
+        return l2norm(next_latent) if self.l2norm_embed else next_latent
+
+    def rollout(self, latent, actions):
+        # (..., d), (..., h, a) -> (..., h + 1, d)
+        latents = [latent]
+        for action in actions.unbind(dim = -2):
+            latents.append(self.forward(latents[-1], action))
+        return stack(latents, dim = -2)
+
+# Q(s, a, g) = V(s', g) - Wang et al.
+# https://arxiv.org/abs/2304.01203
+class ContrastiveWorldModel(Module):
+    def __init__(
+        self,
+        state_encoder: Module,
+        action_dim: int,
+        dim_embed: int,
+        goal_encoder: Module | None = None,
+        world_model: Module | None = None,
+        contrastive_learn: Module | None = None,
+        q_contrastive_learn: Module | None = None,
+        discrete_action = False,
+        l2norm_embed = True,
+        dim_hidden = None,
+        depth = 2,
+        wm_loss_weight = 1.,
+        crl_loss_weight = 1.,
+        q_loss_weight = 1.,
+        stop_grad_target = True
+    ):
+        super().__init__()
+
+        self.state_encoder = state_encoder
+        self.goal_encoder = default(goal_encoder, state_encoder)
+        self.action_dim = action_dim
+        self.discrete_action = discrete_action
+
+        self.contrastive_learn = default(contrastive_learn, ContrastiveLearning(l2norm_embed = l2norm_embed))
+        self.q_contrastive_learn = default(q_contrastive_learn, self.contrastive_learn)
+        self.l2norm_embed = getattr(self.contrastive_learn, 'l2norm_embed', l2norm_embed)
+
+        self.world_model = default(
+            world_model,
+            LatentWorldModel(dim_embed, action_dim, dim_hidden = dim_hidden, depth = depth, l2norm_embed = self.l2norm_embed)
+        )
+
+        self.wm_loss_weight = wm_loss_weight
+        self.crl_loss_weight = crl_loss_weight
+        self.q_loss_weight = q_loss_weight
+        self.stop_grad_target = stop_grad_target
+
+    @property
+    def rotation(self):
+        return self.contrastive_learn.rotation if getattr(self.contrastive_learn, 'has_rotation', False) else None
+
+    def action_feat(self, action):
+        if not self.discrete_action:
+            return action.float()
+
+        if action.ndim > 0 and action.shape[-1] == self.action_dim and action.dtype.is_floating_point:
+            return action.float()
+
+        return F.one_hot(action.long(), self.action_dim).float()
+
+    def encode_state(self, state):
+        embed = self.state_encoder(state)
+        return l2norm(embed) if self.l2norm_embed else embed
+
+    def encode_goal(self, goal):
+        embed = self.goal_encoder(goal)
+        return l2norm(embed) if self.l2norm_embed else embed
+
+    def value(self, state_embed, goal_embed):
+        return self.contrastive_learn(state_embed, goal_embed, return_contrastive_score = True)
+
+    def predict_next(self, state, action):
+        return self.world_model(self.encode_state(state), self.action_feat(action))
+
+    # Q(s, a, g) = V(s', g)
+    def q_value(self, state, action, goal):
+        return self.value(self.predict_next(state, action), self.encode_goal(goal))
+
+    def world_model_loss(self, state, action, next_state):
+        embed = self.encode_state(state)
+        pred_next_embed = self.world_model(embed, self.action_feat(action))
+
+        target = self.encode_state(next_state)
+        target = target.detach() if self.stop_grad_target else target
+
+        return F.mse_loss(pred_next_embed, target)
+
+    def sequence_world_model_loss(self, states, actions):
+        # (b h + 1 d), (b h a) -> ()
+        embed = self.encode_state(states)
+        pred_embed = self.world_model.rollout(embed[:, 0], self.action_feat(actions))
+
+        target = embed[:, 1:]
+        target = target.detach() if self.stop_grad_target else target
+
+        return F.mse_loss(pred_embed[:, 1:], target)
+
+    def contrastive_loss(self, state, goal, delta_times = None, raw_discount = None, goal_states = None):
+        return self.contrastive_learn(
+            self.encode_state(state),
+            self.encode_goal(goal),
+            delta_times = delta_times,
+            raw_discount = raw_discount,
+            goal_states = goal_states
+        )
+
+    def q_contrastive_loss(self, state, action, goal):
+        return self.q_contrastive_learn(self.predict_next(state, action), self.encode_goal(goal))
+
+    def sequence_q_contrastive_loss(self, states, actions, goal):
+        embed = self.encode_state(states[:, 0])
+        pred_embed = self.world_model.rollout(embed, self.action_feat(actions))[:, -1]
+
+        return self.q_contrastive_learn(pred_embed, self.encode_goal(goal))
+
+    def losses(self, state, action, next_state, goal):
+        wm_loss = self.world_model_loss(state, action, next_state)
+        crl_loss = self.contrastive_loss(state, goal)
+        q_loss = self.q_contrastive_loss(state, action, goal)
+
+        total = (
+            self.wm_loss_weight * wm_loss +
+            self.crl_loss_weight * crl_loss +
+            self.q_loss_weight * q_loss
+        )
+
+        return dict(loss = total, world_model_loss = wm_loss, contrastive_loss = crl_loss, q_loss = q_loss)
+
+    def forward(self, state, action, next_state, goal):
+        return self.losses(state, action, next_state, goal)['loss']
+
+# latent planning
+
+class WorldModelPlan(NamedTuple):
+    actions: Tensor
+    latents: Tensor
+    score: Tensor
+    waypoints: Tensor | None = None
+    subgoal: Tensor | None = None
+    selected_index: int | None = None
+
+class WorldModelPlanner:
+    def __init__(
+        self,
+        model: ContrastiveWorldModel,
+        *,
+        horizon = 3,
+        num_samples = 256,
+        num_elites = 32,
+        num_iters = 8,
+        discrete_action = True,
+        num_actions: int | None = None,
+        action_low = -1.,
+        action_high = 1.,
+        init_std = 1.,
+        std_min = 1e-2,
+        intermediate_weight = 0.,
+        use_c_slerp = False,                # https://arxiv.org/abs/2610.20409
+        c_slerp_kwargs: dict | None = None
+    ):
+        assert horizon >= 1
+        assert num_samples > num_elites >= 1
+        assert num_iters >= 1
+
+        self.model = model
+        self.horizon = horizon
+        self.num_samples = num_samples
+        self.num_elites = num_elites
+        self.num_iters = num_iters
+        self.discrete_action = discrete_action
+        self.num_actions = default(num_actions, model.action_dim)
+        self.action_low = action_low
+        self.action_high = action_high
+        self.init_std = init_std
+        self.std_min = std_min
+        self.intermediate_weight = intermediate_weight
+        self.use_c_slerp = use_c_slerp
+        self.c_slerp_kwargs = default(c_slerp_kwargs, dict())
+
+    def _score(self, latents, goal_embed):
+        # (n, h + 1, d) -> (n,)
+        n, h, _ = latents.shape
+        goal_embed = repeat(goal_embed, 'd -> n h d', n = n, h = h)
+        values = self.model.value(latents, goal_embed)
+
+        score = values[:, -1]
+        if self.intermediate_weight > 0.:
+            score = score + self.intermediate_weight * values[:, 1:].mean(dim = -1)
+
+        return score
+
+    def _waypoint_scores(self, state_embed, waypoints):
+        # one-step reachability, max over action candidates
+
+        num_waypoints = waypoints.shape[0]
+
+        if self.discrete_action:
+            actions = arange(self.num_actions, device = waypoints.device)
+            action_feat = self.model.action_feat(actions)
+            action_feat = repeat(action_feat, 'a d -> n a d', n = num_waypoints)
+        else:
+            action_feat = torch.empty(
+                (num_waypoints, self.num_samples, self.model.action_dim),
+                device = waypoints.device
+            ).uniform_(self.action_low, self.action_high)
+
+        state_embed = repeat(state_embed, 'd -> n a d', n = num_waypoints, a = action_feat.shape[1])
+        waypoints = repeat(waypoints, 'n d -> n a d', a = action_feat.shape[1])
+
+        next_embed = self.model.world_model(state_embed, action_feat)
+        values = self.model.value(next_embed, waypoints)
+
+        return values.max(dim = -1).values
+
+    @torch.no_grad()
+    def _cem(self, state_embed, goal_embed):
+        device = state_embed.device
+        model = self.model
+
+        if self.discrete_action:
+            probs = torch.full(
+                (self.horizon, self.num_actions),
+                1. / self.num_actions,
+                device = device
+            )
+
+            best_score = tensor(float('-inf'), device = device)
+            best_actions = None
+            best_latents = None
+
+            for _ in range(self.num_iters):
+                actions = torch.multinomial(
+                    probs,
+                    self.num_samples,
+                    replacement = True
+                ).t()  # n h
+
+                action_feat = model.action_feat(actions)
+                latents = model.world_model.rollout(repeat(state_embed, 'd -> n d', n = self.num_samples), action_feat)
+                scores = self._score(latents, goal_embed)
+
+                elite_indices = scores.topk(self.num_elites).indices
+                elite_actions = actions[elite_indices]
+
+                counts = stack([
+                    F.one_hot(elite_actions[:, time], self.num_actions).sum(dim = 0)
+                    for time in range(self.horizon)
+                ])
+                probs = (counts.float() + 1.) / (self.num_elites + self.num_actions)
+
+                best_index = elite_indices[0]
+                if scores[best_index] > best_score:
+                    best_score = scores[best_index]
+                    best_actions = actions[best_index]
+                    best_latents = latents[best_index]
+
+            return best_actions, best_latents, best_score
+
+        # continuous actions
+
+        mean = torch.zeros((self.horizon, model.action_dim), device = device)
+        std = torch.full_like(mean, self.init_std)
+
+        best_score = tensor(float('-inf'), device = device)
+        best_actions = None
+        best_latents = None
+
+        for _ in range(self.num_iters):
+            actions = mean + std * torch.randn((self.num_samples, *mean.shape), device = device)
+            actions = actions.clamp(self.action_low, self.action_high)
+
+            latents = model.world_model.rollout(repeat(state_embed, 'd -> n d', n = self.num_samples), actions)
+            scores = self._score(latents, goal_embed)
+
+            elite_indices = scores.topk(self.num_elites).indices
+            elite_actions = actions[elite_indices]
+
+            mean = elite_actions.mean(dim = 0)
+            std = elite_actions.std(dim = 0).clamp(min = self.std_min)
+
+            best_index = elite_indices[0]
+            if scores[best_index] > best_score:
+                best_score = scores[best_index]
+                best_actions = actions[best_index]
+                best_latents = latents[best_index]
+
+        return best_actions, best_latents, best_score
+
+    @torch.no_grad()
+    def plan(
+        self,
+        state,
+        goal = None,
+        *,
+        goal_embed = None,
+        use_c_slerp: bool | None = None
+    ):
+        model = self.model
+        device = next(model.parameters()).device
+
+        state = state if is_tensor(state) else tensor(state)
+        state = rearrange(state, '... -> (...)').to(device)
+        state_embed = model.encode_state(rearrange(state, '... -> 1 ...'))[0]
+
+        if exists(goal_embed):
+            goal_embed = goal_embed.to(device)
+            goal_embed = goal_embed[0] if goal_embed.ndim > 1 else goal_embed
+        else:
+            assert exists(goal), 'either goal or goal_embed must be passed'
+            goal = goal if is_tensor(goal) else tensor(goal)
+            goal_embed = model.encode_goal(rearrange(goal, '... -> 1 ...').to(device))[0]
+
+        use_c_slerp = default(use_c_slerp, self.use_c_slerp)
+
+        if not use_c_slerp:
+            actions, latents, score = self._cem(state_embed, goal_embed)
+            return WorldModelPlan(actions, latents, score)
+
+        assert self.model.l2norm_embed, 'c-slerp planning requires normalized embeddings'
+
+        plan = c_slerp_plan(
+            state_embed,
+            goal_embed,
+            rotation = model.rotation,
+            score_fn = self._waypoint_scores,
+            **self.c_slerp_kwargs
+        )
+
+        subgoal = default(plan.subgoal, plan.waypoints[-1])
+        actions, latents, score = self._cem(state_embed, subgoal)
+
+        return WorldModelPlan(
+            actions,
+            latents,
+            score,
+            waypoints = plan.waypoints,
+            subgoal = subgoal,
+            selected_index = plan.selected_index
+        )
