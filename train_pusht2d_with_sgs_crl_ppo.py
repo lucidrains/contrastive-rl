@@ -838,10 +838,26 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
             next_distances = self.critic_wrapper.distance_pairs(flat_next_states, flat_goals, distance_type = self.distance_type)
             cur_distances = self.critic_wrapper.distance_pairs(flat_states, flat_goals, distance_type = self.distance_type)
 
-            values = rearrange(-cur_distances, '(n t) -> n t', n = num_trajs)
-            next_values = rearrange(-next_distances, '(n t) -> n t', n = num_trajs)
-            crl_advantages = next_values - values
+            values = rearrange(-cur_distances, '(n t) -> n t', n = num_trajs)  # log only
             distances = rearrange(next_distances, '(n t) -> n t', n = num_trajs)
+
+            # crl reward on the next state: exp(-scale * d(s_{t+1}, g))
+            crl_rewards = torch.exp(-next_distances * self.reward_distance_scale) * self.reward_scale
+            crl_rewards = rearrange(crl_rewards, '(n t) -> n t', n = num_trajs)
+            crl_rewards = torch.where(terminated, torch.zeros_like(crl_rewards), crl_rewards)
+
+            # zero baseline: gae is the discounted sum of the reward
+            crl_gae = calc_gae(
+                crl_rewards,
+                torch.zeros_like(crl_rewards),
+                masks = (~terminated).float(),
+                done_masks = (~dones).float(),
+                gamma = self.discount,
+                lam = self.lam,
+                next_values = torch.zeros_like(crl_rewards),
+                return_advantages = True
+            )
+            crl_advantages = crl_gae.advantages
 
             env_values = rearrange(self.env_value_hl_gauss(self.env_value(cat((flat_states, flat_goals), dim = -1))), '(n t) -> n t', n = num_trajs)
             env_next_values = rearrange(self.env_value_hl_gauss(self.env_value(cat((flat_next_states, flat_goals), dim = -1))), '(n t) -> n t', n = num_trajs)
@@ -870,7 +886,8 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
 
         env_value_loss = self._hl_gauss_value_update(flat_states, flat_goals, rearrange(env_returns, 'n t -> (n t)'))
         ppo_metrics = self._ppo_update(states, goals, actions, old_log_probs, advantages)
-        crl_reward_mean = crl_advantages.mean().item()
+        crl_reward_mean = crl_rewards.mean().item()
+        crl_advantage_mean = crl_advantages.mean().item()
 
         return dict(
             critic_loss = critic_loss,
@@ -888,7 +905,7 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
             advantage_mean = advantages.mean().item(),
             advantage_std = advantages.std().item(),
             env_advantage_mean = env_advantages.mean().item(),
-            crl_advantage_mean = crl_reward_mean,
+            crl_advantage_mean = crl_advantage_mean,
             **ppo_metrics
         )
 

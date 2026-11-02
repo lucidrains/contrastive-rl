@@ -1081,7 +1081,9 @@ class DistanceRewardPPO(Module):
             if self.separate_env_rewards:
                 env_values, env_next_values = value_predictions(self.env_value)
 
-        masks = (~terminated).float()
+        # next state is the autoreset state at an episode boundary - no bootstrap across it
+        boundary = dones if exists(dones) else terminated
+        masks = (~boundary).float()
         env_reward_weight = default(env_reward_weight, self.env_reward_weight)
         env_reward_weight = min(max(float(env_reward_weight), 0.), 1.)
         crl_reward_weight = 1. - env_reward_weight
