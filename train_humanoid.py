@@ -40,6 +40,7 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
+    FactorizedActionEncoder,
 )
 
 from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
@@ -126,11 +127,17 @@ def main(
     mlp_depth: int = 4,
     use_attn_residual_mlp: bool = True,
     use_rmsnorm: bool = True,
+    factorized_critic: bool = False,
+    factorized_norm: str = 'none',
     use_wandb: bool = False,
     cpu: bool = False,
     resume: bool = False,
-    clear_recordings: bool = True
+    clear_recordings: bool = True,
+    seed: int = 0
 ):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
     # directories
 
     video_path = Path(video_folder)
@@ -244,14 +251,35 @@ def main(
         ).to(device)
         critic_dim_action = action_dim * hl_gauss_num_bins
 
-    critic_encoder = MLP(
-        dim_in = obs_dim + critic_dim_action,
-        dim = 256,
-        dim_out = dim_contrastive_embed,
-        depth = mlp_depth
-    ).to(device)
+    if factorized_critic:
+        assert not use_hl_gauss_critic_actions, 'factorized critic currently expects raw continuous actions'
+        critic_encoder = FactorizedActionEncoder(
+            state_encoder = MLP(
+                dim_in = obs_dim,
+                dim = 256,
+                dim_out = dim_contrastive_embed,
+                depth = mlp_depth
+            ),
+            action_encoder = MLP(
+                dim_in = critic_dim_action,
+                dim = 256,
+                dim_out = dim_contrastive_embed,
+                depth = mlp_depth
+            ),
+            dim_state = obs_dim,
+            dim_action = critic_dim_action,
+            dim_embed = dim_contrastive_embed,
+            norm = factorized_norm
+        ).to(device)
+    else:
+        critic_encoder = MLP(
+            dim_in = obs_dim + critic_dim_action,
+            dim = 256,
+            dim_out = dim_contrastive_embed,
+            depth = mlp_depth
+        ).to(device)
 
-    critic_encoder = CriticWrapper(critic_encoder, hl_gauss, action_dim)
+        critic_encoder = CriticWrapper(critic_encoder, hl_gauss, action_dim)
 
     goal_encoder = MLP(
         dim_in = goal_dim,
@@ -344,7 +372,7 @@ def main(
             disable_logger = True
         )
 
-        eval_state, eval_info = eval_env.reset()
+        eval_state, eval_info = eval_env.reset(seed = seed)
         init_pos_x = eval_info.get('x_position', 0.0) if isinstance(eval_info, dict) else 0.0
         cum_eval_reward = 0.0
         eval_step = 0
@@ -442,7 +470,7 @@ def main(
 
     with dashboard.create_renderable():
 
-        state, info = env.reset()
+        state, info = env.reset(seed = seed)
 
         init_x = np.array(info.get('x_position', np.zeros(num_envs)), dtype = np.float32) if isinstance(info, dict) else np.zeros(num_envs, dtype = np.float32)
 
@@ -550,6 +578,14 @@ def main(
                 episode_lens = torch.as_tensor(data['episode_lens'])
                 actions_for_critic = torch.as_tensor(data['action'])
 
+                # autoreset can leave length-1 episodes in the replay buffer
+
+                valid = episode_lens >= 2
+                if not valid.all():
+                    trajectories = trajectories[valid]
+                    episode_lens = episode_lens[valid]
+                    actions_for_critic = actions_for_critic[valid]
+
                 cl_loss = critic_trainer(
                     trajectories,
                     num_train_steps = cl_train_steps,
@@ -584,6 +620,7 @@ def main(
                 next_eval_step += eval_every_env_steps
                 eval_st, eval_rw, eval_d, eval_v = record_eval_episode(total_env_steps)
                 last_eval_dist = eval_d
+                print(f'eval step {total_env_steps}: distance {eval_d:.2f} velocity {eval_v:.2f} reward {eval_rw:.1f}', flush = True)
                 step_m_tag = f'{total_env_steps / 1e6:.1f}M'
                 torch.save(actor_encoder.state_dict(), f'{checkpoint_folder}/actor-{step_m_tag}.pt')
 

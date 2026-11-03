@@ -37,6 +37,7 @@ from contrastive_rl_pytorch import (
     ActorTrainer,
     ContrastiveLearning,
     SigmoidContrastiveLearning,
+    FactorizedActionEncoder,
     sample_random_state,
     default_discount_transform
 )
@@ -98,6 +99,8 @@ def main(
     exploration_random_goal_prob = 0.05,
     exploration_sample_from_buffer_prob = 0.5,
     action_entropy_loss_weight = 0.01,
+    factorized_critic = False,
+    factorized_norm = 'none',
     save_checkpoint_every = 200,
     checkpoint_folder = './checkpoints-lunar',
     reward_json_path = './lunar_rewards.json',
@@ -108,6 +111,7 @@ def main(
     np.random.seed(seed)
 
     assert use_sigmoid or not temporal_distance_regularization, 'temporal distance regularization requires the sigmoid critic'
+    assert not (factorized_critic and use_euclidean), 'factorized trilinear critic requires dot-product similarity (use_euclidean=False)'
 
     # recordings folder
 
@@ -140,7 +144,7 @@ def main(
     replay_buffer = ReplayBuffer(
         replay_buffer_folder,
         max_episodes = buffer_size,
-        max_timesteps = max_timesteps + 1,
+        max_timesteps = max(max_timesteps + 1, 1001),
         fields = dict(
             state = ('float', dim_state),
             reward = ('float', 1),
@@ -174,7 +178,7 @@ def main(
                 replay_buffer.store_episode(
                     state = demo_states,
                     reward = [1.] * len(demo_states),
-                    action_hard_one_hot = demo_actions
+                    action_hard_one_hot = torch.stack(demo_actions).numpy()
                 )
 
     # models
@@ -198,6 +202,25 @@ def main(
         depth = critic_depth,
         dim_out = dim_contrastive_embed,
         use_rmsnorm = use_rmsnorm
+    ) if not factorized_critic else FactorizedActionEncoder(
+        state_encoder = AttnResidualNormedMLP(
+            dim_in = dim_state + dim_discount,
+            dim = critic_dim,
+            depth = critic_depth,
+            dim_out = dim_contrastive_embed,
+            use_rmsnorm = use_rmsnorm
+        ),
+        action_encoder = AttnResidualNormedMLP(
+            dim_in = dim_action,
+            dim = critic_dim,
+            depth = critic_depth,
+            dim_out = dim_contrastive_embed,
+            use_rmsnorm = use_rmsnorm
+        ),
+        dim_state = dim_state,
+        dim_action = dim_action,
+        dim_embed = dim_contrastive_embed,
+        norm = factorized_norm
     )
 
     goal_encoder = AttnResidualNormedMLP(
@@ -344,7 +367,7 @@ def main(
             replay_buffer.store_episode(
                 state = states,
                 reward = [1.] * len(states),
-                action_hard_one_hot = hard_one_hots
+                action_hard_one_hot = torch.stack(hard_one_hots).numpy()
             )
 
         rolling_reward.append(cum_reward)

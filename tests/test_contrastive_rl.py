@@ -854,3 +854,214 @@ def test_world_model_planner_cem_and_c_slerp():
     continuous_plan = continuous_planner.plan(state, goal)
     assert continuous_plan.actions.shape == (2, action_dim)
     assert continuous_plan.latents.shape == (3, dim_embed)
+import copy
+import pytest
+import torch
+from torch import nn
+
+param = pytest.mark.parametrize
+
+
+def make_encoders(dim_state = 8, dim_action = 4, dim_embed = 32, extra = 0, seed = 0):
+    torch.manual_seed(seed)
+
+    state_encoder = nn.Sequential(
+        nn.Linear(dim_state + extra, 32),
+        nn.SiLU(),
+        nn.Linear(32, dim_embed)
+    )
+
+    action_encoder = nn.Sequential(
+        nn.Linear(dim_action, 32),
+        nn.SiLU(),
+        nn.Linear(32, dim_embed)
+    )
+
+    return state_encoder, action_encoder
+
+
+@param('block_size', (1, 2, 4, 8, 32))
+def test_block_tucker_shapes(block_size):
+    from contrastive_rl_pytorch import BlockDiagonalTuckerActionEncoder
+
+    dim_state, dim_action, dim_embed = 8, 4, 32
+    state_encoder, action_encoder = make_encoders(dim_state, dim_action, dim_embed)
+
+    encoder = BlockDiagonalTuckerActionEncoder(
+        state_encoder,
+        action_encoder,
+        dim_state = dim_state,
+        dim_action = dim_action,
+        block_size = block_size,
+        dim_embed = dim_embed
+    )
+
+    x = torch.randn(5, dim_state + dim_action)
+    out = encoder(x)
+
+    assert out.shape == (5, dim_embed * block_size)
+    assert encoder.output_dim == dim_embed * block_size
+
+
+def test_block_tucker_cp_equivalence():
+    from contrastive_rl_pytorch import FactorizedActionEncoder, BlockDiagonalTuckerActionEncoder
+
+    dim_state, dim_action, dim_embed = 8, 4, 32
+    state_encoder, action_encoder = make_encoders(dim_state, dim_action, dim_embed)
+
+    cp = FactorizedActionEncoder(
+        copy.deepcopy(state_encoder),
+        copy.deepcopy(action_encoder),
+        dim_state = dim_state,
+        dim_action = dim_action
+    )
+
+    block = BlockDiagonalTuckerActionEncoder(
+        copy.deepcopy(state_encoder),
+        copy.deepcopy(action_encoder),
+        dim_state = dim_state,
+        dim_action = dim_action,
+        block_size = 1,
+        dim_embed = dim_embed
+    )
+
+    x = torch.randn(5, dim_state + dim_action)
+
+    assert torch.allclose(cp(x), block(x), atol = 1e-6)
+    assert block(x).shape == (5, dim_embed)
+
+
+def test_block_tucker_full_equivalence():
+    from contrastive_rl_pytorch import TuckerActionEncoder, BlockDiagonalTuckerActionEncoder
+
+    dim_state, dim_action, dim_embed = 8, 4, 16
+    state_encoder, action_encoder = make_encoders(dim_state, dim_action, dim_embed)
+
+    full = TuckerActionEncoder(
+        copy.deepcopy(state_encoder),
+        copy.deepcopy(action_encoder),
+        dim_state = dim_state,
+        dim_action = dim_action
+    )
+
+    block = BlockDiagonalTuckerActionEncoder(
+        copy.deepcopy(state_encoder),
+        copy.deepcopy(action_encoder),
+        dim_state = dim_state,
+        dim_action = dim_action,
+        block_size = dim_embed,
+        dim_embed = dim_embed
+    )
+
+    x = torch.randn(5, dim_state + dim_action)
+
+    assert torch.allclose(full(x), block(x), atol = 1e-6)
+    assert block(x).shape == (5, dim_embed * dim_embed)
+
+
+def test_block_tucker_matches_manual_blocks():
+    from contrastive_rl_pytorch import BlockDiagonalTuckerActionEncoder
+
+    dim_state, dim_action, dim_embed, block_size = 8, 4, 16, 4
+    state_encoder, action_encoder = make_encoders(dim_state, dim_action, dim_embed)
+
+    encoder = BlockDiagonalTuckerActionEncoder(
+        state_encoder,
+        action_encoder,
+        dim_state = dim_state,
+        dim_action = dim_action,
+        block_size = block_size,
+        dim_embed = dim_embed
+    )
+
+    x = torch.randn(5, dim_state + dim_action)
+    state, action = x[:, :dim_state], x[:, dim_state:]
+
+    with torch.no_grad():
+        phi_s = state_encoder(state).reshape(5, -1, block_size)
+        phi_a = action_encoder(action).reshape(5, -1, block_size)
+        expected = torch.einsum('b g i, b g j -> b g i j', phi_s, phi_a).reshape(5, -1)
+
+    assert torch.allclose(encoder(x), expected, atol = 1e-6)
+
+
+def test_block_tucker_extra_features():
+    from contrastive_rl_pytorch import BlockDiagonalTuckerActionEncoder
+
+    dim_state, dim_action, dim_embed, extra, block_size = 8, 4, 16, 3, 4
+    state_encoder, action_encoder = make_encoders(dim_state, dim_action, dim_embed, extra = extra)
+
+    encoder = BlockDiagonalTuckerActionEncoder(
+        state_encoder,
+        action_encoder,
+        dim_state = dim_state,
+        dim_action = dim_action,
+        block_size = block_size,
+        dim_embed = dim_embed
+    )
+
+    x = torch.randn(5, dim_state + dim_action + extra)
+    out = encoder(x)
+
+    assert out.shape == (5, dim_embed * block_size)
+
+
+def test_block_tucker_invalid_block():
+    from contrastive_rl_pytorch import BlockDiagonalTuckerActionEncoder
+
+    state_encoder, action_encoder = make_encoders(dim_embed = 10)
+
+    with pytest.raises(AssertionError):
+        BlockDiagonalTuckerActionEncoder(
+            state_encoder,
+            action_encoder,
+            dim_state = 8,
+            dim_action = 4,
+            block_size = 4,
+            dim_embed = 10
+        )
+
+
+def test_block_tucker_trainer_step():
+    from contrastive_rl_pytorch import (
+        BlockDiagonalTuckerActionEncoder,
+        ContrastiveRLTrainer,
+        ContrastiveLearning
+    )
+    from x_mlps_pytorch import MLP
+
+    dim_state, dim_action, dim_embed, block_size = 8, 4, 16, 4
+    state_encoder, action_encoder = make_encoders(dim_state, dim_action, dim_embed)
+
+    encoder = BlockDiagonalTuckerActionEncoder(
+        state_encoder,
+        action_encoder,
+        dim_state = dim_state,
+        dim_action = dim_action,
+        block_size = block_size,
+        dim_embed = dim_embed
+    )
+
+    goal_encoder = MLP(dim_state, 32, dim_embed * block_size)
+
+    trainer = ContrastiveRLTrainer(
+        encoder,
+        goal_encoder,
+        batch_size = 8,
+        repetition_factor = 1,
+        cpu = True,
+        contrastive_learn = ContrastiveLearning()
+    )
+
+    trajectories = torch.randn(16, 20, dim_state)
+    actions = torch.randn(16, 20, dim_action)
+    loss = trainer(
+        trajectories,
+        1,
+        lens = torch.full((16,), 20),
+        actions = actions,
+        pbar = False
+    )
+
+    assert isinstance(loss, float)
+    assert torch.isfinite(torch.tensor(loss))

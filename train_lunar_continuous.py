@@ -32,6 +32,9 @@ from contrastive_rl_pytorch import (
     ContrastiveLearning,
     SigmoidContrastiveLearning,
     MeanConcBetaActionAdapter,
+    FactorizedActionEncoder,
+    TuckerActionEncoder,
+    BlockDiagonalTuckerActionEncoder,
     sample_random_state
 )
 
@@ -94,6 +97,11 @@ def main(
     beta_max_unimodal_floor = 50.,
     beta_squash_fn = 'leaky_tanh',
     beta_detach_entropy_mean = True,
+    factorized_critic = False,
+    factorized_norm = 'none',
+    tucker_critic = False,
+    tucker_dim = 32,
+    tucker_block = 0,
     save_checkpoint_every = 200,
     checkpoint_folder = './checkpoints-lunar-continuous',
     reward_json_path = './lunar_continuous_rewards.json',
@@ -105,6 +113,10 @@ def main(
     np.random.seed(seed)
 
     assert not (use_sigmoid and lse_reg_weight > 0.), 'lse_reg_weight requires infonce'
+    assert not (factorized_critic and use_euclidean), 'factorized trilinear critic requires dot-product similarity (use_euclidean=False)'
+    assert not (tucker_critic and use_euclidean), 'Tucker critic requires dot-product similarity (use_euclidean=False)'
+    assert sum((factorized_critic, tucker_critic)) <= 1, 'choose one critic structure'
+    assert not (tucker_critic and tucker_block > 0) or divisible_by(tucker_dim, tucker_block), 'tucker_dim must divide into blocks'
 
     replay_buffer_folder = default(replay_buffer_folder, f'./replay-lunar-continuous-chunk{action_chunk_size}')
 
@@ -181,20 +193,90 @@ def main(
         num_streams = num_streams
     )
 
-    critic_encoder = AttnResidualNormedMLP(
-        dim_in = dim_state + action_adapter.dim,
-        dim = critic_dim,
-        depth = critic_depth,
-        dim_out = dim_contrastive_embed,
-        use_rmsnorm = use_rmsnorm,
-        num_streams = num_streams
-    )
+    critic_embed_dim = tucker_dim * (tucker_block if tucker_block > 0 else tucker_dim) if tucker_critic else dim_contrastive_embed
+
+    if tucker_critic and tucker_block > 0:
+        critic_encoder = BlockDiagonalTuckerActionEncoder(
+            state_encoder = AttnResidualNormedMLP(
+                dim_in = dim_state,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = tucker_dim,
+                use_rmsnorm = use_rmsnorm,
+                num_streams = num_streams
+            ),
+            action_encoder = AttnResidualNormedMLP(
+                dim_in = action_adapter.dim,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = tucker_dim,
+                use_rmsnorm = use_rmsnorm,
+                num_streams = num_streams
+            ),
+            dim_state = dim_state,
+            dim_action = action_adapter.dim,
+            block_size = tucker_block,
+            dim_embed = tucker_dim
+        )
+    elif tucker_critic:
+        critic_encoder = TuckerActionEncoder(
+            state_encoder = AttnResidualNormedMLP(
+                dim_in = dim_state,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = tucker_dim,
+                use_rmsnorm = use_rmsnorm,
+                num_streams = num_streams
+            ),
+            action_encoder = AttnResidualNormedMLP(
+                dim_in = action_adapter.dim,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = tucker_dim,
+                use_rmsnorm = use_rmsnorm,
+                num_streams = num_streams
+            ),
+            dim_state = dim_state,
+            dim_action = action_adapter.dim
+        )
+    elif factorized_critic:
+        critic_encoder = FactorizedActionEncoder(
+            state_encoder = AttnResidualNormedMLP(
+                dim_in = dim_state,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = dim_contrastive_embed,
+                use_rmsnorm = use_rmsnorm,
+                num_streams = num_streams
+            ),
+            action_encoder = AttnResidualNormedMLP(
+                dim_in = action_adapter.dim,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = dim_contrastive_embed,
+                use_rmsnorm = use_rmsnorm,
+                num_streams = num_streams
+            ),
+            dim_state = dim_state,
+            dim_action = action_adapter.dim,
+            dim_embed = dim_contrastive_embed,
+            norm = factorized_norm
+        )
+    else:
+        critic_encoder = AttnResidualNormedMLP(
+            dim_in = dim_state + action_adapter.dim,
+            dim = critic_dim,
+            depth = critic_depth,
+            dim_out = dim_contrastive_embed,
+            use_rmsnorm = use_rmsnorm,
+            num_streams = num_streams
+        )
 
     goal_encoder = AttnResidualNormedMLP(
         dim_in = dim_goal,
         dim = goal_dim,
         depth = goal_depth,
-        dim_out = dim_contrastive_embed,
+        dim_out = critic_embed_dim,
         use_rmsnorm = use_rmsnorm,
         num_streams = num_streams
     )
@@ -206,7 +288,7 @@ def main(
             bias = sigmoid_bias,
             l2norm_embed = False,
             learned_scale = False,
-            use_euclidean = use_euclidean
+            use_euclidean = use_euclidean,
         )
     else:
         contrastive_learn = ContrastiveLearning(
@@ -214,7 +296,7 @@ def main(
             learned_temp = False,
             use_euclidean = use_euclidean,
             symmetric = symmetric,
-            lse_reg_weight = lse_reg_weight
+            lse_reg_weight = lse_reg_weight,
         )
 
     # trainers

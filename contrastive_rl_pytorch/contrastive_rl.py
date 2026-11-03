@@ -666,6 +666,163 @@ class ContrastiveWrapper(Module):
 
         return loss + decoder_loss
 
+class FactorizedActionEncoder(Module):
+    # FaStR CP feature only: psi(s, a) = phi_s(s) * phi_a(a) - Wu & Li 2026, arXiv:2607.13498
+    # paper also uses beta-conditioned m(s'), RP-NCE, and an RFF/TD3 critic
+    def __init__(
+        self,
+        state_encoder: Module,
+        action_encoder: Module,
+        dim_state: int,
+        dim_action: int,
+        dim_embed: int | None = None,
+        norm: str = 'none'
+    ):
+        super().__init__()
+
+        assert norm in ('none', 'layernorm', 'l2')
+
+        self.state_encoder = state_encoder
+        self.action_encoder = action_encoder
+        self.dim_state = dim_state
+        self.dim_action = dim_action
+        self.norm = norm
+
+        if norm == 'layernorm':
+            assert exists(dim_embed)
+            self.state_norm = nn.LayerNorm(dim_embed)
+            self.action_norm = nn.LayerNorm(dim_embed)
+        else:
+            self.state_norm = self.action_norm = None
+
+    def forward(self, x):
+        state = x[..., :self.dim_state]
+        action = x[..., self.dim_state:(self.dim_state + self.dim_action)]
+        extra = x[..., (self.dim_state + self.dim_action):]
+
+        if extra.shape[-1] > 0:
+            state = cat((state, extra), dim = -1)
+
+        phi_s = self.state_encoder(state)
+        phi_a = self.action_encoder(action)
+
+        if self.norm == 'layernorm':
+            phi_s, phi_a = self.state_norm(phi_s), self.action_norm(phi_a)
+        elif self.norm == 'l2':
+            phi_s, phi_a = map(l2norm, (phi_s, phi_a))
+
+        return phi_s * phi_a
+
+class TuckerActionEncoder(Module):
+    # full Tucker score: vec(phi_s(s) phi_a(a)^T) . vec(M(s'))
+    def __init__(
+        self,
+        state_encoder: Module,
+        action_encoder: Module,
+        dim_state: int,
+        dim_action: int
+    ):
+        super().__init__()
+
+        self.state_encoder = state_encoder
+        self.action_encoder = action_encoder
+        self.dim_state = dim_state
+        self.dim_action = dim_action
+
+    def forward(self, x):
+        state = x[..., :self.dim_state]
+        action = x[..., self.dim_state:(self.dim_state + self.dim_action)]
+        extra = x[..., (self.dim_state + self.dim_action):]
+
+        if extra.shape[-1] > 0:
+            state = cat((state, extra), dim = -1)
+
+        phi_s = self.state_encoder(state)
+        phi_a = self.action_encoder(action)
+
+        outer = einsum(phi_s, phi_a, '... i, ... j -> ... i j')
+        return rearrange(outer, '... i j -> ... (i j)')
+
+class BlockDiagonalTuckerActionEncoder(Module):
+    # block-diagonal Tucker: CP within groups, cross-terms across groups
+    # block_size 1 -> CP, block_size dim_embed -> full Tucker
+    def __init__(
+        self,
+        state_encoder: Module,
+        action_encoder: Module,
+        dim_state: int,
+        dim_action: int,
+        block_size: int,
+        dim_embed: int | None = None
+    ):
+        super().__init__()
+
+        assert block_size >= 1
+        assert not exists(dim_embed) or divisible_by(dim_embed, block_size)
+
+        self.state_encoder = state_encoder
+        self.action_encoder = action_encoder
+        self.dim_state = dim_state
+        self.dim_action = dim_action
+        self.block_size = block_size
+        self.dim_embed = dim_embed
+
+    @property
+    def output_dim(self):
+        if not exists(self.dim_embed):
+            return None
+
+        return self.dim_embed * self.block_size
+
+    def forward(self, x):
+        state = x[..., :self.dim_state]
+        action = x[..., self.dim_state:(self.dim_state + self.dim_action)]
+        extra = x[..., (self.dim_state + self.dim_action):]
+
+        if extra.shape[-1] > 0:
+            state = cat((state, extra), dim = -1)
+
+        block_size = self.block_size
+        phi_s = rearrange(self.state_encoder(state), '... (g i) -> ... g i', i = block_size)
+        phi_a = rearrange(self.action_encoder(action), '... (g i) -> ... g i', i = block_size)
+
+        outer = einsum(phi_s, phi_a, '... g i, ... g j -> ... g i j')
+        return rearrange(outer, '... g i j -> ... (g i j)')
+
+class FiLMStateActionEncoder(Module):
+    # action FiLM-modulates hidden state features, optionally gates the final feature
+    def __init__(
+        self,
+        state_encoder: Module,
+        action_encoder: Module,
+        dim_state: int,
+        dim_action: int,
+        gate_encoder: Module | None = None
+    ):
+        super().__init__()
+
+        self.state_encoder = state_encoder
+        self.action_encoder = action_encoder
+        self.gate_encoder = gate_encoder
+        self.dim_state = dim_state
+        self.dim_action = dim_action
+
+    def forward(self, x):
+        state = x[..., :self.dim_state]
+        action = x[..., self.dim_state:(self.dim_state + self.dim_action)]
+        extra = x[..., (self.dim_state + self.dim_action):]
+
+        if extra.shape[-1] > 0:
+            state = cat((state, extra), dim = -1)
+
+        cond = self.action_encoder(action)
+        hidden = self.state_encoder(state, cond = cond)
+
+        if not exists(self.gate_encoder):
+            return hidden
+
+        return hidden * self.gate_encoder(action)
+
 class ActionContrastiveWrapper(ContrastiveWrapper):
     def __init__(
         self,

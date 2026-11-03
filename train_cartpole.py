@@ -42,6 +42,9 @@ from contrastive_rl_pytorch import (
     ContrastiveLearning,
     SigmoidContrastiveLearning,
     CategoricalActionAdapter,
+    FactorizedActionEncoder,
+    TuckerActionEncoder,
+    FiLMStateActionEncoder,
     sample_random_state
 )
 
@@ -110,6 +113,13 @@ def main(
     exploration_sample_from_buffer_prob = 0.5,
     action_entropy_loss_weight = 0.005,
     normalize_q_values = True,
+    factorized_critic = False,
+    factorized_norm = 'none',
+    film_critic = False,
+    film_cond_dim = 64,
+    film_final_gate = False,
+    tucker_critic = False,
+    tucker_dim = 32,
     save_checkpoint_every = 100,
     checkpoint_folder = './checkpoints-cartpole',
     replay_buffer_folder = './replay-cartpole',
@@ -124,6 +134,8 @@ def main(
     assert not (orthogonal_transition and use_euclidean), 'orthogonal_transition requires cosine similarity'
     assert not (orthogonal_transition and temporal_distance_regularization), 'temporal distance regularization is not supported with orthogonal transition'
     assert use_sigmoid_contrastive_learning or orthogonal_transition or not temporal_distance_regularization, 'temporal distance regularization requires the sigmoid critic or orthogonal transition'
+    assert not (factorized_critic and use_euclidean), 'factorized trilinear critic requires dot-product similarity (use_euclidean=False)'
+    assert sum((factorized_critic, film_critic, tucker_critic)) <= 1, 'choose one critic structure'
 
     # env
 
@@ -185,20 +197,90 @@ def main(
     actor_readout = Readout(num_discrete = dim_action, dim = 0)
 
     contrastive_embed_dim = dim_contrastive_embed
+    critic_embed_dim = tucker_dim * tucker_dim if tucker_critic else contrastive_embed_dim
 
-    critic_encoder = AttnResidualNormedMLP(
-        dim_in = dim_state + dim_action_field,
-        dim = critic_dim,
-        depth = critic_depth,
-        dim_out = contrastive_embed_dim,
-        use_rmsnorm = use_rmsnorm
-    )
+    if tucker_critic:
+        critic_encoder = TuckerActionEncoder(
+            state_encoder = AttnResidualNormedMLP(
+                dim_in = dim_state,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = tucker_dim,
+                use_rmsnorm = use_rmsnorm
+            ),
+            action_encoder = AttnResidualNormedMLP(
+                dim_in = dim_action_field,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = tucker_dim,
+                use_rmsnorm = use_rmsnorm
+            ),
+            dim_state = dim_state,
+            dim_action = dim_action_field
+        )
+    elif film_critic:
+        critic_encoder = FiLMStateActionEncoder(
+            state_encoder = AttnResidualNormedMLP(
+                dim_in = dim_state,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = contrastive_embed_dim,
+                use_rmsnorm = use_rmsnorm,
+                film = True,
+                cond_dim = film_cond_dim
+            ),
+            action_encoder = AttnResidualNormedMLP(
+                dim_in = dim_action_field,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = film_cond_dim,
+                use_rmsnorm = use_rmsnorm
+            ),
+            dim_state = dim_state,
+            dim_action = dim_action_field,
+            gate_encoder = AttnResidualNormedMLP(
+                dim_in = dim_action_field,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = contrastive_embed_dim,
+                use_rmsnorm = use_rmsnorm
+            ) if film_final_gate else None
+        )
+    elif factorized_critic:
+        critic_encoder = FactorizedActionEncoder(
+            state_encoder = AttnResidualNormedMLP(
+                dim_in = dim_state,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = contrastive_embed_dim,
+                use_rmsnorm = use_rmsnorm
+            ),
+            action_encoder = AttnResidualNormedMLP(
+                dim_in = dim_action_field,
+                dim = critic_dim,
+                depth = critic_depth,
+                dim_out = contrastive_embed_dim,
+                use_rmsnorm = use_rmsnorm
+            ),
+            dim_state = dim_state,
+            dim_action = dim_action_field,
+            dim_embed = contrastive_embed_dim,
+            norm = factorized_norm
+        )
+    else:
+        critic_encoder = AttnResidualNormedMLP(
+            dim_in = dim_state + dim_action_field,
+            dim = critic_dim,
+            depth = critic_depth,
+            dim_out = contrastive_embed_dim,
+            use_rmsnorm = use_rmsnorm
+        )
 
     goal_encoder = AttnResidualNormedMLP(
         dim_in = dim_goal,
         dim = goal_dim,
         depth = goal_depth,
-        dim_out = contrastive_embed_dim,
+        dim_out = critic_embed_dim,
         use_rmsnorm = use_rmsnorm
     )
 
@@ -207,7 +289,7 @@ def main(
     if orthogonal_transition:
         contrastive_learn = ContrastiveLearning(
             l2norm_embed = True,
-            rotation_dim = contrastive_embed_dim
+            rotation_dim = contrastive_embed_dim,
         )
     elif temporal_distance_regularization:
         contrastive_learn = SigmoidContrastiveLearning(
@@ -217,20 +299,20 @@ def main(
             use_euclidean = use_euclidean,
             time_weight = temporal_time_weight,
             sep_weight = temporal_sep_weight,
-            temporal_distance_type = temporal_distance_type
+            temporal_distance_type = temporal_distance_type,
         )
     elif use_sigmoid_contrastive_learning:
         contrastive_learn = SigmoidContrastiveLearning(
             bias = sigmoid_bias,
             l2norm_embed = cl_l2norm_embed,
             learned_scale = learned_scale,
-            use_euclidean = use_euclidean
+            use_euclidean = use_euclidean,
         )
     else:
         contrastive_learn = ContrastiveLearning(
             l2norm_embed = cl_l2norm_embed,
             learned_temp = learned_temp,
-            use_euclidean = use_euclidean
+            use_euclidean = use_euclidean,
         )
 
     # trainer

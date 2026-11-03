@@ -316,3 +316,15 @@ wait until 3-5k steps at least
     url     = {https://openreview.net/forum?id=rJvY_5OzoI}
 }
 ```
+
+```bibtex
+@misc{wu2026factorizedspectral,
+    title   = {Factorized Spectral Representations for Reinforcement Learning},
+    author  = {Junyi Wu and Dan Li},
+    year    = {2026},
+    eprint  = {2607.13498},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2607.13498}
+}
+```
