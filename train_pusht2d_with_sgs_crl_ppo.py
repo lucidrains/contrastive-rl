@@ -13,7 +13,7 @@
 #   "torch",
 #   "torch-einops-utils",
 #   "x-mlps-pytorch>=0.6.1",
-#   "x-ppo>=0.0.21",
+#   "x-ppo>=0.0.30",
 # ]
 #
 # [tool.uv.sources]
@@ -56,6 +56,7 @@ from x_ppo import calc_gae, combine_grouped_advantages, hpo_actor_loss
 from contrastive_rl_pytorch import (
     ContrastiveLearning,
     ContrastiveWrapper,
+    contrastive_distance_rewards,
     sample_discount,
     sample_truncated_geometric
 )
@@ -672,6 +673,12 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
         self.self_goal_cos_weight = float(self_goal_cos_weight)
         self.last_self_cos_err = 0.0
         self.last_self_top1_err = 0.0
+        self.crl_value_hl_gauss = HLGaussLoss(
+            min_value = 0.0,
+            max_value = float(max(self.reward_scale, 1.0)),
+            num_bins = int(value_num_bins),
+            clamp_to_range = True
+        ).to(self.device)
         self.env_value_hl_gauss = HLGaussLoss(
             min_value = 0.0,
             max_value = float(env_value_max_return),
@@ -741,25 +748,25 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
 
         return sum(losses) / len(losses)
 
-    def _hl_gauss_value_update(self, flat_states, flat_goals, flat_returns):
+    def _hl_gauss_net_update(self, net, opt, loss_fn, flat_states, flat_goals, flat_returns):
         batch_size = shape(flat_states, 'b ...').dims['b']
         minibatch_size = min(self.value_minibatch_size, batch_size)
 
-        self.env_value.train()
+        net.train()
         losses = []
         for _ in range(self.value_epochs):
             perm = torch.randperm(batch_size, device = self.device)
             for start in range(0, batch_size, minibatch_size):
                 idx = perm[start:start + minibatch_size]
                 inputs = cat((flat_states[idx], flat_goals[idx]), dim = -1)
-                loss = self.env_value_hl_gauss(self.env_value(inputs), flat_returns[idx])
-                self.env_value_opt.zero_grad()
+                loss = loss_fn(net(inputs), flat_returns[idx])
+                opt.zero_grad()
                 loss.backward()
                 if exists(self.max_grad_norm):
-                    nn.utils.clip_grad_norm_(self.env_value.parameters(), self.max_grad_norm)
-                self.env_value_opt.step()
+                    nn.utils.clip_grad_norm_(net.parameters(), self.max_grad_norm)
+                opt.step()
                 losses.append(loss.item())
-        return sum(losses) / len(losses)
+        return sum(losses) / len(losses) if losses else 0.0
 
     def _ppo_update(self, states, goals, actions, old_log_probs, advantages):
         flat_states = rearrange(states, 'n t d -> (n t) d')
@@ -815,13 +822,14 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
             clip_frac = sum(clip_fracs) / len(clip_fracs)
         )
 
-    def update(self, states, goals, actions, old_log_probs, dones, next_states, terminated, base_rewards, env_reward_weight = None):
+    def update(self, states, goals, actions, old_log_probs, dones, next_states, terminated, base_rewards, env_reward_weight = None, truncated = None):
         states = self._to_tensor(states, torch.float32)
         next_states = self._to_tensor(next_states, torch.float32)
         actions = self._to_tensor(actions)
         old_log_probs = self._to_tensor(old_log_probs, torch.float32)
         dones = self._to_tensor(dones, torch.bool)
         terminated = self._to_tensor(terminated, torch.bool)
+        truncated = self._to_tensor(truncated, torch.bool) if exists(truncated) else dones & ~terminated
         base_rewards = self._to_tensor(base_rewards, torch.float32).clamp(0., 1.)
 
         dims = shape(states, 'n t ...').dims
@@ -833,40 +841,47 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
         flat_states = rearrange(states, 'n t d -> (n t) d')
         flat_next_states = rearrange(next_states, 'n t d -> (n t) d')
         flat_goals = rearrange(goals, 'n t g -> (n t) g')
+        flat_success = rearrange(terminated, 'n t -> (n t)')
 
         with torch.no_grad():
-            next_distances = self.critic_wrapper.distance_pairs(flat_next_states, flat_goals, distance_type = self.distance_type)
-            cur_distances = self.critic_wrapper.distance_pairs(flat_states, flat_goals, distance_type = self.distance_type)
-
-            values = rearrange(-cur_distances, '(n t) -> n t', n = num_trajs)  # log only
-            distances = rearrange(next_distances, '(n t) -> n t', n = num_trajs)
-
-            # crl reward on the next state: exp(-scale * d(s_{t+1}, g))
-            crl_rewards = torch.exp(-next_distances * self.reward_distance_scale) * self.reward_scale
-            crl_rewards = rearrange(crl_rewards, '(n t) -> n t', n = num_trajs)
-            crl_rewards = torch.where(terminated, torch.zeros_like(crl_rewards), crl_rewards)
-
-            # zero baseline: gae is the discounted sum of the reward
-            crl_gae = calc_gae(
-                crl_rewards,
-                torch.zeros_like(crl_rewards),
-                masks = (~terminated).float(),
-                done_masks = (~dones).float(),
-                gamma = self.discount,
-                lam = self.lam,
-                next_values = torch.zeros_like(crl_rewards),
-                return_advantages = True
+            crl_out = contrastive_distance_rewards(
+                self.critic_wrapper,
+                flat_next_states,
+                flat_goals,
+                success = flat_success,
+                discount = self.discount,
+                distance_scale = self.reward_distance_scale,
+                reward_scale = self.reward_scale,
+                distance_type = self.distance_type
             )
-            crl_advantages = crl_gae.advantages
+
+            step_crl = rearrange(crl_out.step_rewards, '(n t) -> n t', n = num_trajs)
+            crl_rewards = rearrange(crl_out.rewards, '(n t) -> n t', n = num_trajs)
+            distances = rearrange(crl_out.distances, '(n t) -> n t', n = num_trajs)
+
+            crl_values = rearrange(self.crl_value_hl_gauss(self.value(cat((flat_states, flat_goals), dim = -1))), '(n t) -> n t', n = num_trajs)
+            crl_next_values = rearrange(self.crl_value_hl_gauss(self.value(cat((flat_next_states, flat_goals), dim = -1))), '(n t) -> n t', n = num_trajs)
 
             env_values = rearrange(self.env_value_hl_gauss(self.env_value(cat((flat_states, flat_goals), dim = -1))), '(n t) -> n t', n = num_trajs)
             env_next_values = rearrange(self.env_value_hl_gauss(self.env_value(cat((flat_next_states, flat_goals), dim = -1))), '(n t) -> n t', n = num_trajs)
 
+        crl_gae = calc_gae(
+            crl_rewards,
+            crl_values,
+            terminated = terminated,
+            truncated = truncated,
+            gamma = self.discount,
+            lam = self.lam,
+            next_values = crl_next_values,
+            return_advantages = True
+        )
+        crl_returns, crl_advantages = crl_gae.returns, crl_gae.advantages
+
         env_gae = calc_gae(
             base_rewards,
             env_values,
-            masks = (~terminated).float(),
-            done_masks = (~dones).float(),
+            terminated = terminated,
+            truncated = truncated,
             gamma = self.discount,
             lam = self.lam,
             next_values = env_next_values,
@@ -884,19 +899,20 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
             reduce = 'sum'
         )
 
-        env_value_loss = self._hl_gauss_value_update(flat_states, flat_goals, rearrange(env_returns, 'n t -> (n t)'))
+        value_loss = self._hl_gauss_net_update(self.value, self.value_opt, self.crl_value_hl_gauss, flat_states, flat_goals, rearrange(crl_returns, 'n t -> (n t)'))
+        env_value_loss = self._hl_gauss_net_update(self.env_value, self.env_value_opt, self.env_value_hl_gauss, flat_states, flat_goals, rearrange(env_returns, 'n t -> (n t)'))
         ppo_metrics = self._ppo_update(states, goals, actions, old_log_probs, advantages)
-        crl_reward_mean = crl_rewards.mean().item()
+        crl_reward_mean = step_crl.mean().item()
         crl_advantage_mean = crl_advantages.mean().item()
 
         return dict(
             critic_loss = critic_loss,
             self_cos_err = float(self.last_self_cos_err),
             self_top1_err = float(self.last_self_top1_err),
-            value_loss = 0.,
+            value_loss = value_loss,
             env_value_loss = env_value_loss,
             distance_mean = distances.mean().item(),
-            value_mean = values.mean().item(),
+            value_mean = crl_values.mean().item(),
             reward_mean = crl_reward_mean,
             crl_reward_mean = crl_reward_mean,
             env_reward_mean = base_rewards.mean().item(),
@@ -1258,7 +1274,7 @@ def main(
         metrics = trainer.update(
             states = states, goals = goals, actions = actions, old_log_probs = log_probs,
             dones = terminateds | truncateds, next_states = next_states, terminated = terminateds,
-            base_rewards = env_rewards, env_reward_weight = env_reward_weight
+            truncated = truncateds, base_rewards = env_rewards, env_reward_weight = env_reward_weight
         )
 
         k_star = compute_frontier_k(sampler.success_rates, sampler.counts)

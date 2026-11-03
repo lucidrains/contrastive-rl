@@ -10,7 +10,7 @@
 #   "mean-conc-beta>=0.2.1",
 #   "memmap-replay-buffer>=0.0.17",
 #   "x-mlps-pytorch>=0.6.1",
-#   "x-ppo>=0.0.21",
+#   "x-ppo>=0.0.30",
 #   "numpy",
 #   "torch",
 # ]
@@ -53,6 +53,7 @@ from mean_conc_beta import Beta
 from contrastive_rl_pytorch import (
     ContrastiveLearning,
     ContrastiveWrapper,
+    contrastive_distance_rewards,
     sample_discount,
     sample_truncated_geometric
 )
@@ -490,6 +491,13 @@ def set_curriculum(envs, update, start_radius = 2, step = 4, max_radius = 20):
 
 # env presets
 
+def default_success_fn(info, terminated, reward):
+    return bool(info.get('success', False))
+
+def lunar_success_fn(info, terminated, reward):
+    # lunar gives +100 on a safe landing and -100 on a crash
+    return bool(info.get('success', False)) or (bool(terminated) and reward > 0.)
+
 def env_config(name):
     if name == 'inverted_pendulum':
         return dict(
@@ -517,6 +525,7 @@ def env_config(name):
             entropy_coef = 0.,
             exploration_goal_prob = 0.25,
             success_bonus = 0.,
+            success_fn = default_success_fn,
             use_rms = True,
             goals_from_env = False
         )
@@ -543,11 +552,12 @@ def env_config(name):
             critic_depth = 3,
             critic_distance_scale = 10.,
             reward_distance_scale = 2.,
-            reward_scale = 1.,
+            reward_scale = None,  # auto 1 / (1 - discount), keeps value targets O(1)
             critic_discount = 0.95,
             entropy_coef = 0.,
             exploration_goal_prob = 0.25,
             success_bonus = 0.,
+            success_fn = lunar_success_fn,
             env_reward_has_success = False,
             use_rms = True,
             goals_from_env = False
@@ -579,6 +589,7 @@ def env_config(name):
         entropy_coef = 0.01,
         exploration_goal_prob = 0.5,
         success_bonus = 1.,
+        success_fn = default_success_fn,
         env_reward_has_success = True,
         use_rms = False,
         goals_from_env = True
@@ -1022,12 +1033,17 @@ class DistanceRewardPPO(Module):
         base_rewards = None,
         env_reward_weight: float | None = None,
         critic_steps: int | None = None,
-        ppo_epochs: int | None = None
+        ppo_epochs: int | None = None,
+        truncated = None,
+        success = None
     ):
         states = self._to_tensor(states, torch.float32)
         actions = self._to_tensor(actions)
         old_log_probs = self._to_tensor(old_log_probs, torch.float32)
         dones = self._to_tensor(dones, torch.bool) if exists(dones) else None
+        terminated = self._to_tensor(terminated, torch.bool) if exists(terminated) else None
+        truncated = self._to_tensor(truncated, torch.bool) if exists(truncated) else None
+        success = self._to_tensor(success, torch.bool) if exists(success) else None
 
         dims = shape(states, 'n t ...').dims
         num_trajs, num_steps = dims['n'], dims['t']
@@ -1040,9 +1056,10 @@ class DistanceRewardPPO(Module):
             next_states = self._to_tensor(next_states, torch.float32)
 
         if not exists(terminated):
-            terminated = dones if exists(dones) else torch.zeros((num_trajs, num_steps), device = self.device, dtype = torch.bool)
+            terminated = dones & ~truncated if exists(dones) and exists(truncated) else default(dones, torch.zeros((num_trajs, num_steps), device = self.device, dtype = torch.bool))
 
-        terminated = self._to_tensor(terminated, torch.bool)
+        if not exists(truncated):
+            truncated = dones & ~terminated if exists(dones) else torch.zeros_like(terminated)
 
         # critic update on the fresh on-policy batch
 
@@ -1054,15 +1071,25 @@ class DistanceRewardPPO(Module):
         flat_states = rearrange(states, 'n t d -> (n t) d')
         flat_next_states = rearrange(next_states, 'n t d -> (n t) d')
         flat_goals = rearrange(goals, 'n t g -> (n t) g')
+        flat_success = rearrange(success, 'n t -> (n t)') if exists(success) else None
 
         # reward
 
         with torch.no_grad():
-            distances = self.critic_wrapper.distance_pairs(flat_next_states, flat_goals, distance_type = self.distance_type)
-            crl_distance_rewards = torch.exp(-distances * self.reward_distance_scale) * self.reward_scale
+            crl_out = contrastive_distance_rewards(
+                self.critic_wrapper,
+                flat_next_states,
+                flat_goals,
+                success = flat_success,
+                discount = self.discount,
+                distance_scale = self.reward_distance_scale,
+                reward_scale = self.reward_scale,
+                distance_type = self.distance_type
+            )
 
-            crl_distance_rewards = rearrange(crl_distance_rewards, '(n t) -> n t', n = num_trajs)
-            distances = rearrange(distances, '(n t) -> n t', n = num_trajs)
+            crl_rewards = rearrange(crl_out.rewards, '(n t) -> n t', n = num_trajs)
+            crl_step_rewards = rearrange(crl_out.step_rewards, '(n t) -> n t', n = num_trajs)
+            distances = rearrange(crl_out.distances, '(n t) -> n t', n = num_trajs)
 
             def value_predictions(value):
                 flat_values = value(cat((flat_states, flat_goals), dim = -1)).squeeze(-1)
@@ -1075,15 +1102,14 @@ class DistanceRewardPPO(Module):
             if exists(self.value):
                 values, next_values = value_predictions(self.value)
             else:
-                values = torch.zeros_like(crl_distance_rewards)
+                values = torch.zeros_like(crl_rewards)
                 next_values = values
 
             if self.separate_env_rewards:
                 env_values, env_next_values = value_predictions(self.env_value)
 
-        # next state is the autoreset state at an episode boundary - no bootstrap across it
-        boundary = dones if exists(dones) else terminated
-        masks = (~boundary).float()
+        # normalization mask skips episode boundaries
+        done_mask = (~(terminated | truncated)).float()
         env_reward_weight = default(env_reward_weight, self.env_reward_weight)
         env_reward_weight = min(max(float(env_reward_weight), 0.), 1.)
         crl_reward_weight = 1. - env_reward_weight
@@ -1093,16 +1119,16 @@ class DistanceRewardPPO(Module):
         if self.separate_env_rewards:
             assert exists(base_rewards), 'base_rewards must be passed when separate_env_rewards is enabled'
             base_rewards = self._to_tensor(base_rewards, torch.float32)
-            assert base_rewards.shape == crl_distance_rewards.shape
+            assert base_rewards.shape == crl_rewards.shape
 
-            crl_rewards = crl_distance_rewards
             if exists(aux_rewards):
                 crl_rewards = crl_rewards + self._to_tensor(aux_rewards, torch.float32)
 
             gae = calc_gae(
                 torch.stack((base_rewards, crl_rewards), dim = -1),
                 torch.stack((env_values, values), dim = -1),
-                masks = masks,
+                terminated = terminated,
+                truncated = truncated,
                 gamma = self.discount,
                 lam = self.lam,
                 next_values = torch.stack((env_next_values, next_values), dim = -1),
@@ -1115,27 +1141,28 @@ class DistanceRewardPPO(Module):
                 weights = torch.tensor((env_reward_weight, crl_reward_weight), device = self.device),
                 normalize = True,
                 group_dim = -1,
-                mask = masks,
+                mask = done_mask,
                 reduce = 'sum'
             )
 
             env_returns, crl_returns = gae.returns[..., 0], gae.returns[..., 1]
             env_advantages, crl_advantages = gae.advantages[..., 0], gae.advantages[..., 1]
         else:
-            rewards = crl_distance_rewards
+            rewards = crl_rewards
             if exists(aux_rewards):
                 rewards = rewards + self._to_tensor(aux_rewards, torch.float32)
 
             if self.add_env_rewards:
                 assert exists(base_rewards), 'base_rewards must be passed when add_env_rewards is enabled'
                 base_rewards = self._to_tensor(base_rewards, torch.float32)
-                assert base_rewards.shape == crl_distance_rewards.shape
+                assert base_rewards.shape == crl_rewards.shape
                 rewards = base_rewards + rewards
 
             gae = calc_gae(
                 rewards,
                 values,
-                masks = masks,
+                terminated = terminated,
+                truncated = truncated,
                 gamma = self.discount,
                 lam = self.lam,
                 next_values = next_values,
@@ -1175,7 +1202,7 @@ class DistanceRewardPPO(Module):
             return t.mean().item(), t.std().item()
 
         use_env_rewards = self.separate_env_rewards or self.add_env_rewards
-        reward_mean = crl_rewards.mean().item() if self.separate_env_rewards else rewards.mean().item()
+        reward_mean = crl_step_rewards.mean().item() if self.separate_env_rewards else rewards.mean().item()
         env_reward_mean = base_rewards.mean().item() if use_env_rewards else 0.
 
         value_mean, value_std = mean_std(values)
@@ -1192,7 +1219,7 @@ class DistanceRewardPPO(Module):
             value_mean = value_mean,
             value_std = value_std,
             reward_mean = reward_mean,
-            crl_reward_mean = crl_distance_rewards.mean().item(),
+            crl_reward_mean = crl_step_rewards.mean().item(),
             env_reward_mean = env_reward_mean,
             env_value_mean = env_value_mean,
             env_value_std = env_value_std,
@@ -1243,6 +1270,7 @@ def main(
     success_bonus = None,
     add_env_rewards = False,
     separate_env_rewards = True,
+    sparse_env_rewards = False,  # replace engine rewards with binary success
     # weights z-scored advantages when separate_env_rewards=True; ignored when add_env_rewards=True
     env_reward_weight = 0.5,
     env_reward_weight_start = None,
@@ -1285,7 +1313,9 @@ def main(
     critic_discount = default(critic_discount, cfg['critic_discount'])
     reward_distance_scale = default(reward_distance_scale, cfg['reward_distance_scale'])
     reward_scale = default(reward_scale, cfg['reward_scale'])
+    reward_scale = default(reward_scale, 1. / (1. - discount))
     success_bonus = default(success_bonus, cfg['success_bonus'])
+    success_fn = cfg['success_fn']
     exploration_goal_prob = default(exploration_goal_prob, cfg['exploration_goal_prob'])
 
     device = device or 'cpu'
@@ -1522,7 +1552,7 @@ def main(
             actions[:, step] = action_np
             log_probs[:, step] = log_prob.cpu().numpy()
             env_rewards[:, step] = step_rewards
-            success_rewards[:, step] = [float(info.get('success', False)) for info in infos]
+            success_rewards[:, step] = [float(success_fn(info, term, rew)) for info, term, rew in zip(infos, terminated, step_rewards)]
             terminateds[:, step] = terminated
             truncateds[:, step] = truncated
 
@@ -1533,6 +1563,9 @@ def main(
                     current_goals[i] = sample_goal()
 
             obs = next_obs
+
+        if sparse_env_rewards:
+            env_rewards = success_rewards.copy()
 
         if exists(rms):
             states = rms.normalize(raw_states)
@@ -1576,7 +1609,7 @@ def main(
             )
         else:
             success_source = success_rewards if use_env_rewards else env_rewards
-            env_has_success = cfg.get('env_reward_has_success', False)
+            env_has_success = cfg.get('env_reward_has_success', False) or sparse_env_rewards
             add_success_bonus = success_bonus > 0. and not (use_env_rewards and env_has_success)
             aux_rewards = success_bonus * success_source if add_success_bonus else None
 
@@ -1588,6 +1621,8 @@ def main(
                 dones = dones,
                 next_states = next_states,
                 terminated = terminateds,
+                truncated = truncateds,
+                success = success_rewards,
                 aux_rewards = aux_rewards,
                 base_rewards = env_rewards if use_env_rewards else None,
                 env_reward_weight = env_weight

@@ -666,6 +666,34 @@ class ContrastiveWrapper(Module):
 
         return loss + decoder_loss
 
+# contrastive distance reward -> [0, reward_scale]: non-terminal (1 - discount) * r, success full reward
+
+class ContrastiveRewardOutput(NamedTuple):
+    rewards: Tensor
+    step_rewards: Tensor
+    distances: Tensor
+
+def contrastive_distance_rewards(
+    contrastive: Module,
+    next_states: Tensor,
+    goals: Tensor,
+    *,
+    success: Tensor | None = None,
+    discount = 0.99,
+    distance_scale = 2.,
+    reward_scale = 1.,
+    distance_type: str | None = None,
+    **distance_kwargs
+) -> ContrastiveRewardOutput:
+    distances = contrastive.distance_pairs(next_states, goals, distance_type = distance_type, **distance_kwargs)
+    step_rewards = torch.exp(-distances * distance_scale) * reward_scale
+    rewards = step_rewards * (1. - discount)
+
+    if exists(success):
+        rewards = torch.where(success.bool(), torch.full_like(rewards, reward_scale), rewards)
+
+    return ContrastiveRewardOutput(rewards, step_rewards, distances)
+
 class FactorizedActionEncoder(Module):
     # FaStR CP feature only: psi(s, a) = phi_s(s) * phi_a(a) - Wu & Li 2026, arXiv:2607.13498
     # paper also uses beta-conditioned m(s'), RP-NCE, and an RFF/TD3 critic
