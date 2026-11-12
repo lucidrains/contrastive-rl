@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from copy import deepcopy
 from functools import partial
 from typing import Callable, NamedTuple
@@ -8,17 +7,15 @@ from typing import Callable, NamedTuple
 import torch
 from torch import cat, arange, tensor, from_numpy, is_tensor, Tensor, stack
 from torch import nn
-from torch.nn import Module, ModuleList, Parameter
+from torch.nn import Module, Parameter
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import TensorDataset, DataLoader
 
 from einops import einsum, rearrange, repeat
-from ema_pytorch import EMA
 from torch_einops_utils import lens_to_mask, masked_mean, safe_cat, z_score
 from torch_einops_utils.device import fallback_from
 from torch_einops_utils.shape import shape
-from x_mlps_pytorch import ResidualNormedMLP, AttnResidualNormedMLP
 
 from accelerate import Accelerator
 from tqdm import tqdm
@@ -74,8 +71,6 @@ def default_discount_transform(discount):
         discount = rearrange(discount, '-> 1 1')
     elif discount.ndim == 1:
         discount = rearrange(discount, 'b -> b 1')
-    elif discount.shape[-1] != 1:
-        discount = rearrange(discount, '... -> ... 1')
 
     return cat((
         discount,
@@ -606,32 +601,8 @@ class ContrastiveWrapper(Module):
     def scale(self):
         return self.contrastive_learn.scale
 
-    def encode_state_action(
-        self,
-        past,
-        past_action = None,
-        discount = None
-    ):
-        if exists(past_action):
-            if past_action.ndim > 2:
-                past_action = rearrange(past_action, 'b c ... -> b (c ...)')
-
-            past = cat((past, past_action), dim = -1)
-
-        if exists(discount):
-            past = cat((past, discount), dim = -1)
-
-        return self.encode(past)
-
-    def encode_goal(self, future):
-        return self.encode_future(future)
-
-    def distance_pairs(self, past, future, distance_type: str | None = None, discount = None):
+    def distance_pairs(self, past, future, distance_type: str | None = None):
         cl = self.contrastive_learn
-
-        if exists(discount):
-            past = cat((past, discount), dim = -1)
-
         past_embeds, future_embeds = self.encode(past), self.encode_future(future)
 
         if cl.has_rotation and not cl.use_euclidean:
@@ -940,25 +911,7 @@ class ActionContrastiveWrapper(ContrastiveWrapper):
 
         return super().forward(past, future, past_action = action_feat, **kwargs)
 
-    def encode_state_action(
-        self,
-        past,
-        past_action = None,
-        discount = None,
-        dropout_action = False
-    ):
-        if exists(past_action):
-            action_feat = self.action_feat(past_action)
-            if action_feat.ndim > 2:
-                action_feat = rearrange(action_feat, 'b ... -> b (...)')
-            if dropout_action:
-                action_feat = self.dropout_action(action_feat)
-        else:
-            action_feat = self.null_feat(past.shape[0], device = past.device)
-
-        return super().encode_state_action(past, past_action = action_feat, discount = discount)
-
-    def distance_pairs(self, past, future, distance_type = None, past_action = None, past_action_feat = None, discount = None):
+    def distance_pairs(self, past, future, distance_type = None, past_action = None, past_action_feat = None):
         if exists(past_action_feat):
             action_feat = past_action_feat
         elif exists(past_action):
@@ -969,7 +922,7 @@ class ActionContrastiveWrapper(ContrastiveWrapper):
             action_feat = self.null_feat(past.shape[0], device = past.device)
 
         past = cat((past, action_feat), dim = -1)
-        return super().distance_pairs(past, future, distance_type = distance_type, discount = discount)
+        return super().distance_pairs(past, future, distance_type = distance_type)
 
 # contrastive RL trainer
 
@@ -1240,251 +1193,6 @@ class ContrastiveRLTrainer(Module):
 
         return loss_item
 
-# discount-conditioned SAC-style Q-head
-# consumes detached critic embedding + raw state + raw action skip connection + discount conditioning
-
-class DiscountConditionedQHead(Module):
-    def __init__(
-        self,
-        dim_embed: int,
-        dim_state: int,
-        dim_action: int,
-        dim_goal: int = 0,
-        dim_discount: int = 3,
-        dim_hidden: int = 256,
-        depth: int = 4,
-        num_q_heads: int = 2,
-        use_rmsnorm: bool = True,
-        ema_decay: float = 0.995,
-        detach_critic_embed: bool = True,
-        discount_transform: Callable = default_discount_transform,
-        q_nets: ModuleList | None = None,
-        ema_kwargs: dict = dict()
-    ):
-        super().__init__()
-        assert num_q_heads >= 1
-
-        self.dim_embed = dim_embed
-        self.dim_state = dim_state
-        self.dim_action = dim_action
-        self.dim_goal = dim_goal
-        self.dim_discount = dim_discount
-        self.num_q_heads = num_q_heads
-        self.detach_critic_embed = detach_critic_embed
-        self.discount_transform = discount_transform
-
-        dim_in = dim_embed + dim_state + dim_action + dim_goal + dim_discount
-
-        if not exists(q_nets):
-            q_nets = ModuleList([
-                ResidualNormedMLP(
-                    dim_in = dim_in,
-                    dim = dim_hidden,
-                    depth = depth,
-                    dim_out = 1,
-                    residual_every = 2,
-                    activation = nn.SiLU(),
-                    final_norm = True
-                )
-                for _ in range(num_q_heads)
-            ])
-            for net in q_nets:
-                last_linear = getattr(net, 'proj_out', None) or [m for m in net.modules() if isinstance(m, nn.Linear)][-1]
-                nn.init.uniform_(last_linear.weight, -1e-3, 1e-3)
-                if exists(last_linear.bias):
-                    nn.init.zeros_(last_linear.bias)
-
-        self.q_nets = q_nets
-
-        ema_full_kwargs = dict(
-            update_after_step = -1,
-            update_every = 1,
-            min_value = ema_decay,
-            **ema_kwargs
-        )
-
-        self.ema_q_nets = EMA(
-            self.q_nets,
-            beta = ema_decay,
-            include_online_model = False,
-            **ema_full_kwargs
-        )
-        self.ema_decay = ema_decay
-        self.ema_kwargs = ema_full_kwargs
-
-    def __deepcopy__(self, memo):
-        cls = self.__class__
-        result = cls.__new__(cls)
-        memo[id(self)] = result
-        Module.__init__(result)
-        result.dim_embed = self.dim_embed
-        result.dim_state = self.dim_state
-        result.dim_action = self.dim_action
-        result.dim_goal = self.dim_goal
-        result.dim_discount = self.dim_discount
-        result.num_q_heads = self.num_q_heads
-        result.detach_critic_embed = self.detach_critic_embed
-        result.discount_transform = self.discount_transform
-        result.ema_decay = self.ema_decay
-        result.ema_kwargs = self.ema_kwargs
-        result.q_nets = deepcopy(self.q_nets, memo)
-        result.ema_q_nets = EMA(
-            result.q_nets,
-            beta = self.ema_decay,
-            include_online_model = False,
-            **self.ema_kwargs
-        )
-        result.ema_q_nets.load_state_dict(deepcopy(self.ema_q_nets.state_dict(), memo))
-        return result
-
-    def update_ema(self):
-        self.ema_q_nets.update()
-
-    def format_discount(
-        self,
-        discount: float | Tensor | None,
-        batch_shape: tuple[int, ...],
-        device: torch.device,
-        dtype: torch.dtype
-    ) -> Tensor:
-        if not exists(discount):
-            discount = 0.99
-
-        if not is_tensor(discount):
-            discount_tensor = torch.full((*batch_shape, 1), float(discount), device = device, dtype = dtype)
-            return self.discount_transform(discount_tensor)
-
-        discount_tensor = discount.to(device = device, dtype = dtype)
-
-        if discount_tensor.ndim == 0:
-            discount_tensor = repeat(discount_tensor, ' -> ... 1', **dict(zip([f'd{i}' for i in range(len(batch_shape))], batch_shape)))
-            discount_tensor = discount_tensor.reshape(*batch_shape, 1)
-            return self.discount_transform(discount_tensor)
-
-        # if already transformed to dim_discount
-        if discount_tensor.shape[-1] == self.dim_discount and self.dim_discount != 1:
-            if discount_tensor.shape[:-1] != batch_shape:
-                discount_tensor = discount_tensor.expand(*batch_shape, self.dim_discount)
-            return discount_tensor
-
-        if discount_tensor.ndim == len(batch_shape):
-            discount_tensor = rearrange(discount_tensor, '... -> ... 1')
-
-        if discount_tensor.shape[:-1] != batch_shape:
-            discount_tensor = discount_tensor.expand(*batch_shape, discount_tensor.shape[-1])
-
-        return self.discount_transform(discount_tensor)
-
-    def forward(
-        self,
-        critic_embed: Tensor,
-        state: Tensor,
-        action: Tensor,
-        discount: float | Tensor | None = 0.99,
-        goal: Tensor | None = None,
-        *,
-        detach_embed: bool | None = None,
-        ema: bool = False,
-        return_all: bool = False,
-        aggregation: str = 'min'
-    ) -> Tensor:
-        should_detach = default(detach_embed, self.detach_critic_embed)
-
-        if should_detach:
-            critic_embed = critic_embed.detach()
-
-        batch_shape = state.shape[:-1]
-
-        features = [critic_embed, state, action]
-
-        if self.dim_goal > 0:
-            assert exists(goal), 'goal must be provided when dim_goal > 0'
-            features.append(goal)
-
-        if self.dim_discount > 0:
-            discount_cond = self.format_discount(discount, batch_shape, state.device, state.dtype)
-            features.append(discount_cond)
-
-        q_input = cat(features, dim = -1)
-
-        nets = self.ema_q_nets.ema_model if ema else self.q_nets
-
-        preds = stack([rearrange(net(q_input), '... 1 -> ...') for net in nets], dim = 0)
-
-        if return_all:
-            return preds
-
-        if aggregation == 'min':
-            return preds.amin(dim = 0)
-        elif aggregation == 'mean':
-            return preds.mean(dim = 0)
-        else:
-            raise ValueError(f'unknown aggregation {aggregation}')
-
-    def td_loss(
-        self,
-        critic_embed: Tensor,
-        state: Tensor,
-        action: Tensor,
-        rewards: Tensor,
-        next_critic_embed: Tensor,
-        next_state: Tensor,
-        next_action: Tensor,
-        dones: Tensor | None = None,
-        *,
-        discount: float | Tensor = 0.99,
-        goal: Tensor | None = None,
-        next_action_log_prob: Tensor | None = None,
-        alpha: float | Tensor = 0.
-    ) -> Tensor:
-        batch_shape = state.shape[:-1]
-        device, dtype = state.device, state.dtype
-
-        if not is_tensor(discount):
-            raw_discount = torch.full(batch_shape, float(discount), device = device, dtype = dtype)
-        else:
-            raw_discount = discount.to(device = device, dtype = dtype)
-            if raw_discount.ndim == len(batch_shape) + 1 and raw_discount.shape[-1] == 1:
-                raw_discount = rearrange(raw_discount, '... 1 -> ...')
-            if raw_discount.shape != batch_shape:
-                raw_discount = raw_discount.expand(batch_shape)
-
-        with torch.no_grad():
-            next_q = self.forward(
-                next_critic_embed,
-                next_state,
-                next_action,
-                discount = raw_discount,
-                goal = goal,
-                detach_embed = True,
-                ema = True,
-                return_all = False,
-                aggregation = 'min'
-            )
-
-            if exists(next_action_log_prob):
-                next_q = next_q - alpha * next_action_log_prob
-
-            not_done = (1. - dones.float()) if exists(dones) else 1.
-            target_q = rewards + raw_discount * not_done * next_q
-
-        pred_qs = self.forward(
-            critic_embed,
-            state,
-            action,
-            discount = raw_discount,
-            goal = goal,
-            detach_embed = True,
-            ema = False,
-            return_all = True
-        )
-
-        target_qs = repeat(target_q, '... -> h ...', h = self.num_q_heads)
-        return F.mse_loss(pred_qs, target_qs)
-
-QHead = DiscountConditionedQHead
-SACQHead = DiscountConditionedQHead
-
 # training the actor
 
 class ActorTrainer(Module):
@@ -1513,12 +1221,7 @@ class ActorTrainer(Module):
         num_discrete_actions: int | None = None,
         normalize_q_values = True,
         target_goal_prob = 0.5,
-        action_adapter = None,
-        q_head: Module | None = None,
-        q_head_loss_weight: float = 1.,
-        normalize_q_head_values: bool = True,
-        crl_loss_weight: float = 1.,
-        alternate_crl_and_q: bool = False
+        action_adapter = None
     ):
         super().__init__()
 
@@ -1535,13 +1238,6 @@ class ActorTrainer(Module):
         self.discount = discount
         self.discount_condition = default(condition_on_discount, discount_condition)
         self.discount_transform = discount_transform
-
-        self.q_head = q_head
-        self.q_head_loss_weight = q_head_loss_weight
-        self.normalize_q_head_values = normalize_q_head_values
-        self.crl_loss_weight = crl_loss_weight
-        self.alternate_crl_and_q = alternate_crl_and_q
-        self._actor_step_idx = 0
 
         self.state_to_goal_fn = state_to_goal_fn
         self.state_to_actor_state_fn = state_to_actor_state_fn
@@ -1624,12 +1320,6 @@ class ActorTrainer(Module):
         goal_encoder.eval()
         encoder.eval()
 
-        q_head = None
-        if exists(self.q_head):
-            q_head = deepcopy(self.q_head).to(device)
-            q_head.requires_grad_(False)
-            q_head.eval()
-
         if exists(target_goals):
             if not is_tensor(target_goals):
                 target_goals = tensor(target_goals, device = device, dtype = torch.float32)
@@ -1687,22 +1377,22 @@ class ActorTrainer(Module):
 
             # maybe discount conditioning
 
-            raw_discount = default(
-                discount,
-                sample_discount(self.discount, batch, device = device)
-            )
-            if not is_tensor(raw_discount):
-                raw_discount = torch.full((batch, 1), float(raw_discount), device = device)
-            elif raw_discount.ndim == 1:
-                raw_discount = rearrange(raw_discount, 'b -> b 1')
-
-            discount_batch, *_ = raw_discount.shape
-
-            if discount_batch != batch:
-                raw_discount = repeat(raw_discount, '1 ... -> b ...', b = batch)
-
             batch_discount = None
             if self.discount_condition:
+                raw_discount = default(
+                    discount,
+                    sample_discount(self.discount, batch, device = device)
+                )
+                if not is_tensor(raw_discount):
+                    raw_discount = torch.full((batch, 1), float(raw_discount), device = device)
+                elif raw_discount.ndim == 1:
+                    raw_discount = rearrange(raw_discount, 'b -> b 1')
+
+                discount_batch, *_ = raw_discount.shape
+
+                if discount_batch != batch:
+                    raw_discount = repeat(raw_discount, '1 ... -> b ...', b = batch)
+
                 batch_discount = self.discount_transform(raw_discount)
 
             # forward state and goal
@@ -1715,10 +1405,6 @@ class ActorTrainer(Module):
                 actor_input.append(batch_discount)
 
             action_logits = self.actor(cat(actor_input, dim = -1))
-
-            use_q_turn = exists(q_head) and self.alternate_crl_and_q and (self._actor_step_idx % 2 == 1)
-            use_crl_turn = not (exists(q_head) and self.alternate_crl_and_q) or not use_q_turn
-            self._actor_step_idx += 1
 
             if exists(self.num_discrete_actions):
                 num_actions = self.num_discrete_actions
@@ -1741,44 +1427,21 @@ class ActorTrainer(Module):
                     encoded_state_actions = encoder(rearrange(state_actions, 'b a d -> (b a) d'))
                     encoded_state_actions = rearrange(encoded_state_actions, '(b a) d -> b a d', a = num_actions)
 
-                    total_q_values = torch.zeros((batch, num_actions), device = device, dtype = critic_state.dtype)
+                    encoded_goal = goal_encoder(actor_goal)
+                    repeated_goals = repeat(encoded_goal, 'b d -> b a d', a = num_actions)
 
-                    if use_crl_turn:
-                        encoded_goal = goal_encoder(actor_goal)
-                        repeated_goals = repeat(encoded_goal, 'b d -> b a d', a = num_actions)
+                    q_values = self.contrastive_learn(
+                        encoded_state_actions,
+                        repeated_goals,
+                        return_contrastive_score = True
+                    )
 
-                        q_values = self.contrastive_learn(
-                            encoded_state_actions,
-                            repeated_goals,
-                            return_contrastive_score = True
-                        )
-
-                        if self.normalize_q_values:
-                            q_values = z_score(q_values, dim = -1)
-
-                        total_q_values = total_q_values + self.crl_loss_weight * q_values
-
-                    if exists(q_head) and (not self.alternate_crl_and_q or use_q_turn):
-                        repeated_raw_discount = repeat(raw_discount, 'b d -> b a d', a = num_actions)
-                        repeated_actor_goal = repeat(actor_goal, 'b d -> b a d', a = num_actions) if getattr(q_head, 'dim_goal', 0) > 0 else None
-
-                        extra_q = q_head(
-                            encoded_state_actions,
-                            repeated_states,
-                            all_actions,
-                            discount = repeated_raw_discount,
-                            goal = repeated_actor_goal,
-                            detach_embed = True
-                        )
-
-                        if self.normalize_q_head_values:
-                            extra_q = z_score(extra_q, dim = -1)
-
-                        total_q_values = total_q_values + self.q_head_loss_weight * extra_q
+                    if self.normalize_q_values:
+                        q_values = z_score(q_values, dim = -1)
 
                 # closed-form policy expectation
 
-                expected_q = einsum(action_probs, total_q_values, 'b a, b a -> b')
+                expected_q = einsum(action_probs, q_values, 'b a, b a -> b')
                 loss = -expected_q.mean()
 
                 if self.has_action_entropy_loss:
@@ -1804,36 +1467,18 @@ class ActorTrainer(Module):
                 if exists(batch_discount):
                     critic_input.append(batch_discount)
 
-                loss = torch.zeros((), device = device, dtype = critic_state.dtype)
+                encoded_state_action = encoder(cat(critic_input, dim = -1))
 
-                if use_crl_turn:
-                    encoded_state_action = encoder(cat(critic_input, dim = -1))
+                with torch.no_grad():
+                    encoded_goal = goal_encoder(actor_goal)
 
-                    with torch.no_grad():
-                        encoded_goal = goal_encoder(actor_goal)
+                sim = self.contrastive_learn(
+                    encoded_state_action,
+                    encoded_goal,
+                    return_contrastive_score = True
+                )
 
-                    sim = self.contrastive_learn(
-                        encoded_state_action,
-                        encoded_goal,
-                        return_contrastive_score = True
-                    )
-
-                    loss = loss - self.crl_loss_weight * sim.mean()
-                else:
-                    with torch.no_grad():
-                        encoded_state_action = encoder(cat(critic_input, dim = -1))
-
-                if exists(q_head) and (not self.alternate_crl_and_q or use_q_turn):
-                    q_goal = actor_goal if getattr(q_head, 'dim_goal', 0) > 0 else None
-                    q_val = q_head(
-                        encoded_state_action.detach(),
-                        critic_state,
-                        action,
-                        discount = raw_discount,
-                        goal = q_goal,
-                        detach_embed = True
-                    )
-                    loss = loss - self.q_head_loss_weight * q_val.mean()
+                loss = -sim.mean()
 
                 if self.has_action_entropy_loss and exists(entropy_fn):
                     entropy = entropy_fn(action_logits)
@@ -1852,302 +1497,6 @@ class ActorTrainer(Module):
             self.optimizer.zero_grad()
 
         return loss.item()
-
-# training the discount-conditioned SAC Q-head on trajectories
-
-class QHeadTrainer(Module):
-    def __init__(
-        self,
-        q_head: DiscountConditionedQHead,
-        encoder: Module,
-        goal_encoder: Module | None = None,
-        actor: Module | None = None,
-        batch_size = 64,
-        learning_rate = 3e-4,
-        weight_decay = 0.,
-        max_grad_norm = 0.5,
-        discount: float | tuple[float, ...] | list[float] = (0.7, 0.995),
-        discount_condition_critic: bool = False,
-        discount_transform: Callable = default_discount_transform,
-        reward_source: str = 'both', # 'env' | 'crl' | 'both'
-        env_reward_weight: float = 1.,
-        crl_reward_weight: float = 1.,
-        alpha: float = 0.,
-        num_discrete_actions: int | None = None,
-        softmax_actor_output: bool = False,
-        action_adapter = None,
-        contrastive_learn: Module | None = None,
-        state_to_goal_fn: Callable = identity,
-        state_to_actor_state_fn: Callable = identity,
-        state_to_critic_state_fn: Callable = identity,
-        target_goal_prob: float = 0.5,
-        adam_kwargs: dict = dict(),
-        accelerate_kwargs: dict = dict(),
-        cpu: bool = False
-    ):
-        super().__init__()
-        assert reward_source in ('env', 'crl', 'both')
-
-        self.q_head = q_head
-        self.encoder = encoder
-        self.goal_encoder = goal_encoder
-        self.actor = actor
-
-        self.batch_size = batch_size
-        self.max_grad_norm = max_grad_norm
-        self.discount = discount
-        self.discount_condition_critic = discount_condition_critic
-        self.discount_transform = discount_transform
-
-        self.reward_source = reward_source
-        self.env_reward_weight = env_reward_weight
-        self.crl_reward_weight = crl_reward_weight
-        self.alpha = alpha
-
-        self.num_discrete_actions = num_discrete_actions
-        self.softmax_actor_output = softmax_actor_output
-        self.action_adapter = action_adapter
-        self.contrastive_learn = default(contrastive_learn, ContrastiveLearning())
-
-        self.state_to_goal_fn = state_to_goal_fn
-        self.state_to_actor_state_fn = state_to_actor_state_fn
-        self.state_to_critic_state_fn = state_to_critic_state_fn
-        self.target_goal_prob = target_goal_prob
-
-        self.accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
-
-        optimizer = AdamW(q_head.parameters(), lr = learning_rate, weight_decay = weight_decay, **adam_kwargs)
-
-        self.q_head, self.optimizer = self.accelerator.prepare(q_head, optimizer)
-
-    @property
-    def device(self):
-        return self.accelerator.device
-
-    def _encode_sa(self, encoder: Module, critic_state: Tensor, action: Tensor, raw_discount: Tensor) -> Tensor:
-        inputs = [critic_state, action]
-        if self.discount_condition_critic:
-            inputs.append(self.discount_transform(raw_discount))
-        return encoder(cat(inputs, dim = -1))
-
-    def _sample_next_action(self, actor: Module | None, next_state: Tensor, goal: Tensor | None, raw_discount: Tensor, actions_fallback: Tensor):
-        if not exists(actor):
-            return actions_fallback, None
-
-        actor_state = self.state_to_actor_state_fn(next_state)
-        actor_inputs = [actor_state]
-
-        if exists(goal):
-            actor_inputs.append(self.state_to_goal_fn(goal))
-
-        if self.discount_condition_critic:
-            actor_inputs.append(self.discount_transform(raw_discount))
-
-        logits = actor(cat(actor_inputs, dim = -1))
-
-        if exists(self.num_discrete_actions):
-            probs = logits.softmax(dim = -1)
-            dist = torch.distributions.Categorical(probs = probs)
-            sampled_idx = dist.sample()
-            log_prob = dist.log_prob(sampled_idx)
-            one_hot_act = F.one_hot(sampled_idx, num_classes = self.num_discrete_actions).float()
-            return one_hot_act, log_prob
-
-        if exists(self.action_adapter):
-            return self.action_adapter.to_critic(logits), None
-
-        if self.softmax_actor_output:
-            return logits.softmax(dim = -1), None
-
-        return logits, None
-
-    def forward(
-        self,
-        trajectories: Tensor | ndarray,
-        actions: Tensor | ndarray,
-        num_train_steps: int,
-        *,
-        rewards: Tensor | ndarray | None = None,
-        dones: Tensor | ndarray | None = None,
-        goals: Tensor | ndarray | None = None,
-        target_goals: Tensor | ndarray | None = None,
-        discount: float | Tensor | None = None,
-        pbar = None
-    ) -> float:
-        if num_train_steps <= 0:
-            return 0.
-
-        device = self.device
-
-        if not is_tensor(trajectories):
-            trajectories = from_numpy(trajectories)
-        if not is_tensor(actions):
-            actions = from_numpy(actions)
-
-        trajectories = trajectories.float()
-        actions = actions.float()
-
-        # extract transitions (s_t, a_t, s_{t+1}) from trajectories (..., T, D)
-        states = rearrange(trajectories[..., :-1, :], '... t d -> (... t) d')
-        next_states = rearrange(trajectories[..., 1:, :], '... t d -> (... t) d')
-
-        if actions.shape[-2] == trajectories.shape[-2]:
-            cur_actions = rearrange(actions[..., :-1, :], '... t d -> (... t) d')
-            next_actions_fallback = rearrange(actions[..., 1:, :], '... t d -> (... t) d')
-        else:
-            cur_actions = rearrange(actions, '... t d -> (... t) d')
-            next_actions_fallback = cur_actions
-
-        num_transitions = states.shape[0]
-
-        if exists(rewards):
-            if not is_tensor(rewards):
-                rewards = from_numpy(rewards)
-            rewards = rewards.float()
-            if rewards.ndim >= 2 and rewards.shape[-1] == trajectories.shape[-2]:
-                rewards = rewards[..., :-1]
-            flat_rewards = rearrange(rewards, '... -> (...)')
-        else:
-            flat_rewards = torch.zeros(num_transitions, dtype = torch.float32)
-
-        if exists(dones):
-            if not is_tensor(dones):
-                dones = from_numpy(dones)
-            dones = dones.float()
-            if dones.ndim >= 2 and dones.shape[-1] == trajectories.shape[-2]:
-                dones = dones[..., :-1]
-            flat_dones = rearrange(dones, '... -> (...)')
-        else:
-            flat_dones = torch.zeros(num_transitions, dtype = torch.float32)
-
-        if exists(goals):
-            if not is_tensor(goals):
-                goals = from_numpy(goals)
-            goals = goals.float()
-            if goals.ndim == trajectories.ndim and goals.shape[-2] == trajectories.shape[-2]:
-                goals = goals[..., :-1, :]
-            flat_goals = rearrange(goals, '... d -> (...) d')
-        else:
-            # sample future or random states as goals
-            perm = torch.randperm(num_transitions)
-            flat_goals = next_states[perm]
-
-        if exists(target_goals):
-            if not is_tensor(target_goals):
-                target_goals = tensor(target_goals, device = device, dtype = torch.float32)
-            else:
-                target_goals = target_goals.to(device = device, dtype = torch.float32)
-            if target_goals.ndim == 1:
-                target_goals = rearrange(target_goals, 'd -> 1 d')
-            num_target_goals = target_goals.shape[0]
-
-        dataset = TensorDataset(states, cur_actions, next_states, next_actions_fallback, flat_rewards, flat_dones, flat_goals)
-        dataloader = DataLoader(dataset, batch_size = self.batch_size, shuffle = True)
-        dataloader = self.accelerator.prepare(dataloader)
-        iter_dataloader = cycle(dataloader)
-
-        encoder = deepcopy(self.encoder).to(device).eval()
-        encoder.requires_grad_(False)
-
-        goal_encoder = None
-        if exists(self.goal_encoder):
-            goal_encoder = deepcopy(self.goal_encoder).to(device).eval()
-            goal_encoder.requires_grad_(False)
-
-        actor = None
-        if exists(self.actor):
-            actor = deepcopy(self.actor).to(device).eval()
-            actor.requires_grad_(False)
-
-        self.q_head.train()
-
-        if pbar is False:
-            pbar_instance = range(num_train_steps)
-        else:
-            pbar = default(pbar, tqdm)
-            pbar_instance = pbar(range(num_train_steps), disable = not self.accelerator.is_main_process)
-
-        loss_item = 0.
-
-        for _ in pbar_instance:
-            b_state, b_action, b_next_state, b_next_action_fb, b_rew, b_done, b_goal = next(iter_dataloader)
-            batch = b_state.shape[0]
-
-            if exists(target_goals):
-                rand_idx = torch.randint(0, num_target_goals, (batch,), device = device)
-                mix_mask = rearrange(torch.rand(batch, device = device) < self.target_goal_prob, 'b -> b 1')
-                b_goal = torch.where(mix_mask, target_goals[rand_idx], b_goal)
-
-            raw_discount = default(
-                discount,
-                sample_discount(self.discount, batch, device = device)
-            )
-            if not is_tensor(raw_discount):
-                raw_discount = torch.full((batch, 1), float(raw_discount), device = device)
-            elif raw_discount.ndim == 1:
-                raw_discount = rearrange(raw_discount, 'b -> b 1')
-
-            if raw_discount.shape[0] != batch:
-                raw_discount = repeat(raw_discount, '1 ... -> b ...', b = batch)
-
-            critic_state = self.state_to_critic_state_fn(b_state)
-            next_critic_state = self.state_to_critic_state_fn(b_next_state)
-            goal_feat = self.state_to_goal_fn(b_goal)
-
-            with torch.no_grad():
-                critic_embed = self._encode_sa(encoder, critic_state, b_action, raw_discount)
-                next_action, next_log_prob = self._sample_next_action(actor, b_next_state, b_goal, raw_discount, b_next_action_fb)
-                next_critic_embed = self._encode_sa(encoder, next_critic_state, next_action, raw_discount)
-
-                # compute reward based on reward_source
-                total_reward = torch.zeros(batch, device = device, dtype = critic_state.dtype)
-
-                if self.reward_source in ('env', 'both'):
-                    total_reward = total_reward + self.env_reward_weight * b_rew
-
-                if self.reward_source in ('crl', 'both') and exists(goal_encoder):
-                    goal_embed = goal_encoder(goal_feat)
-                    crl_score = self.contrastive_learn(
-                        critic_embed,
-                        goal_embed,
-                        return_contrastive_score = True
-                    )
-                    # normalize CRL potential/similarity score into a bounded dense reward
-                    crl_rew = torch.tanh(crl_score / math.sqrt(max(critic_embed.shape[-1], 1)))
-                    total_reward = total_reward + self.crl_reward_weight * crl_rew
-
-            q_goal = goal_feat if getattr(self.q_head, 'dim_goal', 0) > 0 else None
-
-            loss = self.q_head.td_loss(
-                critic_embed = critic_embed,
-                state = critic_state,
-                action = b_action,
-                rewards = total_reward,
-                next_critic_embed = next_critic_embed,
-                next_state = next_critic_state,
-                next_action = next_action,
-                dones = b_done,
-                discount = raw_discount,
-                goal = q_goal,
-                next_action_log_prob = next_log_prob,
-                alpha = self.alpha
-            )
-
-            self.accelerator.backward(loss)
-
-            if exists(self.max_grad_norm):
-                self.accelerator.clip_grad_norm_(self.q_head.parameters(), self.max_grad_norm)
-
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
-            self.q_head.update_ema()
-
-            loss_item = loss.item()
-            if hasattr(pbar_instance, 'set_description'):
-                pbar_instance.set_description(f'q_head loss: {loss_item:.4f}')
-
-        return loss_item
 
 # contrastive world model
 #

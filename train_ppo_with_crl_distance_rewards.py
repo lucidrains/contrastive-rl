@@ -1,18 +1,21 @@
 # /// script
 # dependencies = [
 #   "contrastive-rl-pytorch",
-#   "env-ssl-wrapper>=0.6.5",
+#   "einops",
+#   "env-ssl-wrapper>=0.6.8",
 #   "fire",
 #   "gymnasium[box2d]",
 #   "gymnasium[mujoco]",
+#   "hl-gauss-pytorch>=0.2.2",
 #   "imageio",
 #   "imageio-ffmpeg",
 #   "mean-conc-beta>=0.2.1",
 #   "memmap-replay-buffer>=0.0.17",
-#   "x-mlps-pytorch>=0.6.1",
-#   "x-ppo>=0.1.0",
 #   "numpy",
 #   "torch",
+#   "torch-einops-utils>=0.2.0",
+#   "x-mlps-pytorch>=0.6.1",
+#   "x-ppo>=0.1.0",
 # ]
 #
 # [tool.uv.sources]
@@ -31,7 +34,7 @@ from typing import Callable
 
 import numpy as np
 import torch
-from torch import Tensor, arange, cat, is_tensor, nn
+from torch import Tensor, arange, cat, is_tensor, nn, stack
 from torch.nn import Module
 from torch.distributions import Categorical, Distribution
 from torch.optim import AdamW
@@ -40,14 +43,17 @@ import torch.nn.functional as F
 import gymnasium as gym
 from gymnasium import spaces
 
-from einops import rearrange, repeat
+from einops import einsum, rearrange, reduce, repeat
+from torch_einops_utils import maybe
 from torch_einops_utils.shape import divisible_by, shape
 
 from fire import Fire
+from hl_gauss_pytorch import HLGaussLoss
 
 from env_ssl_wrapper import evaluate_actor, record_actor_video
 from x_mlps_pytorch import MLP
-from x_ppo import calc_gae, combine_grouped_advantages, ppo_actor_loss
+from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
+from x_ppo import calc_gae, combine_grouped_advantages, hpo_actor_loss, ppo_actor_loss
 from mean_conc_beta import Beta
 
 from contrastive_rl_pytorch import (
@@ -66,6 +72,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def l2norm(t):
+    return F.normalize(t, dim = -1)
 
 def mlp(dim_in, dim, dim_out, depth = 2):
     return MLP(dim_in, *((dim,) * depth), dim_out, activation = nn.SiLU())
@@ -681,6 +690,69 @@ class CategoricalActor(Module):
         state, goal = broadcast_goal(state, goal)
         return Categorical(logits = self.net(cat((state, goal), dim = -1)))
 
+class ResidualBetaActor(Module):
+    def __init__(
+        self,
+        dim_state,
+        dim_goal,
+        dim_action,
+        hidden_dim = 256,
+        depth = 12,
+        residual_every = 2,
+        beta: Beta | None = None,
+        **beta_kwargs
+    ):
+        super().__init__()
+
+        self.net = ResidualNormedMLP(
+            dim_in = dim_state + dim_goal,
+            dim = hidden_dim,
+            depth = depth,
+            dim_out = dim_action * 2,
+            residual_every = residual_every,
+            activation = nn.SiLU(),
+            final_norm = True
+        )
+        self.beta = beta if exists(beta) else Beta(**beta_kwargs)
+
+    def log_prob(self, distr: Distribution, action: Tensor):
+        return reduce(distr.log_prob(action), '... a -> ...', 'sum')
+
+    def entropy(self, distr: Distribution):
+        return reduce(distr.entropy(), '... a -> ...', 'sum')
+
+    def forward(self, state, goal = None):
+        if exists(goal):
+            state, goal = broadcast_goal(state, goal)
+            state = cat((state, goal), dim = -1)
+
+        params = rearrange(self.net(state), '... (a d) -> ... a d', d = 2)
+        return self.beta(params)
+
+class ResidualEncoder(Module):
+    def __init__(
+        self,
+        dim_in,
+        dim_hidden = 256,
+        depth = 16,
+        dim_out = 64,
+        residual_every = 4
+    ):
+        super().__init__()
+
+        self.net = ResidualNormedMLP(
+            dim_in = dim_in,
+            dim = dim_hidden,
+            depth = depth,
+            dim_out = dim_out,
+            residual_every = residual_every,
+            activation = nn.SiLU(),
+            final_norm = True
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
 # ppo with distance rewards
 
 class DistanceRewardPPO(Module):
@@ -704,18 +776,23 @@ class DistanceRewardPPO(Module):
         entropy_coef = 1e-3,
         ppo_epochs = 4,
         minibatch_size = 256,
+        use_hpo = False,
         critic_steps = 8,
         critic_batch_size = 256,
         critic_discount = 0.9,
         critic_negative_buffer_size = 8192,
+        self_goal_cos_weight = 0.,
         distance_type = 'chord',
         reward_distance_scale = 2.,
         reward_scale = 1.,
         value: Module | None = None,
         env_value: Module | None = None,
+        value_num_bins: int | None = None,
+        env_value_max_return = 1.,
         add_env_rewards = False,
         separate_env_rewards = False,
         env_reward_weight = 0.5,
+        mask_done_advantages = True,
         value_lr: float | None = None,
         value_epochs = 4,
         value_minibatch_size: int | None = None,
@@ -742,6 +819,7 @@ class DistanceRewardPPO(Module):
         self.add_env_rewards = add_env_rewards
         self.separate_env_rewards = separate_env_rewards
         self.env_reward_weight = env_reward_weight
+        self.mask_done_advantages = mask_done_advantages
 
         self.discount = discount
         self.lam = lam
@@ -750,10 +828,14 @@ class DistanceRewardPPO(Module):
         self.entropy_coef = entropy_coef
         self.ppo_epochs = ppo_epochs
         self.minibatch_size = minibatch_size
+        self.use_hpo = use_hpo
         self.critic_steps = critic_steps
         self.critic_batch_size = critic_batch_size
         self.critic_discount = critic_discount
         self.critic_negative_buffer_size = critic_negative_buffer_size
+        self.self_goal_cos_weight = float(self_goal_cos_weight)
+        self.last_self_cos_err = 0.
+        self.last_self_top1_err = 0.
         self.distance_type = distance_type
         self.reward_distance_scale = reward_distance_scale
         self.reward_scale = reward_scale
@@ -778,6 +860,24 @@ class DistanceRewardPPO(Module):
         self.negative_buffer = deque(maxlen = critic_negative_buffer_size)
 
         self.device = torch.device(device) if exists(device) else torch.device('cpu')
+
+        self.crl_value_hl_gauss = None
+        self.env_value_hl_gauss = None
+
+        if exists(value_num_bins):
+            self.crl_value_hl_gauss = HLGaussLoss(
+                min_value = 0.,
+                max_value = float(self.reward_scale),
+                num_bins = int(value_num_bins),
+                clamp_to_range = True
+            )
+            self.env_value_hl_gauss = HLGaussLoss(
+                min_value = 0.,
+                max_value = float(env_value_max_return),
+                num_bins = int(value_num_bins),
+                clamp_to_range = True
+            )
+
         self.to(self.device)
 
     # tensor helpers
@@ -849,7 +949,7 @@ class DistanceRewardPPO(Module):
         next_done = torch.where(dones, step_indices, torch.full_like(step_indices, num_steps - 1))
         return torch.flip(torch.cummin(torch.flip(next_done, dims = (1,)), dim = 1).values, dims = (1,))
 
-    def _sample_critic_pairs(self, states, dones, batch_size):
+    def _sample_critic_pairs(self, states, dones, batch_size, next_states = None):
         dims = shape(states, 'n t ...').dims
         num_trajs, num_steps = dims['n'], dims['t']
 
@@ -859,26 +959,31 @@ class DistanceRewardPPO(Module):
             ends = repeat(ends, '1 t -> n t', n = num_trajs)
 
         times = repeat(arange(num_steps, device = self.device), 't -> n t', n = num_trajs)
-        valid = ends > times
-        traj_indices, time_indices = torch.nonzero(valid, as_tuple = True)
+        max_steps_all = (ends - times) + (1 if exists(next_states) else 0)
+        traj_indices, time_indices = torch.nonzero(max_steps_all >= 1, as_tuple = True)
 
         assert traj_indices.numel() > 0, 'no valid past/future pairs - each episode needs at least two steps'
 
         rand_indices = torch.randint(0, traj_indices.numel(), (batch_size,), device = self.device)
+        traj_indices, time_indices = traj_indices[rand_indices], time_indices[rand_indices]
 
-        traj_indices = traj_indices[rand_indices]
-        time_indices = time_indices[rand_indices]
-
-        max_steps = ends[traj_indices, time_indices] - time_indices
+        max_steps = max_steps_all[traj_indices, time_indices]
         discount = rearrange(sample_discount(self.critic_discount, batch_size, device = self.device), 'b 1 -> b')
         delta_times = sample_truncated_geometric(max_steps, discount)
 
-        future_times = time_indices + delta_times
-
         past_states = states[traj_indices, time_indices]
-        future_goals = states[traj_indices, future_times]
+        future_states = (
+            next_states[traj_indices, time_indices + delta_times - 1]
+            if exists(next_states) else
+            states[traj_indices, time_indices + delta_times]
+        )
 
-        return past_states, future_goals
+        return (
+            past_states,
+            future_states,
+            rearrange(delta_times, 'b -> b 1'),
+            rearrange(discount, 'b -> b 1')
+        )
 
     def _sample_negative_goals(self, count):
         if len(self.negative_buffer) == 0:
@@ -889,43 +994,75 @@ class DistanceRewardPPO(Module):
         goals = torch.stack([self.negative_buffer[int(i)] for i in indices])
         return goals.to(self.device)
 
-    def update_critic(self, states, dones = None, steps: int | None = None, batch_size: int | None = None):
+    def update_critic(self, states, dones = None, next_states = None, steps: int | None = None, batch_size: int | None = None):
         steps = default(steps, self.critic_steps)
         batch_size = default(batch_size, self.critic_batch_size)
 
         self.critic_wrapper.train()
 
-        losses = []
+        losses, cos_errs, top1_errs = [], [], []
         for _ in range(steps):
-            past_states, future_goals = self._sample_critic_pairs(states, dones, batch_size)
-            future_goals = self.state_to_goal_fn(future_goals)
+            past_states, future_states, delta_times, raw_discount = self._sample_critic_pairs(states, dones, batch_size, next_states)
+            future_goals = self.state_to_goal_fn(future_states)
+            extra_negatives = maybe(self.state_to_goal_fn)(self._sample_negative_goals(batch_size))
 
-            extra_negatives = self._sample_negative_goals(batch_size)
-            if exists(extra_negatives):
-                extra_negatives = self.state_to_goal_fn(extra_negatives)
+            crl_loss = self.critic_wrapper(
+                past_states,
+                future_goals,
+                delta_times = delta_times,
+                raw_discount = raw_discount,
+                extra_negatives = extra_negatives
+            )
 
-            loss = self.critic_wrapper(past_states, future_goals, extra_negatives = extra_negatives)
+            loss = crl_loss
+
+            if self.self_goal_cos_weight > 0.:
+                z_s = l2norm(self.critic_wrapper.encode(future_states))
+                z_g = l2norm(self.critic_wrapper.encode_future(future_goals))
+                cos_err = (1. - einsum(z_s, z_g, 'b d, b d -> b')).mean()
+
+                with torch.no_grad():
+                    sim = einsum(z_s, z_g, 'i d, j d -> i j')
+                    top1_err = (sim.argmax(dim = -1) != arange(len(z_s), device = self.device)).float().mean().item()
+
+                cos_errs.append(float(cos_err.item()))
+                top1_errs.append(float(top1_err))
+                loss = crl_loss + self.self_goal_cos_weight * cos_err
 
             self.critic_opt.zero_grad()
             loss.backward()
 
             if exists(self.max_grad_norm):
-                torch.nn.utils.clip_grad_norm_(self.critic_wrapper.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic_wrapper.parameters(), self.max_grad_norm)
 
             self.critic_opt.step()
-            losses.append(loss.item())
+            losses.append(crl_loss.item())
+
+        if cos_errs:
+            self.last_self_cos_err = sum(cos_errs) / len(cos_errs)
+            self.last_self_top1_err = sum(top1_errs) / len(top1_errs)
 
         # keep a short FIFO of states for harder / more diverse negatives
 
         flat_states = rearrange(states.detach(), 'n t d -> (n t) d').cpu()
-        for state in flat_states:
-            self.negative_buffer.append(state)
+
+        if exists(next_states):
+            for state in flat_states[::2]:
+                self.negative_buffer.append(state)
+            for state in rearrange(next_states.detach(), 'n t d -> (n t) d').cpu()[::4]:
+                self.negative_buffer.append(state)
+        else:
+            for state in flat_states:
+                self.negative_buffer.append(state)
 
         return sum(losses) / len(losses) if losses else 0.
 
     # ppo
 
-    def _ppo_update(self, states, goals, actions, old_log_probs, advantages):
+    def _ppo_update(self, states, goals, actions, old_log_probs, advantages, epochs = None):
+        epochs = default(epochs, self.ppo_epochs)
+        actor_loss_fn = hpo_actor_loss if self.use_hpo else ppo_actor_loss
+
         flat_states = rearrange(states, 'n t d -> (n t) d')
         flat_goals = rearrange(goals, 'n t g -> (n t) g')
         flat_actions = rearrange(actions, 'n t ... -> (n t) ...')
@@ -935,14 +1072,10 @@ class DistanceRewardPPO(Module):
         batch_size = shape(flat_states, 'b ...').dims['b']
         minibatch_size = min(self.minibatch_size, batch_size)
 
-        policy_losses = []
-        entropies = []
-        approx_kls = []
-        clip_fracs = []
-
+        policy_losses, entropies, approx_kls, clip_fracs = [], [], [], []
         self.actor.train()
 
-        for _ in range(self.ppo_epochs):
+        for _ in range(epochs):
             permutation = torch.randperm(batch_size, device = self.device)
 
             for start in range(0, batch_size, minibatch_size):
@@ -951,7 +1084,7 @@ class DistanceRewardPPO(Module):
                 distr = self.actor(flat_states[indices], flat_goals[indices])
                 new_log_probs = self.actor.log_prob(distr, flat_actions[indices])
 
-                policy_loss = ppo_actor_loss(
+                policy_loss = actor_loss_fn(
                     new_log_probs,
                     flat_old_log_probs[indices],
                     flat_advantages[indices],
@@ -968,7 +1101,7 @@ class DistanceRewardPPO(Module):
                 policy_loss.backward()
 
                 if exists(self.max_grad_norm):
-                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
 
                 self.actor_opt.step()
 
@@ -989,7 +1122,7 @@ class DistanceRewardPPO(Module):
             clip_frac = sum(clip_fracs) / len(clip_fracs)
         )
 
-    def _value_update(self, value, opt, flat_states, flat_goals, flat_returns, epochs, minibatch_size):
+    def _value_update(self, value, opt, flat_states, flat_goals, flat_returns, epochs, minibatch_size, hl_gauss = None):
         if not exists(value) or epochs <= 0:
             return 0.
 
@@ -1006,14 +1139,14 @@ class DistanceRewardPPO(Module):
                 indices = permutation[start:(start + minibatch_size)]
 
                 inputs = cat((flat_states[indices], flat_goals[indices]), dim = -1)
-                pred = value(inputs).squeeze(-1)
-                loss = F.mse_loss(pred, flat_returns[indices])
+                logits = value(inputs)
+                loss = hl_gauss(logits, flat_returns[indices]) if exists(hl_gauss) else F.mse_loss(logits.squeeze(-1), flat_returns[indices])
 
                 opt.zero_grad()
                 loss.backward()
 
                 if exists(self.max_grad_norm):
-                    torch.nn.utils.clip_grad_norm_(value.parameters(), self.max_grad_norm)
+                    nn.utils.clip_grad_norm_(value.parameters(), self.max_grad_norm)
 
                 opt.step()
                 losses.append(loss.item())
@@ -1039,6 +1172,8 @@ class DistanceRewardPPO(Module):
         truncated = None,
         success = None
     ):
+        has_explicit_next_states = exists(next_states)
+
         states = self._to_tensor(states, torch.float32)
         actions = self._to_tensor(actions)
         old_log_probs = self._to_tensor(old_log_probs, torch.float32)
@@ -1052,7 +1187,7 @@ class DistanceRewardPPO(Module):
 
         goals = self._broadcast_goals(goals, num_trajs, num_steps)
 
-        if not exists(next_states):
+        if not has_explicit_next_states:
             next_states = cat((states[:, 1:], states[:, -1:]), dim = 1)
         else:
             next_states = self._to_tensor(next_states, torch.float32)
@@ -1066,7 +1201,8 @@ class DistanceRewardPPO(Module):
         # critic update on the fresh on-policy batch
 
         critic_steps = default(critic_steps, self.critic_steps)
-        critic_loss = self.update_critic(states, dones, steps = critic_steps) if critic_steps > 0 else 0.
+        critic_next = next_states if has_explicit_next_states else None
+        critic_loss = self.update_critic(states, dones, next_states = critic_next, steps = critic_steps) if critic_steps > 0 else 0.
 
         # flatten for reward / value / ppo
 
@@ -1093,25 +1229,26 @@ class DistanceRewardPPO(Module):
             crl_step_rewards = rearrange(crl_out.step_rewards, '(n t) -> n t', n = num_trajs)
             distances = rearrange(crl_out.distances, '(n t) -> n t', n = num_trajs)
 
-            def value_predictions(value):
-                flat_values = value(cat((flat_states, flat_goals), dim = -1)).squeeze(-1)
-                flat_next_values = value(cat((flat_next_states, flat_goals), dim = -1)).squeeze(-1)
+            sg_inputs = cat((flat_states, flat_goals), dim = -1)
+            nsg_inputs = cat((flat_next_states, flat_goals), dim = -1)
+
+            def value_predictions(value, hl_gauss = None):
+                decode = hl_gauss if exists(hl_gauss) else (lambda t: t.squeeze(-1))
                 return (
-                    rearrange(flat_values, '(n t) -> n t', n = num_trajs),
-                    rearrange(flat_next_values, '(n t) -> n t', n = num_trajs)
+                    rearrange(decode(value(sg_inputs)), '(n t) -> n t', n = num_trajs),
+                    rearrange(decode(value(nsg_inputs)), '(n t) -> n t', n = num_trajs)
                 )
 
             if exists(self.value):
-                values, next_values = value_predictions(self.value)
+                values, next_values = value_predictions(self.value, self.crl_value_hl_gauss)
             else:
                 values = torch.zeros_like(crl_rewards)
                 next_values = values
 
             if self.separate_env_rewards:
-                env_values, env_next_values = value_predictions(self.env_value)
+                env_values, env_next_values = value_predictions(self.env_value, self.env_value_hl_gauss)
 
-        # normalization mask skips episode boundaries
-        done_mask = (~(terminated | truncated)).float()
+        done_mask = (~(terminated | truncated)).float() if self.mask_done_advantages else None
         env_reward_weight = default(env_reward_weight, self.env_reward_weight)
         env_reward_weight = min(max(float(env_reward_weight), 0.), 1.)
         crl_reward_weight = 1. - env_reward_weight
@@ -1127,13 +1264,13 @@ class DistanceRewardPPO(Module):
                 crl_rewards = crl_rewards + self._to_tensor(aux_rewards, torch.float32)
 
             gae = calc_gae(
-                torch.stack((base_rewards, crl_rewards), dim = -1),
-                torch.stack((env_values, values), dim = -1),
+                stack((base_rewards, crl_rewards), dim = -1),
+                stack((env_values, values), dim = -1),
                 terminated = terminated,
                 truncated = truncated,
                 gamma = self.discount,
                 lam = self.lam,
-                next_values = torch.stack((env_next_values, next_values), dim = -1),
+                next_values = stack((env_next_values, next_values), dim = -1),
                 group_dim = -1,
                 finite_time = self.finite_time_gae,
                 return_advantages = True
@@ -1148,8 +1285,8 @@ class DistanceRewardPPO(Module):
                 reduce = 'sum'
             )
 
-            env_returns, crl_returns = gae.returns[..., 0], gae.returns[..., 1]
-            env_advantages, crl_advantages = gae.advantages[..., 0], gae.advantages[..., 1]
+            env_returns, crl_returns = gae.returns.unbind(dim = -1)
+            env_advantages, crl_advantages = gae.advantages.unbind(dim = -1)
         else:
             rewards = crl_rewards
             if exists(aux_rewards):
@@ -1178,7 +1315,7 @@ class DistanceRewardPPO(Module):
 
         # value regression to the GAE returns
 
-        def update_value(value, opt, returns):
+        def update_value(value, opt, returns, hl_gauss = None):
             return self._value_update(
                 value,
                 opt,
@@ -1186,20 +1323,20 @@ class DistanceRewardPPO(Module):
                 flat_goals,
                 rearrange(returns, 'n t -> (n t)'),
                 self.value_epochs,
-                self.value_minibatch_size
+                self.value_minibatch_size,
+                hl_gauss = hl_gauss
             )
 
-        value_loss = update_value(self.value, self.value_opt, crl_returns)
-        env_value_loss = update_value(self.env_value, self.env_value_opt, env_returns) if self.separate_env_rewards else 0.
-
-        ppo_epochs = default(ppo_epochs, self.ppo_epochs)
+        value_loss = update_value(self.value, self.value_opt, crl_returns, self.crl_value_hl_gauss)
+        env_value_loss = update_value(self.env_value, self.env_value_opt, env_returns, self.env_value_hl_gauss) if self.separate_env_rewards else 0.
 
         ppo_metrics = self._ppo_update(
             states,
             goals,
             actions,
             old_log_probs,
-            advantages
+            advantages,
+            epochs = ppo_epochs
         )
 
         def mean_std(t):
@@ -1217,6 +1354,8 @@ class DistanceRewardPPO(Module):
 
         return dict(
             critic_loss = critic_loss,
+            self_cos_err = float(self.last_self_cos_err),
+            self_top1_err = float(self.last_self_top1_err),
             value_loss = value_loss,
             env_value_loss = env_value_loss,
             distance_mean = distances.mean().item(),

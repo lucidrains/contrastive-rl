@@ -2,10 +2,10 @@
 # dependencies = [
 #   "contrastive-rl-pytorch",
 #   "einops",
-#   "env-ssl-wrapper>=0.6.5",
+#   "env-ssl-wrapper>=0.6.8",
 #   "fire",
 #   "gymnasium",
-#   "hl-gauss-pytorch>=0.1.12",
+#   "hl-gauss-pytorch>=0.2.2",
 #   "imageio",
 #   "imageio-ffmpeg",
 #   "mani-skill==3.0.1",
@@ -14,7 +14,7 @@
 #   "pin",
 #   "sapien==3.0.3",
 #   "torch",
-#   "torch-einops-utils",
+#   "torch-einops-utils>=0.2.0",
 #   "x-mlps-pytorch>=0.6.1",
 #   "x-ppo>=0.1.0",
 # ]
@@ -35,11 +35,14 @@ import math
 import os
 from pathlib import Path
 import shutil
+import sys
 import time
 
 os.environ.setdefault('PYGAME_HIDE_SUPPORT_PROMPT', '1')
-os.environ.setdefault('VK_ICD_FILENAMES', '/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json')
-os.environ.setdefault('DYLD_LIBRARY_PATH', '/opt/homebrew/lib')
+
+if sys.platform == 'darwin' and Path('/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json').exists():
+    os.environ.setdefault('VK_ICD_FILENAMES', '/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json')
+    os.environ.setdefault('DYLD_LIBRARY_PATH', '/opt/homebrew/lib')
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -49,39 +52,25 @@ from mani_skill.utils.structs import Pose
 import numpy as np
 
 import torch
-from torch import Tensor, arange, cat, is_tensor, nn, stack
-from torch.nn import Module
+from torch import Tensor, arange, is_tensor
 import torch.nn.functional as F
 
-from einops import einsum, rearrange, reduce, repeat
+from einops import rearrange
 from fire import Fire
-from hl_gauss_pytorch import HLGaussLoss
-from mean_conc_beta import Beta
-from torch_einops_utils import maybe
-from torch_einops_utils.shape import default, divisible_by, exists, shape
-from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
-from x_ppo import calc_gae, combine_grouped_advantages, hpo_actor_loss
+from torch_einops_utils.shape import default, divisible_by, exists
 
-from contrastive_rl_pytorch import (
-    ContrastiveLearning,
-    ContrastiveWrapper,
-    contrastive_distance_rewards,
-    sample_discount,
-    sample_truncated_geometric
-)
+from contrastive_rl_pytorch import ContrastiveLearning, ContrastiveWrapper
 from train_ppo_with_crl_distance_rewards import (
     DistanceRewardPPO,
+    ResidualBetaActor,
+    ResidualEncoder,
     VecEnv,
     append_jsonl,
-    broadcast_goal,
     save_json
 )
 from env_ssl_wrapper import SGSSampler, SuccessGuidedSamplingWrapper
 
 # helpers
-
-def l2norm(t):
-    return F.normalize(t, dim = -1)
 
 def wrap_angle(theta):
     return np.arctan2(np.sin(theta), np.cos(theta))
@@ -117,8 +106,7 @@ def quat_to_yaw(q):
     return np.arctan2(2. * (w * z + x * y), 1. - 2. * (y * y + z * z))
 
 def canonicalize_quat(q):
-    sign = np.where(q[..., :1] < 0., -1., 1.)
-    return (q * sign).astype(np.float32)
+    return (q * np.where(q[..., :1] < 0., -1., 1.)).astype(np.float32)
 
 def transform_pusht3d(obs):
     raw = np.asarray(obs, dtype = np.float32)
@@ -140,11 +128,7 @@ def extract_goal_pusht3d(obs):
     raw = np.asarray(obs, dtype = np.float32)
     gxy = raw[..., 21:23] / 0.4
     gyaw = raw[..., 31] if raw.shape[-1] >= 32 else np.full_like(gxy[..., 0], GOAL_YAW)
-
-    return np.concatenate([
-        gxy,
-        np.stack([np.sin(gyaw), np.cos(gyaw)], axis = -1)
-    ], axis = -1).astype(np.float32)
+    return np.concatenate([gxy, np.stack([np.sin(gyaw), np.cos(gyaw)], axis = -1)], axis = -1).astype(np.float32)
 
 def config_to_goal_3d(cfg):
     tx, ty, tyaw = map(float, cfg[:3])
@@ -166,7 +150,6 @@ def set_goal_pose_3d(raw_env, gx, gy, gyaw):
         p = torch.tensor([[gx, gy, GOAL_Z]], dtype = torch.float32, device = device),
         q = torch.tensor([[gc, 0., 0., gs]], dtype = torch.float32, device = device)
     ))
-
     raw_env.goal_offset = torch.tensor([gx, gy], dtype = torch.float32, device = device)
     raw_env.goal_z_rot = gyaw
 
@@ -180,19 +163,17 @@ def apply_reset_state_3d(raw_env, state):
     st = np.asarray(state, dtype = np.float32).reshape(-1)
     tx, ty, tyaw, gx, gy, gyaw = map(float, st[:6])
     device = getattr(raw_env, 'device', torch.device('cpu'))
-
     tc, ts = math.cos(tyaw / 2.), math.sin(tyaw / 2.)
+
     raw_env.tee.set_pose(Pose.create_from_pq(
         p = torch.tensor([[tx, ty, TEE_Z]], dtype = torch.float32, device = device),
         q = torch.tensor([[tc, 0., 0., ts]], dtype = torch.float32, device = device)
     ))
-
     set_goal_pose_3d(raw_env, gx, gy, gyaw)
     raw_env.agent.reset(torch.as_tensor(st[6:13], dtype = torch.float32, device = device)[None])
 
 def install_reset_state_3d(raw_env):
     raw_env = getattr(raw_env, 'unwrapped', raw_env)
-
     if getattr(raw_env, '_sgs_reset_state_installed', False):
         return raw_env
 
@@ -210,9 +191,7 @@ def install_reset_state_3d(raw_env):
 
 def set_simulator_goal_from_vec_3d(env, goal_vec, raw_obs = None):
     g = rearrange(np.asarray(goal_vec, dtype = np.float32), '... -> (...)')
-    gx, gy = float(g[0] * 0.4), float(g[1] * 0.4)
-    gyaw = math.atan2(float(g[2]), float(g[3]))
-
+    gx, gy, gyaw = float(g[0] * 0.4), float(g[1] * 0.4), math.atan2(float(g[2]), float(g[3]))
     set_goal_pose_3d(unwrap_pusht3d(env).raw.unwrapped, gx, gy, gyaw)
 
     if not exists(raw_obs):
@@ -225,13 +204,7 @@ def set_simulator_goal_from_vec_3d(env, goal_vec, raw_obs = None):
 # sparse binary pusht-v1 wrapper (reward = 1. iff terminated on >= 90% goal intersection)
 
 class PushT3DEnv(gym.Env):
-    def __init__(
-        self,
-        max_steps = 240,
-        seed = 0,
-        render_mode = None,
-        action_scale = (0.25, 0.25, 0.05)
-    ):
+    def __init__(self, max_steps = 240, seed = 0, render_mode = None, action_scale = (0.25, 0.25, 0.05)):
         super().__init__()
         self.raw = gym.make(
             'PushT-v1',
@@ -245,7 +218,6 @@ class PushT3DEnv(gym.Env):
 
         u = install_reset_state_3d(self.raw.unwrapped)
         u.compute_dense_reward = lambda obs, action, info: torch.zeros(1, device = u.device)
-
         orig_pseudo = u.pseudo_render_intersection
 
         def fast_pseudo_render_intersection():
@@ -263,10 +235,8 @@ class PushT3DEnv(gym.Env):
     def _pack_obs(self, obs):
         if is_tensor(obs):
             obs = obs.detach().cpu().numpy()
-
         flat = np.asarray(obs, dtype = np.float32).reshape(-1)
-        goal_yaw = np.float32(getattr(self.raw.unwrapped, 'goal_z_rot', GOAL_YAW))
-        return np.append(flat[:31], goal_yaw).astype(np.float32)
+        return np.append(flat[:31], np.float32(getattr(self.raw.unwrapped, 'goal_z_rot', GOAL_YAW))).astype(np.float32)
 
     def _overlap_proxy(self, obs32):
         d_pos = float(np.linalg.norm(obs32[24:26] - obs32[21:23]))
@@ -289,11 +259,7 @@ class PushT3DEnv(gym.Env):
         truncated = bool(np.asarray(trunc).reshape(-1)[0])
         cov = 1. if succ else self._overlap_proxy(obs32)
 
-        return obs32, float(terminated), terminated, truncated, dict(
-            coverage = cov,
-            success = terminated,
-            is_success = terminated
-        )
+        return obs32, float(terminated), terminated, truncated, dict(coverage = cov, success = terminated, is_success = terminated)
 
     def render(self):
         frame = self.raw.render()
@@ -357,7 +323,6 @@ FRONTIER_RING_STATES = np.array([
     [ 0.0097, -0.1965, -2.6180, -0.1560, -0.1000, -1.0472, -0.3360,  0.9953, -0.0015, -1.2143,  0.0138, 2.2310,  0.3763],  # 330 deg
 ], dtype = np.float32)
 
-FRONTIER_RING_ANGLES = np.arange(12, dtype = np.float32) * 30.
 OUTER_SAFE_RING_INDICES = (0, 1, 2, 3, 4, 8, 9, 10, 11)
 ANCHOR_FRONTIER_INDICES = (0, 1, 2, 3, 4, 7)
 PHI_DEFAULT_RAY = math.atan2(0.284 - float(GOAL_POS[1]), -0.321 - float(GOAL_POS[0]))
@@ -472,9 +437,7 @@ def ring_config(idx):
         tee = base[:2] + rng.normal(0., 0.004, size = 2)
         push_dist = max(base_push + float(rng.normal(0., 0.002)), 0.005)
         goal = tee + push_dist * direction + rng.normal(0., 0.001, size = 2)
-        tee_yaw = float(base[2] + rng.normal(0., 0.03))
-        goal_yaw = float(base[5] + rng.normal(0., 0.02))
-        return make_state(tee, goal, tee_yaw, goal_yaw, base[6:13] + table_safe_qpos_noise(rng, 0.005))
+        return make_state(tee, goal, float(base[2] + rng.normal(0., 0.03)), float(base[5] + rng.normal(0., 0.02)), base[6:13] + table_safe_qpos_noise(rng, 0.005))
 
     return fn
 
@@ -530,8 +493,7 @@ def frontier_translation_track(w):
         rad_blend = max(u ** 1.15, (r + margin - 0.018) / max(f_r - 0.018, 0.04))
 
         q_base = ring_sector_qpos(k, e_base, f_base, rad_blend, lat_blend, retract = 0.12 * over, adj_sign = int(choose_sign(rng, idx, is_eval)))
-        qpos = q_base + table_safe_qpos_noise(rng, 0.004 + 0.008 * over)
-        return make_state(goal + polar(r, math.radians(angle_deg)), goal, goal_yaw + dyaw, goal_yaw, qpos)
+        return make_state(goal + polar(r, math.radians(angle_deg)), goal, goal_yaw + dyaw, goal_yaw, q_base + table_safe_qpos_noise(rng, 0.004 + 0.008 * over))
 
     return fn
 
@@ -547,8 +509,6 @@ def lever_rotation_track(w):
         max_dyaw = 0.16 + (math.pi - 0.16) * (u ** 1.35)
         dyaw = choose_sign(rng, int(idx) // 3, is_eval) * float(rng.uniform((0.24 + 0.43 * over) * max_dyaw, max_dyaw))
 
-        # spin on goal from collision-safe outer ring postures
-
         if mode == 0:
             k = OUTER_SAFE_RING_INDICES[pick_index(rng, len(OUTER_SAFE_RING_INDICES), int(idx) // 3, is_eval)]
             angle_deg = 30. * k + float(rng.uniform(-15., 15.))
@@ -558,8 +518,6 @@ def lever_rotation_track(w):
             q_base = lerp(e_base[6:13], f_base[6:13], float(np.clip(0.68 + 0.22 * (abs(dyaw) / math.pi) + 0.06 * over, 0.68, 0.94)))
             return make_state(goal + polar(r, phi), goal, goal_yaw + dyaw, goal_yaw, q_base + table_safe_qpos_noise(rng, 0.005 + 0.007 * over))
 
-        # spin near goal approaching from DEFAULT_QPOS
-
         if mode == 1:
             r = float(rng.uniform(0.003, 0.018 + 0.024 * u + 0.014 * over))
             phi = float(PHI_DEFAULT_RAY + rng.uniform(-0.8, 0.8)) if u < 0.25 else float(rng.uniform(-math.pi, math.pi))
@@ -567,8 +525,6 @@ def lever_rotation_track(w):
             q_base = retract_ring_qpos(FRONTIER_RING_STATES[4, 6:13], 4, alpha_def)
             noise_std = (QPOS_NOISE + 0.018 * over) if alpha_def >= 0.999 else lerp(0.008, QPOS_NOISE, alpha_def)
             return make_state(GOAL_POS + polar(r, phi), GOAL_POS, GOAL_YAW + dyaw, GOAL_YAW, q_base + qpos_noise(rng, noise_std))
-
-        # coupled medium-range push + cyclic-neighbor lever rotation
 
         k = pick_index(rng, 12, idx, is_eval)
         angle_deg = 30. * k + float(rng.uniform(-14. - 4. * over, 14. + 4. * over))
@@ -632,10 +588,10 @@ def native_bridge_track(w):
     def fn(rng, idx = 0, step = 0):
         ww = float(np.clip(w + rng.normal(0., 0.02), 0., 1.))
         s = ww ** 1.20
-        dx = rng.uniform(lerp(-0.065, -0.100, s), lerp(0.005, 0.100, s))
-        dy = rng.uniform(lerp(-0.005, -0.100, s), lerp(0.105, 0.200, s))
-        tee = GOAL_POS + np.array([dx, dy], dtype = np.float32)
-
+        tee = GOAL_POS + np.array([
+            rng.uniform(lerp(-0.065, -0.100, s), lerp(0.005, 0.100, s)),
+            rng.uniform(lerp(-0.005, -0.100, s), lerp(0.105, 0.200, s))
+        ], dtype = np.float32)
         dyaw = choose_sign(rng) * float(rng.uniform(0., 0.16 + (math.pi - 0.16) * (ww ** 1.35)))
         q_base = lerp(f4, DEFAULT_QPOS, 0.45 + 0.55 * (ww / 0.18)) if ww < 0.18 else DEFAULT_QPOS
         noise_std = lerp(0.010, QPOS_NOISE, ww / 0.18) if ww < 0.18 else QPOS_NOISE
@@ -660,8 +616,7 @@ def beyond_native_track(w):
             else:
                 cur_dy_hi = 0.015
 
-        dx = float(rng.uniform(cur_dx_lo, dx_hi))
-        dy = float(rng.uniform(dy_lo, cur_dy_hi))
+        dx, dy = float(rng.uniform(cur_dx_lo, dx_hi)), float(rng.uniform(dy_lo, cur_dy_hi))
         offset = np.array([dx, dy], dtype = np.float32)
 
         cur_r, min_r = float(np.linalg.norm(offset)), 0.045 * wb
@@ -670,8 +625,7 @@ def beyond_native_track(w):
             offset = np.clip(polar(min_r, phi), [dx_lo, dy_lo], [dx_hi, dy_hi])
 
         dyaw = choose_sign(rng) * float(rng.uniform(1.25 * wb, math.pi))
-        qpos = DEFAULT_QPOS + qpos_noise(rng, QPOS_NOISE + 0.022 * wb)
-        return make_state(GOAL_POS + offset, GOAL_POS, GOAL_YAW + dyaw, GOAL_YAW, qpos)
+        return make_state(GOAL_POS + offset, GOAL_POS, GOAL_YAW + dyaw, GOAL_YAW, DEFAULT_QPOS + qpos_noise(rng, QPOS_NOISE + 0.022 * wb))
 
     return fn
 
@@ -707,8 +661,7 @@ def build_curriculum_configs(
         for j in range(n_interleaved)
     ]
 
-    num_bridge = round(native_bank_size * 0.45)
-    num_pure = round(native_bank_size * 0.20)
+    num_bridge, num_pure = round(native_bank_size * 0.45), round(native_bank_size * 0.20)
     num_beyond = max(0, native_bank_size - num_bridge - num_pure)
     native_cfgs = [
         *[native_bridge_track((j + 1) / max(num_bridge, 1)) for j in range(num_bridge)],
@@ -725,21 +678,12 @@ def materialize_config(c, rng, idx = 0, step = 0):
 
 # highest rung before a sustained (> max_gap) wall below `threshold` under count-weighted smoothing
 
-def contiguous_frontier_index(
-    p_sub: Tensor,
-    c_sub: Tensor,
-    threshold = 0.22,
-    min_count = 4,
-    kernel = 5,
-    max_gap = 3,
-    fallback = 1
-):
+def contiguous_frontier_index(p_sub: Tensor, c_sub: Tensor, threshold = 0.22, min_count = 4, kernel = 5, max_gap = 3, fallback = 1):
     n = len(p_sub)
     if n == 0:
         return 0
 
-    p = torch.nan_to_num(p_sub.float(), nan = 0.)
-    c = torch.nan_to_num(c_sub.float(), nan = 0.)
+    p, c = torch.nan_to_num(p_sub.float(), nan = 0.), torch.nan_to_num(c_sub.float(), nan = 0.)
     half = max(1, kernel // 2)
     win = 2 * half + 1
 
@@ -749,10 +693,8 @@ def contiguous_frontier_index(
     sm_p = torch.where(tot_c > 0., sm_p, torch.zeros_like(sm_p))
 
     visited = (c >= min_count) | ((c >= 2.) & (tot_c >= 2.5 * min_count))
-    passed = (visited & (sm_p >= threshold)).tolist()
-
     best_k, gap = -1, 0
-    for i, ok in enumerate(passed):
+    for i, ok in enumerate((visited & (sm_p >= threshold)).tolist()):
         if ok:
             best_k, gap = i, 0
         else:
@@ -762,21 +704,9 @@ def contiguous_frontier_index(
 
     return best_k if best_k >= 0 else min(max(fallback, 0), n - 1)
 
-# localized 1d sgs distribution: frontier gaussian bell + forward probe + decaying retention
-
-def _track_weights(
-    p_sub: Tensor,
-    c_sub: Tensor,
-    target = 0.40,
-    kappa = 4.,
-    eps = 1e-4,
-    unvisited_weight = 0.35,
-    fallback = 1,
-    retain_floor = 0.18
-):
+def _track_weights(p_sub: Tensor, c_sub: Tensor, target = 0.40, kappa = 4., eps = 1e-4, unvisited_weight = 0.35, fallback = 1, retain_floor = 0.18):
     p_sub = torch.nan_to_num(p_sub, nan = 0.)
     n = len(p_sub)
-
     if n == 0:
         return p_sub, 0
 
@@ -784,35 +714,16 @@ def _track_weights(
     idx = arange(n, device = p_sub.device, dtype = p_sub.dtype)
     kf = float(k_sub)
 
-    bell = torch.where(
-        c_sub >= 2.,
-        torch.exp(-kappa * (p_sub - target) ** 2) + eps,
-        torch.full_like(p_sub, unvisited_weight)
-    )
-
+    bell = torch.where(c_sub >= 2., torch.exp(-kappa * (p_sub - target) ** 2) + eps, torch.full_like(p_sub, unvisited_weight))
     probe_decay = torch.rsqrt(1. + c_sub.clamp(min = 0.) / 5.)
-    frontier_env = (
-        torch.exp(-0.5 * ((idx - kf) / 3.4) ** 2) +
-        0.55 * torch.exp(-0.5 * ((idx - (kf + 2.4)) / 2.1) ** 2) * probe_decay
-    )
+    frontier_env = torch.exp(-0.5 * ((idx - kf) / 3.4) ** 2) + 0.55 * torch.exp(-0.5 * ((idx - (kf + 2.4)) / 2.1) ** 2) * probe_decay
 
     retain_decay = torch.exp(-(kf - idx).clamp(min = 0.) / 15.).clamp(min = retain_floor)
     retain = (idx <= kf).to(p_sub.dtype) * (0.14 + 0.45 * (0.88 - p_sub).clamp(min = 0.04)) * retain_decay
-
-    far_cutoff = torch.exp(-(idx - (kf + 5.)).clamp(min = 0.) / 2.)
-    w = (bell * frontier_env + retain) * far_cutoff
+    w = (bell * frontier_env + retain) * torch.exp(-(idx - (kf + 5.)).clamp(min = 0.) / 2.)
     return w / w.sum().clamp(min = 1e-8), k_sub
 
-def compute_frontier_k(
-    p: Tensor,
-    counts: Tensor,
-    threshold = 0.22,
-    min_count = 4,
-    kernel = 5,
-    fallback = 4,
-    ladder_size = LADDER_SIZE,
-    num_tracks = len(SKILL_TRACKS)
-):
+def compute_frontier_k(p: Tensor, counts: Tensor, threshold = 0.22, min_count = 4, kernel = 5, fallback = 4, ladder_size = LADDER_SIZE, num_tracks = len(SKILL_TRACKS)):
     p = torch.nan_to_num(p, nan = 0.)
     n_total, n_main = len(p), min(len(p), ladder_size)
     n_foot = min(FOOTHOLD_SIZE, n_main)
@@ -837,16 +748,7 @@ def compute_frontier_k(
 
     return max(n_foot, min(n_main - 1, n_foot + round(min(prog_mean, prog_min + 0.24) * (n_main - 1 - n_foot))))
 
-def curriculum_score_fn(
-    p: Tensor,
-    counts: Tensor,
-    target = 0.40,
-    kappa = 4.,
-    eps = 1e-4,
-    unvisited_weight = 0.35,
-    ladder_size = LADDER_SIZE,
-    num_tracks = len(SKILL_TRACKS)
-):
+def curriculum_score_fn(p: Tensor, counts: Tensor, target = 0.40, kappa = 4., eps = 1e-4, unvisited_weight = 0.35, ladder_size = LADDER_SIZE, num_tracks = len(SKILL_TRACKS)):
     p = torch.nan_to_num(p, nan = 0.)
     n_total, n_main = len(p), min(len(p), ladder_size)
     n_foot = min(FOOTHOLD_SIZE, n_main)
@@ -882,15 +784,10 @@ def curriculum_score_fn(
 
         if len(p_d) > br_end:
             w_tail = torch.zeros_like(p_d)
-            w_tail[br_end:] = torch.where(
-                c_d[br_end:] >= 2.,
-                (0.88 - p_d[br_end:]).clamp(min = 0.12),
-                torch.full_like(p_d[br_end:], unvisited_weight)
-            )
+            w_tail[br_end:] = torch.where(c_d[br_end:] >= 2., (0.88 - p_d[br_end:]).clamp(min = 0.12), torch.full_like(p_d[br_end:], unvisited_weight))
             w_d = 0.75 * w_d + 0.25 * (w_tail / w_tail.sum().clamp(min = 1e-8))
 
-        prog_d = k_d / max(len(p_d) - 1, 1)
-        share_d = float(np.clip(0.24 + 0.14 * (sum(progs) / len(progs)) + 0.10 * prog_d, 0.24, 0.48))
+        share_d = float(np.clip(0.24 + 0.14 * (sum(progs) / len(progs)) + 0.10 * (k_d / max(len(p_d) - 1, 1)), 0.24, 0.48))
         out[n_main:] = share_d * (w_d / w_d.sum().clamp(min = 1e-8))
     else:
         share_d = 0.
@@ -905,398 +802,17 @@ def curriculum_score_fn(
 
 frontier_ladder_score_fn = curriculum_score_fn
 
-def make_sampler(
-    configs,
-    seed = 0,
-    progression_path = None,
-    target = 0.40,
-    kappa = 4.,
-    eps = 1e-4,
-    window = 30,
-    unvisited_weight = 0.35,
-    uniform_prob = 0.015,
-    score_fn = curriculum_score_fn
-):
+def make_sampler(configs, seed = 0, progression_path = None, target = 0.40, kappa = 4., eps = 1e-4, window = 30, unvisited_weight = 0.35, uniform_prob = 0.015, score_fn = curriculum_score_fn):
     return SGSSampler(
-        configs = configs,
-        target = target,
-        kappa = kappa,
-        eps = eps,
-        window = window,
-        unvisited_weight = unvisited_weight,
-        uniform_prob = uniform_prob,
-        score_fn = score_fn,
-        log_every = None,
-        log_path = progression_path,
-        seed = seed
+        configs = configs, target = target, kappa = kappa, eps = eps,
+        window = window, unvisited_weight = unvisited_weight, uniform_prob = uniform_prob,
+        score_fn = score_fn, log_every = None, log_path = progression_path, seed = seed
     )
-
-# networks
-
-class ResidualBetaActor(Module):
-    def __init__(
-        self,
-        dim_state = DIM_STATE,
-        dim_goal = DIM_GOAL,
-        dim_action = DIM_ACTION,
-        hidden_dim = 256,
-        depth = 12,
-        residual_every = 2,
-        beta: Beta | None = None,
-        **beta_kwargs
-    ):
-        super().__init__()
-        self.net = ResidualNormedMLP(
-            dim_in = dim_state + dim_goal,
-            dim = hidden_dim,
-            depth = depth,
-            dim_out = dim_action * 2,
-            residual_every = residual_every,
-            activation = nn.SiLU(),
-            final_norm = True
-        )
-        self.beta = default(beta, lambda: Beta(**beta_kwargs))
-
-    def log_prob(self, distr, action):
-        return reduce(distr.log_prob(action), '... a -> ...', 'sum')
-
-    def entropy(self, distr):
-        return reduce(distr.entropy(), '... a -> ...', 'sum')
-
-    def forward(self, state, goal = None):
-        if exists(goal):
-            state, goal = broadcast_goal(state, goal)
-            state = cat((state, goal), dim = -1)
-
-        params = rearrange(self.net(state), '... (a d) -> ... a d', d = 2)
-        return self.beta(params)
-
-class ResidualEncoder(Module):
-    def __init__(
-        self,
-        dim_in,
-        dim_hidden = 256,
-        depth = 16,
-        dim_out = 64,
-        residual_every = 4
-    ):
-        super().__init__()
-        self.net = ResidualNormedMLP(
-            dim_in = dim_in,
-            dim = dim_hidden,
-            depth = depth,
-            dim_out = dim_out,
-            residual_every = residual_every,
-            activation = nn.SiLU(),
-            final_norm = True
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-# contrastive rl + multi-critic ppo
-
-class PushT3DDistanceRewardPPO(DistanceRewardPPO):
-    def __init__(
-        self,
-        *args,
-        value_num_bins = 256,
-        env_value_max_return = 1.,
-        self_goal_cos_weight = 0.15,
-        **kwargs
-    ):
-        super().__init__(*args, **kwargs)
-        self.self_goal_cos_weight = float(self_goal_cos_weight)
-        self.last_self_cos_err = 0.
-        self.last_self_top1_err = 0.
-
-        self.crl_value_hl_gauss = HLGaussLoss(
-            min_value = 0.,
-            max_value = float(self.reward_scale),
-            num_bins = int(value_num_bins),
-            clamp_to_range = True
-        ).to(self.device)
-
-        self.env_value_hl_gauss = HLGaussLoss(
-            min_value = 0.,
-            max_value = float(env_value_max_return),
-            num_bins = int(value_num_bins),
-            clamp_to_range = True
-        ).to(self.device)
-
-    def _sample_critic_pairs(self, states, dones, batch_size, next_states):
-        dims = shape(states, 'n t ...').dims
-        num_trajs, num_steps = dims['n'], dims['t']
-        ends = self._episode_ends(dones, num_steps)
-
-        if shape(ends, 'n ...').dims['n'] == 1 and num_trajs > 1:
-            ends = repeat(ends, '1 t -> n t', n = num_trajs)
-
-        max_steps_all = (ends - repeat(arange(num_steps, device = self.device), 't -> n t', n = num_trajs)) + 1
-        traj_idx, time_idx = torch.nonzero(max_steps_all >= 1, as_tuple = True)
-        pick = torch.randint(0, traj_idx.numel(), (batch_size,), device = self.device)
-        traj_idx, time_idx = traj_idx[pick], time_idx[pick]
-
-        discount = rearrange(sample_discount(self.critic_discount, batch_size, device = self.device), 'b 1 -> b')
-        delta_times = sample_truncated_geometric(max_steps_all[traj_idx, time_idx], discount)
-
-        return (
-            states[traj_idx, time_idx],
-            next_states[traj_idx, time_idx + delta_times - 1],
-            rearrange(delta_times, 'b -> b 1'),
-            rearrange(discount, 'b -> b 1')
-        )
-
-    def update_critic(self, states, dones, next_states):
-        self.critic_wrapper.train()
-        losses, cos_errs, top1_errs = [], [], []
-
-        for _ in range(self.critic_steps):
-            past_s, future_s, delta_t, raw_disc = self._sample_critic_pairs(states, dones, self.critic_batch_size, next_states)
-            future_g = self.state_to_goal_fn(future_s)
-            neg_g = maybe(self.state_to_goal_fn)(self._sample_negative_goals(self.critic_batch_size))
-
-            crl_loss = self.critic_wrapper(
-                past_s,
-                future_g,
-                delta_times = delta_t,
-                raw_discount = raw_disc,
-                extra_negatives = neg_g
-            )
-
-            z_s = l2norm(self.critic_wrapper.encode(future_s))
-            z_g = l2norm(self.critic_wrapper.encode_future(future_g))
-            cos_err = (1. - einsum(z_s, z_g, 'b d, b d -> b')).mean()
-
-            with torch.no_grad():
-                sim = einsum(z_s, z_g, 'i d, j d -> i j')
-                labels = arange(len(z_s), device = self.device)
-                top1_err = (sim.argmax(dim = -1) != labels).float().mean().item()
-
-            cos_errs.append(float(cos_err.item()))
-            top1_errs.append(float(top1_err))
-            loss = crl_loss + self.self_goal_cos_weight * cos_err if self.self_goal_cos_weight > 0. else crl_loss
-
-            self.critic_opt.zero_grad()
-            loss.backward()
-            if exists(self.max_grad_norm):
-                nn.utils.clip_grad_norm_(self.critic_wrapper.parameters(), self.max_grad_norm)
-            self.critic_opt.step()
-
-            losses.append(crl_loss.item())
-
-        self.last_self_cos_err = sum(cos_errs) / len(cos_errs)
-        self.last_self_top1_err = sum(top1_errs) / len(top1_errs)
-
-        for s in rearrange(states.detach(), 'n t d -> (n t) d').cpu()[::2]:
-            self.negative_buffer.append(s)
-        for s in rearrange(next_states.detach(), 'n t d -> (n t) d').cpu()[::4]:
-            self.negative_buffer.append(s)
-
-        return sum(losses) / len(losses)
-
-    def _hl_gauss_net_update(self, net, opt, loss_fn, flat_states, flat_goals, flat_returns):
-        batch_size = len(flat_states)
-        mb = min(self.value_minibatch_size, batch_size)
-        net.train()
-        losses = []
-
-        for _ in range(self.value_epochs):
-            perm = torch.randperm(batch_size, device = self.device)
-            for start in range(0, batch_size, mb):
-                idx = perm[start:start + mb]
-                logits = net(cat((flat_states[idx], flat_goals[idx]), dim = -1))
-                loss = loss_fn(logits, flat_returns[idx])
-
-                opt.zero_grad()
-                loss.backward()
-                if exists(self.max_grad_norm):
-                    nn.utils.clip_grad_norm_(net.parameters(), self.max_grad_norm)
-                opt.step()
-
-                losses.append(loss.item())
-
-        return sum(losses) / len(losses) if losses else 0.
-
-    def _ppo_update(self, states, goals, actions, old_log_probs, advantages):
-        flat_s = rearrange(states, 'n t d -> (n t) d')
-        flat_g = rearrange(goals, 'n t g -> (n t) g')
-        flat_a = rearrange(actions, 'n t ... -> (n t) ...')
-        flat_lp = rearrange(old_log_probs, 'n t -> (n t)')
-        flat_adv = rearrange(advantages, 'n t -> (n t)')
-
-        batch_size = len(flat_s)
-        mb = min(self.minibatch_size, batch_size)
-        p_losses, ents, kls, clips = [], [], [], []
-        self.actor.train()
-
-        for _ in range(self.ppo_epochs):
-            perm = torch.randperm(batch_size, device = self.device)
-            for start in range(0, batch_size, mb):
-                idx = perm[start:start + mb]
-                distr = self.actor(flat_s[idx], flat_g[idx])
-                new_lp = self.actor.log_prob(distr, flat_a[idx])
-
-                loss = hpo_actor_loss(
-                    new_lp,
-                    flat_lp[idx],
-                    flat_adv[idx],
-                    eps_clip = self.clip_eps,
-                    normalize_advantages = self.normalize_advantages,
-                    **self.ppo_kwargs
-                ).mean()
-
-                ent = self.actor.entropy(distr)
-                if exists(ent) and self.entropy_coef > 0.:
-                    loss = loss - ent.mean() * self.entropy_coef
-
-                self.actor_opt.zero_grad()
-                loss.backward()
-                if exists(self.max_grad_norm):
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                self.actor_opt.step()
-
-                p_losses.append(loss.item())
-                if exists(ent):
-                    ents.append(ent.mean().item())
-
-                log_ratio = new_lp - flat_lp[idx]
-                ratio = log_ratio.exp()
-                kls.append(((ratio - 1.) - log_ratio).mean().item())
-                clips.append(((ratio - 1.).abs() > self.clip_eps).float().mean().item())
-
-        return dict(
-            policy_loss = sum(p_losses) / len(p_losses),
-            entropy = sum(ents) / len(ents) if ents else 0.,
-            approx_kl = sum(kls) / len(kls),
-            clip_frac = sum(clips) / len(clips)
-        )
-
-    def update(
-        self,
-        states,
-        goals,
-        actions,
-        old_log_probs,
-        dones,
-        next_states,
-        terminated,
-        base_rewards,
-        env_reward_weight = None,
-        truncated = None
-    ):
-        states = self._to_tensor(states, torch.float32)
-        next_states = self._to_tensor(next_states, torch.float32)
-        actions = self._to_tensor(actions)
-        old_log_probs = self._to_tensor(old_log_probs, torch.float32)
-        dones = self._to_tensor(dones, torch.bool)
-        terminated = self._to_tensor(terminated, torch.bool)
-        truncated = self._to_tensor(truncated, torch.bool) if exists(truncated) else dones & ~terminated
-        base_rewards = self._to_tensor(base_rewards, torch.float32).clamp(0., 1.)
-
-        dims = shape(states, 'n t ...').dims
-        num_trajs, num_steps = dims['n'], dims['t']
-        goals = self._broadcast_goals(goals, num_trajs, num_steps)
-        critic_loss = self.update_critic(states, dones, next_states)
-
-        flat_s = rearrange(states, 'n t d -> (n t) d')
-        flat_ns = rearrange(next_states, 'n t d -> (n t) d')
-        flat_g = rearrange(goals, 'n t g -> (n t) g')
-
-        with torch.no_grad():
-            crl_out = contrastive_distance_rewards(
-                self.critic_wrapper,
-                flat_ns,
-                flat_g,
-                success = rearrange(terminated, 'n t -> (n t)'),
-                discount = self.discount,
-                distance_scale = self.reward_distance_scale,
-                reward_scale = self.reward_scale,
-                distance_type = self.distance_type
-            )
-            step_crl = rearrange(crl_out.step_rewards, '(n t) -> n t', n = num_trajs)
-            crl_rewards = rearrange(crl_out.rewards, '(n t) -> n t', n = num_trajs)
-            distances = rearrange(crl_out.distances, '(n t) -> n t', n = num_trajs)
-
-            sg_in = cat((flat_s, flat_g), dim = -1)
-            nsg_in = cat((flat_ns, flat_g), dim = -1)
-
-            def eval_hl_gauss(net, hl_gauss):
-                return (
-                    rearrange(hl_gauss(net(sg_in)), '(n t) -> n t', n = num_trajs),
-                    rearrange(hl_gauss(net(nsg_in)), '(n t) -> n t', n = num_trajs)
-                )
-
-            crl_values, crl_next_values = eval_hl_gauss(self.value, self.crl_value_hl_gauss)
-            env_values, env_next_values = eval_hl_gauss(self.env_value, self.env_value_hl_gauss)
-
-        gae = calc_gae(
-            stack((base_rewards, crl_rewards), dim = -1),
-            stack((env_values, crl_values), dim = -1),
-            terminated = terminated,
-            truncated = truncated,
-            gamma = self.discount,
-            lam = self.lam,
-            next_values = stack((env_next_values, crl_next_values), dim = -1),
-            group_dim = -1,
-            finite_time = self.finite_time_gae,
-            return_advantages = True
-        )
-        env_returns, crl_returns = gae.returns.unbind(dim = -1)
-        env_advantages, crl_advantages = gae.advantages.unbind(dim = -1)
-
-        env_w = min(max(float(default(env_reward_weight, self.env_reward_weight)), 0.), 1.)
-        advantages = combine_grouped_advantages(
-            gae.advantages,
-            weights = torch.tensor((env_w, 1. - env_w), device = self.device),
-            normalize = True,
-            group_dim = -1,
-            mask = None,
-            reduce = 'sum'
-        )
-
-        crl_v_loss = self._hl_gauss_net_update(
-            self.value, self.value_opt, self.crl_value_hl_gauss,
-            flat_s, flat_g, rearrange(crl_returns, 'n t -> (n t)')
-        )
-        env_v_loss = self._hl_gauss_net_update(
-            self.env_value, self.env_value_opt, self.env_value_hl_gauss,
-            flat_s, flat_g, rearrange(env_returns, 'n t -> (n t)')
-        )
-        ppo_metrics = self._ppo_update(states, goals, actions, old_log_probs, advantages)
-        crl_r_mean = step_crl.mean().item()
-
-        return dict(
-            critic_loss = critic_loss,
-            self_cos_err = float(self.last_self_cos_err),
-            self_top1_err = float(self.last_self_top1_err),
-            value_loss = crl_v_loss,
-            env_value_loss = env_v_loss,
-            distance_mean = distances.mean().item(),
-            value_mean = crl_values.mean().item(),
-            reward_mean = crl_r_mean,
-            crl_reward_mean = crl_r_mean,
-            env_reward_mean = base_rewards.mean().item(),
-            env_value_mean = env_values.mean().item(),
-            env_reward_weight = env_w,
-            advantage_mean = advantages.mean().item(),
-            advantage_std = advantages.std().item(),
-            env_advantage_mean = env_advantages.mean().item(),
-            crl_advantage_mean = crl_advantages.mean().item(),
-            **ppo_metrics
-        )
 
 # held-out evaluation and video rendering
 
 @torch.no_grad()
-def evaluate_heldout(
-    trainer,
-    bank_envs,
-    eval_states,
-    max_steps = 240,
-    seed_base = 0,
-    deterministic = True
-):
+def evaluate_heldout(trainer, bank_envs, eval_states, max_steps = 240, seed_base = 0, deterministic = True):
     n, m = len(eval_states), len(bank_envs)
     succ = np.zeros(n, dtype = np.float32)
     max_cov = np.zeros(n, dtype = np.float32)
@@ -1334,23 +850,10 @@ def evaluate_heldout(
                     if term or trunc:
                         succ[start + j], done[j] = float(term), True
 
-    return dict(
-        success_rate = float(succ.mean()),
-        max_cov = float(max_cov.mean()),
-        per_state = [float(x) for x in succ]
-    )
+    return dict(success_rate = float(succ.mean()), max_cov = float(max_cov.mean()), per_state = [float(x) for x in succ])
 
 @torch.no_grad()
-def render_heldout_grid(
-    trainer,
-    render_env,
-    eval_states,
-    out_path,
-    max_steps = 240,
-    deterministic = True,
-    grid_cols = 4,
-    fps = 12
-):
+def render_heldout_grid(trainer, render_env, eval_states, out_path, max_steps = 240, deterministic = True, grid_cols = 4, fps = 12):
     n = min(len(eval_states), 16)
     sel = [eval_states[i] for i in np.linspace(0, len(eval_states) - 1, n, dtype = int)]
     all_frames, succ = [], []
@@ -1391,14 +894,13 @@ def render_heldout_grid(
             all_frames.append(ep_frames)
 
     cols = next(c for c in range(min(grid_cols, n), 0, -1) if divisible_by(n, c))
-    num_frames = max(len(f) for f in all_frames)
     frames = [
         rearrange(
             np.stack([all_frames[i][min(t, len(all_frames[i]) - 1)] for i in range(n)]),
             '(r c) h w ch -> (r h) (c w) ch',
             c = cols
         )
-        for t in range(num_frames)
+        for t in range(max(len(f) for f in all_frames))
     ]
 
     out_path = Path(out_path)
@@ -1415,7 +917,7 @@ def render_heldout_grid(
 def main(
     num_envs: int = 16,
     rollout_len: int = 128,
-    num_updates: int = 10_000,
+    num_updates: int = 50_000,
     max_steps: int = 240,
     actor_lr: float = 3e-4,
     actor_lr_warmup: int = 0,
@@ -1501,17 +1003,7 @@ def main(
 
     anchor_configs = build_anchor_configs(num_easy = num_easy, num_frontier = num_frontier)
     configs = build_curriculum_configs(num_easy = num_easy, ladder_size = ladder_size, native_bank_size = native_bank_size)
-    sampler = make_sampler(
-        configs,
-        seed = seed,
-        progression_path = progression_path,
-        target = sgs_target,
-        kappa = sgs_kappa,
-        eps = sgs_eps,
-        window = sgs_window,
-        unvisited_weight = sgs_unvisited_weight,
-        uniform_prob = sgs_uniform_prob
-    )
+    sampler = make_sampler(configs, seed, progression_path, sgs_target, sgs_kappa, sgs_eps, sgs_window, sgs_unvisited_weight, sgs_uniform_prob)
 
     success_fn = lambda _o, _r, term, _trunc, info: bool(term or info.get('success', False))
     envs = VecEnv([
@@ -1525,10 +1017,7 @@ def main(
 
     eval_rng = np.random.default_rng(77_777)
     heldout_anchor = list(anchor_configs)
-    heldout_tiers = [
-        materialize_config(configs[int(idx)], eval_rng, i)
-        for i, idx in enumerate(np.linspace(0, ladder_size - 1, num_heldout_tiers, dtype = int))
-    ]
+    heldout_tiers = [materialize_config(configs[int(idx)], eval_rng, i) for i, idx in enumerate(np.linspace(0, ladder_size - 1, num_heldout_tiers, dtype = int))]
     heldout_native = [native_config(np.random.default_rng(90_000 + i), i) for i in range(num_heldout_native)]
 
     eval_envs = [make_pusht3d(max_steps = max_steps, seed = 10_000 + i) for i in range(8)]
@@ -1572,108 +1061,57 @@ def main(
         obs_raw[i] = assign_env_goal(i, obs_raw[i])
     obs = make_aug_state_3d(cur_single_obs, prev_single_obs, prev_act)
 
-    actor = ResidualBetaActor(
-        DIM_STATE, DIM_GOAL, DIM_ACTION,
-        actor_hidden, actor_depth,
-        residual_every = actor_residual_every
-    ).to(device)
-
-    state_encoder = ResidualEncoder(
-        DIM_STATE, critic_hidden, critic_depth, critic_embed_dim,
-        residual_every = critic_residual_every
-    ).to(device)
-
-    goal_encoder = ResidualEncoder(
-        DIM_GOAL, critic_hidden, critic_depth, critic_embed_dim,
-        residual_every = critic_residual_every
-    ).to(device)
-
-    value = ResidualEncoder(
-        DIM_STATE + DIM_GOAL, value_hidden, value_depth, value_num_bins,
-        residual_every = value_residual_every
-    ).to(device)
-
-    env_value = ResidualEncoder(
-        DIM_STATE + DIM_GOAL, value_hidden, value_depth, value_num_bins,
-        residual_every = value_residual_every
-    ).to(device)
+    actor = ResidualBetaActor(DIM_STATE, DIM_GOAL, DIM_ACTION, actor_hidden, actor_depth, residual_every = actor_residual_every).to(device)
+    state_encoder = ResidualEncoder(DIM_STATE, critic_hidden, critic_depth, critic_embed_dim, residual_every = critic_residual_every).to(device)
+    goal_encoder = ResidualEncoder(DIM_GOAL, critic_hidden, critic_depth, critic_embed_dim, residual_every = critic_residual_every).to(device)
+    value = ResidualEncoder(DIM_STATE + DIM_GOAL, value_hidden, value_depth, value_num_bins, residual_every = value_residual_every).to(device)
+    env_value = ResidualEncoder(DIM_STATE + DIM_GOAL, value_hidden, value_depth, value_num_bins, residual_every = value_residual_every).to(device)
 
     contrastive_learn = ContrastiveLearning(
-        use_euclidean = True,
-        l2norm_embed = True,
-        learned_temp = False,
-        scale = critic_distance_scale,
-        symmetric = True,
-        time_weight = critic_time_weight,
-        sep_weight = critic_sep_weight,
-        goal_eps = 0.05
+        use_euclidean = True, l2norm_embed = True, learned_temp = False,
+        scale = critic_distance_scale, symmetric = True,
+        time_weight = critic_time_weight, sep_weight = critic_sep_weight, goal_eps = 0.05
     )
     critic_wrapper = ContrastiveWrapper(state_encoder, contrastive_learn, future_encoder = goal_encoder).to(device)
 
-    trainer = PushT3DDistanceRewardPPO(
-        actor,
-        critic_wrapper,
-        value = value,
-        env_value = env_value,
-        separate_env_rewards = True,
-        env_reward_weight = env_reward_weight,
-        action_type = 'continuous',
-        actor_lr = actor_lr,
-        critic_lr = critic_lr,
-        value_lr = value_lr,
-        value_epochs = value_epochs,
-        value_minibatch_size = value_minibatch_size,
-        value_num_bins = value_num_bins,
-        env_value_max_return = float(max(success_bonus, 1.)),
-        weight_decay = weight_decay,
-        max_grad_norm = max_grad_norm,
-        discount = discount,
-        lam = lam,
-        finite_time_gae = finite_time_gae,
-        clip_eps = clip_eps,
-        entropy_coef = entropy_coef,
-        ppo_epochs = ppo_epochs,
-        minibatch_size = minibatch_size,
-        critic_steps = critic_steps,
-        critic_batch_size = critic_batch_size,
-        critic_discount = critic_discount,
-        critic_negative_buffer_size = critic_negative_buffer_size,
+    trainer = DistanceRewardPPO(
+        actor, critic_wrapper,
+        value = value, env_value = env_value,
+        value_num_bins = value_num_bins, env_value_max_return = float(max(success_bonus, 1.)),
+        separate_env_rewards = True, env_reward_weight = env_reward_weight, mask_done_advantages = False,
+        use_hpo = True, action_type = 'continuous',
+        actor_lr = actor_lr, critic_lr = critic_lr, value_lr = value_lr,
+        value_epochs = value_epochs, value_minibatch_size = value_minibatch_size,
+        weight_decay = weight_decay, max_grad_norm = max_grad_norm,
+        discount = discount, lam = lam, finite_time_gae = finite_time_gae,
+        clip_eps = clip_eps, entropy_coef = entropy_coef,
+        ppo_epochs = ppo_epochs, minibatch_size = minibatch_size,
+        critic_steps = critic_steps, critic_batch_size = critic_batch_size,
+        critic_discount = critic_discount, critic_negative_buffer_size = critic_negative_buffer_size,
         self_goal_cos_weight = self_goal_cos_weight,
         state_to_goal_fn = lambda t: t[..., :DIM_GOAL],
         device = device
     )
 
     ckpt_modules = (('actor', actor), ('critic', critic_wrapper), ('value', value), ('env-value', env_value))
+    ckpt_opts = (('actor_opt', trainer.actor_opt), ('critic_opt', trainer.critic_opt), ('value_opt', trainer.value_opt), ('env_value_opt', trainer.env_value_opt))
 
     def save_bundle(tag, upd, k_st, b_score, b_native_g):
         for name, mod in ckpt_modules:
             torch.save(mod.state_dict(), f'{checkpoint_folder}/{name}-{tag}.pt')
 
-        sampler_payload = dict(
-            history = [list(h) for h in sampler.history],
-            counts = sampler.counts.clone(),
-            step_count = sampler.step_count
+        torch.save(
+            dict(history = [list(h) for h in sampler.history], counts = sampler.counts.clone(), step_count = sampler.step_count),
+            f'{checkpoint_folder}/sampler-{tag}.pt'
         )
-        torch.save(sampler_payload, f'{checkpoint_folder}/sampler-{tag}.pt')
-
-        opt_payload = dict(
-            actor_opt = trainer.actor_opt.state_dict(),
-            critic_opt = trainer.critic_opt.state_dict(),
-            value_opt = trainer.value_opt.state_dict()
+        torch.save(
+            {k: opt.state_dict() for k, opt in ckpt_opts if exists(opt)},
+            f'{checkpoint_folder}/optim-{tag}.pt'
         )
-        if exists(trainer.env_value_opt):
-            opt_payload['env_value_opt'] = trainer.env_value_opt.state_dict()
-        torch.save(opt_payload, f'{checkpoint_folder}/optim-{tag}.pt')
-
         save_json(f'{checkpoint_folder}/ckpt_meta-{tag}.json', dict(
-            update = int(upd),
-            env_steps = int(upd * num_envs * rollout_len),
-            actor_depth = int(actor_depth),
-            critic_depth = int(critic_depth),
-            value_depth = int(value_depth),
-            k_star = int(k_st),
-            best_score = float(b_score),
-            best_native_greedy = float(b_native_g)
+            update = int(upd), env_steps = int(upd * num_envs * rollout_len),
+            actor_depth = int(actor_depth), critic_depth = int(critic_depth), value_depth = int(value_depth),
+            k_star = int(k_st), best_score = float(b_score), best_native_greedy = float(b_native_g)
         ))
 
     num_episodes, best_score, best_native_greedy = 0, float('-inf'), 0.
@@ -1682,8 +1120,7 @@ def main(
         for name, mod in ckpt_modules:
             mod.load_state_dict(torch.load(f'{checkpoint_folder}/{name}-{resume_tag}.pt', map_location = device))
 
-        sampler_path = Path(f'{checkpoint_folder}/sampler-{resume_tag}.pt')
-        if sampler_path.exists():
+        if (sampler_path := Path(f'{checkpoint_folder}/sampler-{resume_tag}.pt')).exists():
             s_state = torch.load(sampler_path, map_location = 'cpu')
             n_common = min(len(sampler.history), len(s_state['history']))
             for h_deq, h_list in zip(sampler.history[:n_common], s_state['history'][:n_common]):
@@ -1692,22 +1129,14 @@ def main(
             sampler.counts[:n_common].copy_(s_state['counts'][:n_common])
             sampler.step_count = int(s_state['step_count'])
 
-        optim_path = Path(f'{checkpoint_folder}/optim-{resume_tag}.pt')
-        if optim_path.exists():
+        if (optim_path := Path(f'{checkpoint_folder}/optim-{resume_tag}.pt')).exists():
             opt_state = torch.load(optim_path, map_location = 'cpu')
-            opts = (
-                ('actor_opt', trainer.actor_opt),
-                ('critic_opt', trainer.critic_opt),
-                ('value_opt', trainer.value_opt),
-                ('env_value_opt', trainer.env_value_opt)
-            )
-            for key, opt in opts:
+            for key, opt in ckpt_opts:
                 if key in opt_state and exists(opt):
                     opt.load_state_dict(opt_state[key])
 
-        best_meta_path = Path(f'{checkpoint_folder}/ckpt_meta-best.json')
-        if best_meta_path.exists():
-            meta = json.loads(best_meta_path.read_text())
+        if (best_meta := Path(f'{checkpoint_folder}/ckpt_meta-best.json')).exists():
+            meta = json.loads(best_meta.read_text())
             best_score = float(meta.get('best_score', float('-inf')))
             best_native_greedy = float(meta.get('best_native_greedy', 0.))
 
@@ -1730,9 +1159,10 @@ def main(
 
         for step in range(rollout_len):
             with torch.no_grad():
-                obs_t = torch.from_numpy(obs).float().to(device)
-                goals_t = torch.from_numpy(current_goals).float().to(device)
-                action, log_prob = trainer.act(obs_t, goals_t)
+                action, log_prob = trainer.act(
+                    torch.from_numpy(obs).float().to(device),
+                    torch.from_numpy(current_goals).float().to(device)
+                )
 
             action_np = action.cpu().numpy()
             next_obs_raw, step_rewards, terminated, truncated, infos = envs.step(action_np)
@@ -1765,21 +1195,14 @@ def main(
             obs = make_aug_state_3d(cur_single_obs, prev_single_obs, prev_act)
 
         flat_next_goals = rearrange(next_states, 'n t d -> (n t) d')[:, :DIM_GOAL]
-        sample_idx = np.random.choice(len(flat_next_goals), size = min(goal_buffer_batch, len(flat_next_goals)), replace = False)
-        for g_vec in flat_next_goals[sample_idx]:
+        for g_vec in flat_next_goals[np.random.choice(len(flat_next_goals), size = min(goal_buffer_batch, len(flat_next_goals)), replace = False)]:
             goal_buffer.append(g_vec.copy())
 
         metrics = trainer.update(
-            states = states,
-            goals = goals,
-            actions = actions,
-            old_log_probs = log_probs,
-            dones = terminateds | truncateds,
-            next_states = next_states,
-            terminated = terminateds,
-            truncated = truncateds,
-            base_rewards = env_rewards,
-            env_reward_weight = env_reward_weight
+            states = states, goals = goals, actions = actions, old_log_probs = log_probs,
+            dones = terminateds | truncateds, next_states = next_states,
+            terminated = terminateds, truncated = truncateds, success = terminateds,
+            base_rewards = np.clip(env_rewards, 0., 1.), env_reward_weight = env_reward_weight
         )
 
         k_star = compute_frontier_k(sampler.success_rates, sampler.counts, ladder_size = ladder_size)
@@ -1787,16 +1210,9 @@ def main(
         elapsed = time.time() - t0
 
         row = dict(
-            update = update,
-            env_steps = update * num_envs * rollout_len,
-            episodes = num_episodes,
-            train_succ = train_succ,
-            k_star = int(k_star),
-            finite_time_gae = bool(trainer.finite_time_gae),
-            actor_depth = actor_depth,
-            critic_depth = critic_depth,
-            elapsed_sec = elapsed,
-            **metrics
+            update = update, env_steps = update * num_envs * rollout_len, episodes = num_episodes,
+            train_succ = train_succ, k_star = int(k_star), finite_time_gae = bool(trainer.finite_time_gae),
+            actor_depth = actor_depth, critic_depth = critic_depth, elapsed_sec = elapsed, **metrics
         )
 
         if divisible_by(update, eval_every) or update == start_update or update == num_updates:
@@ -1822,7 +1238,7 @@ def main(
 
             print(
                 f"upd {update:4d} | steps {row['env_steps']:7d} | k* {k_star:3d}/{len(configs)-1} | "
-                f"train {train_succ:4.1%} | id_err {metrics.get('self_cos_err', 0.):.4f} | "
+                f"train {train_succ:4.1%} | id_err {metrics['self_cos_err']:.4f} | "
                 f"anchor(g/s) {anchor_g['success_rate']:4.1%}/{anchor_s['success_rate']:4.1%} | "
                 f"tiers(g/s) {tiers_g['success_rate']:4.1%}/{tiers_s['success_rate']:4.1%} (cov {row['heldout_tiers_cov']:.2f}) | "
                 f"native(g/s) {native_g['success_rate']:4.1%}/{native_s['success_rate']:4.1%} (cov {row['heldout_native_cov']:.2f}) | "
@@ -1831,14 +1247,9 @@ def main(
             )
 
             cur_score = (
-                2. * native_g['success_rate'] +
-                1. * native_s['success_rate'] +
-                0.5 * row['heldout_native_cov'] +
-                1. * tiers_g['success_rate'] +
-                0.5 * tiers_s['success_rate'] +
-                0.5 * anchor_f_g +
-                0.25 * anchor_g['success_rate'] +
-                0.15 * (float(k_star) / max(len(configs) - 1, 1))
+                2. * native_g['success_rate'] + 1. * native_s['success_rate'] + 0.5 * row['heldout_native_cov'] +
+                1. * tiers_g['success_rate'] + 0.5 * tiers_s['success_rate'] +
+                0.5 * anchor_f_g + 0.25 * anchor_g['success_rate'] + 0.15 * (float(k_star) / max(len(configs) - 1, 1))
             )
 
             if cur_score > best_score + 1e-4 or native_g['success_rate'] > best_native_greedy:
