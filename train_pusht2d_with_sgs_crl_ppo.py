@@ -13,7 +13,7 @@
 #   "torch",
 #   "torch-einops-utils",
 #   "x-mlps-pytorch>=0.6.1",
-#   "x-ppo>=0.0.30",
+#   "x-ppo>=0.1.0",
 # ]
 #
 # [tool.uv.sources]
@@ -865,33 +865,24 @@ class PushTDistanceRewardPPO(DistanceRewardPPO):
             env_values = rearrange(self.env_value_hl_gauss(self.env_value(cat((flat_states, flat_goals), dim = -1))), '(n t) -> n t', n = num_trajs)
             env_next_values = rearrange(self.env_value_hl_gauss(self.env_value(cat((flat_next_states, flat_goals), dim = -1))), '(n t) -> n t', n = num_trajs)
 
-        crl_gae = calc_gae(
-            crl_rewards,
-            crl_values,
+        gae = calc_gae(
+            stack((base_rewards, crl_rewards), dim = -1),
+            stack((env_values, crl_values), dim = -1),
             terminated = terminated,
             truncated = truncated,
             gamma = self.discount,
             lam = self.lam,
-            next_values = crl_next_values,
+            next_values = stack((env_next_values, crl_next_values), dim = -1),
+            group_dim = -1,
+            finite_time = self.finite_time_gae,
             return_advantages = True
         )
-        crl_returns, crl_advantages = crl_gae.returns, crl_gae.advantages
-
-        env_gae = calc_gae(
-            base_rewards,
-            env_values,
-            terminated = terminated,
-            truncated = truncated,
-            gamma = self.discount,
-            lam = self.lam,
-            next_values = env_next_values,
-            return_advantages = True
-        )
-        env_returns, env_advantages = env_gae.returns, env_gae.advantages
+        env_returns, crl_returns = gae.returns.unbind(dim = -1)
+        env_advantages, crl_advantages = gae.advantages.unbind(dim = -1)
 
         env_reward_weight = min(max(float(default(env_reward_weight, self.env_reward_weight)), 0.), 1.)
         advantages = combine_grouped_advantages(
-            stack((env_advantages, crl_advantages), dim = -1),
+            gae.advantages,
             weights = torch.tensor((env_reward_weight, 1. - env_reward_weight), device = self.device),
             normalize = True,
             group_dim = -1,
@@ -986,12 +977,13 @@ def render_heldout_grid(trainer, eval_states, out_path, max_steps = 160, determi
             img[:5, :] = img[-5:, :] = img[:, :5] = img[:, -5:] = [40, 220, 80]
         return img
 
+    cols = next(c for c in range(min(grid_cols, n), 0, -1) if divisible_by(n, c))
     with torch.random.fork_rng():
         torch.manual_seed(0)
         for step_i in range(max_steps):
             if step_i % 3 == 0 or done.all():
                 rgb = np.stack([frozen_rgb[i] if exists(frozen_rgb[i]) else snap_panel(i, green = bool(succ[i])) for i in range(n)])
-                frames.append(rearrange(rgb, '(r c) h w ch -> (r h) (c w) ch', c = grid_cols))
+                frames.append(rearrange(rgb, '(r c) h w ch -> (r h) (c w) ch', c = cols))
             if done.all():
                 break
             state_t = torch.from_numpy(make_aug_state_2d(cur_s, prev_s, prev_a)).float().to(trainer.device)
@@ -1031,6 +1023,7 @@ def main(
     max_grad_norm: float = 0.5,
     discount: float = 0.985,
     lam: float = 0.95,
+    finite_time_gae: bool = True,
     clip_eps: float = 0.2,
     entropy_coef: float = 4e-4,
     ppo_epochs: int = 6,
@@ -1053,7 +1046,6 @@ def main(
     value_num_bins: int = 256,
     value_epochs: int = 6,
     value_minibatch_size: int = 256,
-    crl_log_value: bool = True,
     env_reward_weight: float = 0.5,
     success_bonus: float = 1.0,
     self_goal_cos_weight: float = 1.0,
@@ -1096,7 +1088,7 @@ def main(
         Path(d).mkdir(parents = True, exist_ok = True)
     if exists(artifact_folder):
         Path(artifact_folder).mkdir(parents = True, exist_ok = True)
-    print(f"[PushT-2D SGS+CRL] videos -> {Path(video_folder).resolve()} | checkpoints -> {Path(checkpoint_folder).resolve()} | logs -> {Path(log_path).resolve()}", flush = True)
+    print(f"[PushT-2D SGS+CRL] max_steps={max_steps} | finite_time_gae={finite_time_gae} | videos -> {Path(video_folder).resolve()} | checkpoints -> {Path(checkpoint_folder).resolve()} | logs -> {Path(log_path).resolve()}", flush = True)
 
     dim_state, dim_goal, dim_action = DIM_STATE, DIM_GOAL, DIM_ACTION
 
@@ -1196,7 +1188,7 @@ def main(
         value_num_bins = value_num_bins,
         env_value_max_return = float(max(success_bonus, 1.0)),
         weight_decay = weight_decay, max_grad_norm = max_grad_norm,
-        discount = discount, lam = lam,
+        discount = discount, lam = lam, finite_time_gae = finite_time_gae,
         clip_eps = clip_eps, entropy_coef = entropy_coef,
         ppo_epochs = ppo_epochs, minibatch_size = minibatch_size,
         critic_steps = critic_steps, critic_batch_size = critic_batch_size,
@@ -1283,7 +1275,7 @@ def main(
 
         row = dict(
             update = update, env_steps = update * num_envs * rollout_len, episodes = num_episodes,
-            train_succ = train_succ, k_star = int(k_star),
+            train_succ = train_succ, k_star = int(k_star), finite_time_gae = bool(trainer.finite_time_gae),
             actor_depth = actor_depth, critic_depth = critic_depth,
             elapsed_sec = elapsed, **metrics
         )
@@ -1344,6 +1336,7 @@ def main(
             print(
                 f"upd {update:4d} | steps {row['env_steps']:7d} | critic {metrics['critic_loss']:6.3f} | "
                 f"dist {metrics['distance_mean']:5.2f} | crl {metrics['crl_reward_mean']:+.4f} | "
+                f"v_loss {metrics['value_loss']:5.3f}/{metrics['env_value_loss']:5.3f} | "
                 f"k* {k_star:3d}/{len(configs)-1} | train {train_succ:4.1%} | t {elapsed:5.1f}s",
                 flush = True
             )

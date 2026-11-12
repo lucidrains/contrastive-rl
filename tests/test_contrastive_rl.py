@@ -1065,3 +1065,259 @@ def test_block_tucker_trainer_step():
 
     assert isinstance(loss, float)
     assert torch.isfinite(torch.tensor(loss))
+
+
+def test_discount_conditioned_q_head_detach_and_skip():
+    from contrastive_rl_pytorch import DiscountConditionedQHead
+
+    dim_embed, dim_state, dim_action, dim_goal = 16, 8, 4, 8
+    q_head = DiscountConditionedQHead(
+        dim_embed = dim_embed,
+        dim_state = dim_state,
+        dim_action = dim_action,
+        dim_goal = dim_goal,
+        dim_hidden = 32,
+        depth = 2,
+        num_q_heads = 2
+    )
+
+    critic_embed = torch.randn(6, dim_embed, requires_grad = True)
+    state = torch.randn(6, dim_state, requires_grad = True)
+    action = torch.randn(6, dim_action, requires_grad = True)
+    goal = torch.randn(6, dim_goal)
+    discount = torch.tensor([0.8, 0.85, 0.9, 0.95, 0.98, 0.99])
+
+    q_val = q_head(critic_embed, state, action, discount = discount, goal = goal)
+    assert q_val.shape == (6,)
+
+    all_q = q_head(critic_embed, state, action, discount = discount, goal = goal, return_all = True)
+    assert all_q.shape == (2, 6)
+
+    q_val.sum().backward()
+
+    # critic_embed is detached by default, while raw state and action receive gradients through the skip connection
+    assert critic_embed.grad is None
+    assert state.grad is not None and state.grad.abs().sum() > 0
+    assert action.grad is not None and action.grad.abs().sum() > 0
+
+
+def test_discount_conditioned_q_head_td_loss_and_ema():
+    from contrastive_rl_pytorch import DiscountConditionedQHead
+
+    dim_embed, dim_state, dim_action = 16, 8, 4
+    q_head = DiscountConditionedQHead(
+        dim_embed = dim_embed,
+        dim_state = dim_state,
+        dim_action = dim_action,
+        dim_hidden = 32,
+        depth = 2
+    )
+
+    batch = 8
+    critic_embed = torch.randn(batch, dim_embed)
+    state = torch.randn(batch, dim_state)
+    action = torch.randn(batch, dim_action)
+    rewards = torch.randn(batch)
+    next_critic_embed = torch.randn(batch, dim_embed)
+    next_state = torch.randn(batch, dim_state)
+    next_action = torch.randn(batch, dim_action)
+    dones = torch.zeros(batch)
+    discount = torch.full((batch,), 0.95)
+    next_log_prob = torch.randn(batch)
+
+    loss = q_head.td_loss(
+        critic_embed = critic_embed,
+        state = state,
+        action = action,
+        rewards = rewards,
+        next_critic_embed = next_critic_embed,
+        next_state = next_state,
+        next_action = next_action,
+        dones = dones,
+        discount = discount,
+        next_action_log_prob = next_log_prob,
+        alpha = 0.1
+    )
+
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    loss.backward()
+    q_head.update_ema()
+
+
+def test_q_head_trainer_and_actor_trainer_integration():
+    from contrastive_rl_pytorch import (
+        DiscountConditionedQHead,
+        QHeadTrainer,
+        ActorTrainer,
+        default_discount_transform
+    )
+    from x_mlps_pytorch import MLP
+
+    dim_state, dim_action, dim_embed = 8, 4, 16
+    encoder = MLP(dim_state + dim_action + 3, 32, dim_embed)
+    goal_encoder = MLP(dim_state, 32, dim_embed)
+    actor = MLP(dim_state + dim_state + 3, 32, dim_action)
+
+    q_head = DiscountConditionedQHead(
+        dim_embed = dim_embed,
+        dim_state = dim_state,
+        dim_action = dim_action,
+        dim_goal = dim_state,
+        dim_hidden = 32,
+        depth = 2
+    )
+
+    q_trainer = QHeadTrainer(
+        q_head = q_head,
+        encoder = encoder,
+        goal_encoder = goal_encoder,
+        actor = actor,
+        batch_size = 8,
+        discount = (0.8, 0.99),
+        discount_condition_critic = True,
+        discount_transform = default_discount_transform,
+        reward_source = 'both',
+        cpu = True
+    )
+
+    trajectories = torch.randn(6, 12, dim_state)
+    actions = torch.randn(6, 12, dim_action)
+    rewards = torch.randn(6, 12)
+
+    q_loss = q_trainer(
+        trajectories,
+        actions,
+        2,
+        rewards = rewards,
+        pbar = False
+    )
+    assert isinstance(q_loss, float)
+    assert torch.isfinite(torch.tensor(q_loss))
+
+    actor_trainer = ActorTrainer(
+        actor = actor,
+        encoder = encoder,
+        goal_encoder = goal_encoder,
+        batch_size = 8,
+        discount = (0.8, 0.99),
+        discount_condition = True,
+        discount_transform = default_discount_transform,
+        q_head = q_head,
+        q_head_loss_weight = 1.0,
+        cpu = True
+    )
+
+    actor_loss = actor_trainer(trajectories, 2, pbar = False)
+    assert isinstance(actor_loss, float)
+    assert torch.isfinite(torch.tensor(actor_loss))
+
+
+def test_q_head_discrete_actions_integration():
+    from contrastive_rl_pytorch import (
+        DiscountConditionedQHead,
+        QHeadTrainer,
+        ActorTrainer,
+        default_discount_transform
+    )
+    from x_mlps_pytorch import MLP
+
+    dim_state, num_actions, dim_embed = 6, 3, 12
+    encoder = MLP(dim_state + num_actions + 3, 24, dim_embed)
+    goal_encoder = MLP(dim_state, 24, dim_embed)
+    actor = MLP(dim_state + dim_state + 3, 24, num_actions)
+
+    q_head = DiscountConditionedQHead(
+        dim_embed = dim_embed,
+        dim_state = dim_state,
+        dim_action = num_actions,
+        dim_goal = dim_state,
+        dim_hidden = 24,
+        depth = 2
+    )
+
+    q_trainer = QHeadTrainer(
+        q_head = q_head,
+        encoder = encoder,
+        goal_encoder = goal_encoder,
+        actor = actor,
+        batch_size = 8,
+        discount = (0.8, 0.99),
+        discount_condition_critic = True,
+        discount_transform = default_discount_transform,
+        reward_source = 'both',
+        num_discrete_actions = num_actions,
+        cpu = True
+    )
+
+    trajectories = torch.randn(4, 10, dim_state)
+    actions = torch.nn.functional.one_hot(torch.randint(0, num_actions, (4, 10)), num_classes = num_actions).float()
+    rewards = torch.randn(4, 10)
+
+    q_loss = q_trainer(trajectories, actions, 2, rewards = rewards, pbar = False)
+    assert isinstance(q_loss, float)
+    assert torch.isfinite(torch.tensor(q_loss))
+
+    actor_trainer = ActorTrainer(
+        actor = actor,
+        encoder = encoder,
+        goal_encoder = goal_encoder,
+        batch_size = 8,
+        discount = (0.8, 0.99),
+        discount_condition = True,
+        discount_transform = default_discount_transform,
+        num_discrete_actions = num_actions,
+        q_head = q_head,
+        q_head_loss_weight = 1.0,
+        cpu = True
+    )
+
+    actor_loss = actor_trainer(trajectories, 2, pbar = False)
+    assert isinstance(actor_loss, float)
+    assert torch.isfinite(torch.tensor(actor_loss))
+
+
+def test_actor_trainer_alternate_crl_and_q():
+    from contrastive_rl_pytorch import (
+        DiscountConditionedQHead,
+        ActorTrainer,
+        default_discount_transform
+    )
+    from x_mlps_pytorch import MLP
+
+    dim_state, dim_action, dim_embed = 5, 2, 10
+    encoder = MLP(dim_state + dim_action + 3, 16, dim_embed)
+    goal_encoder = MLP(dim_state, 16, dim_embed)
+    actor = MLP(dim_state + dim_state + 3, 16, dim_action)
+
+    q_head = DiscountConditionedQHead(
+        dim_embed = dim_embed,
+        dim_state = dim_state,
+        dim_action = dim_action,
+        dim_goal = dim_state,
+        dim_hidden = 16,
+        depth = 2
+    )
+
+    actor_trainer = ActorTrainer(
+        actor = actor,
+        encoder = encoder,
+        goal_encoder = goal_encoder,
+        batch_size = 8,
+        discount = (0.85, 0.99),
+        discount_condition = True,
+        discount_transform = default_discount_transform,
+        q_head = q_head,
+        q_head_loss_weight = 1.0,
+        alternate_crl_and_q = True,
+        cpu = True
+    )
+
+    trajectories = torch.randn(4, 10, dim_state)
+    actor_loss = actor_trainer(trajectories, 4, pbar = False)
+    assert isinstance(actor_loss, float)
+    assert torch.isfinite(torch.tensor(actor_loss))
+    assert actor_trainer._actor_step_idx == 4
+
+
+

@@ -10,7 +10,7 @@
 #   "mean-conc-beta>=0.2.1",
 #   "memmap-replay-buffer>=0.0.17",
 #   "x-mlps-pytorch>=0.6.1",
-#   "x-ppo>=0.0.30",
+#   "x-ppo>=0.1.0",
 #   "numpy",
 #   "torch",
 # ]
@@ -699,6 +699,7 @@ class DistanceRewardPPO(Module):
         max_grad_norm = 0.5,
         discount = 0.99,
         lam = 0.95,
+        finite_time_gae = True,
         clip_eps = 0.2,
         entropy_coef = 1e-3,
         ppo_epochs = 4,
@@ -744,6 +745,7 @@ class DistanceRewardPPO(Module):
 
         self.discount = discount
         self.lam = lam
+        self.finite_time_gae = finite_time_gae
         self.clip_eps = clip_eps
         self.entropy_coef = entropy_coef
         self.ppo_epochs = ppo_epochs
@@ -1133,6 +1135,7 @@ class DistanceRewardPPO(Module):
                 lam = self.lam,
                 next_values = torch.stack((env_next_values, next_values), dim = -1),
                 group_dim = -1,
+                finite_time = self.finite_time_gae,
                 return_advantages = True
             )
 
@@ -1166,6 +1169,7 @@ class DistanceRewardPPO(Module):
                 gamma = self.discount,
                 lam = self.lam,
                 next_values = next_values,
+                finite_time = self.finite_time_gae,
                 return_advantages = True
             )
 
@@ -1252,6 +1256,7 @@ def main(
     weight_decay = 1e-4,
     discount = 0.99,
     lam = 0.97,
+    finite_time_gae = True,
     clip_eps = 0.2,
     entropy_coef = None,
     ppo_epochs = 4,
@@ -1463,6 +1468,7 @@ def main(
         weight_decay = weight_decay,
         discount = discount,
         lam = lam,
+        finite_time_gae = finite_time_gae,
         clip_eps = clip_eps,
         entropy_coef = entropy_coef,
         ppo_epochs = ppo_epochs,
